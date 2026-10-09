@@ -86,6 +86,6 @@ The log rotates at 10 MB (one `.log.1` backup kept). Set `MU_NO_OPLOG=1` to disa
 
 Found a security issue? Please open an issue at:
 
-**https://github.com/huaquanghan/mu/issues**
+**https://github.com/baroitrung/mu/issues**
 
 For sensitive issues (credential leaks, privilege escalation), use the GitHub private security advisory feature or email the maintainer directly before public disclosure.

@@ -8,14 +8,14 @@ A 2.3 MB binary that cleans, uninstalls, optimizes, and monitors your Ubuntu sys
 
 **One-liner:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/huaquanghan/mu/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/baroitrung/mu/main/scripts/install.sh | bash
 ```
 
 > Install verifies the binary against a release `checksums.txt` asset (SHA-256). Releases must publish `checksums.txt` next to the `mu` binary (`make checksums` after `make build`).
 
 **From source** (requires the Rust toolchain — rustup stable):
 ```bash
-git clone https://github.com/huaquanghan/mu
+git clone https://github.com/baroitrung/mu
 cd mu
 make build          # cargo build --release → ./bin/mu
 make install-local  # → ~/.local/bin/mu (no sudo)

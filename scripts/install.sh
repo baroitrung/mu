@@ -7,7 +7,7 @@
 # Fail closed: missing or mismatched checksum aborts before install.
 set -euo pipefail
 
-REPO="huaquanghan/mu"
+REPO="baroitrung/mu"
 INSTALL_DIR="${MU_INSTALL_DIR:-/usr/local/bin}"
 BINARY="mu"
 TMP_DIR=""
