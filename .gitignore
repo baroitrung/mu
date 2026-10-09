@@ -12,5 +12,8 @@ scripts/bin/harness-cli.exe
 # zharness v0.15 managed set
 /.zharness/
 
+# opencode runtime state (locks, goal sessions) — machine-local, not source
+/.opencode/
+
 # Rust port
 target/
