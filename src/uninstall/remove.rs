@@ -115,6 +115,32 @@ pub(crate) fn remove_selected_in(
                 continue;
             }
             processed_remnants.insert(remnant.clone());
+
+            // If remnant is a systemd user unit, stop and disable it before trashing
+            if remnant.ends_with(".service") {
+                let unit = Path::new(&remnant)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if !unit.is_empty() {
+                    if dry_run {
+                        let _ =
+                            writeln!(out, "  [dry-run] would run: systemctl --user stop {unit}");
+                        let _ = writeln!(
+                            out,
+                            "  [dry-run] would run: systemctl --user disable {unit}"
+                        );
+                    } else {
+                        let _ = deps
+                            .runner
+                            .run(&CommandSpec::new("systemctl", ["--user", "stop", unit]));
+                        let _ = deps
+                            .runner
+                            .run(&CommandSpec::new("systemctl", ["--user", "disable", unit]));
+                    }
+                }
+            }
+
             // `err = remnantRoot(...); if err == nil { ValidateCleanupCandidate };
             //  if err == nil { SafeDelete }` — the first failing step wins.
             let attempt = remnant_root(deps, &remnant)
@@ -160,9 +186,10 @@ pub(crate) fn remove_package(
     out: &mut dyn Write,
     err_out: &mut dyn Write,
 ) -> Result<()> {
-    let args: Vec<&str> = match pkg.source.as_str() {
-        "apt" => vec!["apt-get", "purge", "-y", pkg.name.as_str()],
-        "snap" => vec!["snap", "remove", pkg.name.as_str()],
+    let (prog, args) = match pkg.source.as_str() {
+        "apt" => ("sudo", vec!["apt-get", "purge", "-y", pkg.name.as_str()]),
+        "snap" => ("sudo", vec!["snap", "remove", pkg.name.as_str()]),
+        "flatpak" => ("flatpak", vec!["uninstall", "-y", pkg.name.as_str()]),
         _ => {
             return msg(format!(
                 "unsupported package source {:?} for {}",
@@ -171,10 +198,15 @@ pub(crate) fn remove_package(
         }
     };
     if dry_run {
-        let _ = writeln!(out, "  [dry-run] would run: sudo {}", args.join(" "));
+        let cmd_str = if prog == "sudo" {
+            format!("sudo {}", args.join(" "))
+        } else {
+            format!("{prog} {}", args.join(" "))
+        };
+        let _ = writeln!(out, "  [dry-run] would run: {cmd_str}");
         return Ok(());
     }
-    let res = deps.runner.run(&CommandSpec::new("sudo", &args));
+    let res = deps.runner.run(&CommandSpec::new(prog, &args));
     // Go writes result.Stdout→os.Stdout and result.Stderr→os.Stderr
     // unconditionally; RunError keeps the partial output for the same cases.
     let output = match &res {
@@ -387,6 +419,49 @@ mod tests {
             remove_package(&deps, &bad, false, &mut out, &mut err_out).is_err(),
             "expected unknown source error"
         );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn flatpak_remove_and_systemd_unit_termination() {
+        let home = tempdir("flatpak-systemd");
+        let runner = Arc::new(FakeRunner::new());
+        let deps = deps_for_test(&home, runner.clone());
+        let unit_remnant = deps
+            .config_home
+            .join("systemd")
+            .join("user")
+            .join("flat-app.service");
+        fs::create_dir_all(unit_remnant.parent().unwrap()).unwrap();
+        fs::write(&unit_remnant, b"[Unit]\nDescription=Test\n").unwrap();
+
+        let pkg = Package {
+            name: "org.example.App".to_string(),
+            source: "flatpak".to_string(),
+            remnants_found: vec![unit_remnant.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let results = remove_selected_in(
+            &deps,
+            std::slice::from_ref(&pkg),
+            std::slice::from_ref(&pkg),
+            true,
+            &mut out,
+            &mut err_out,
+        );
+        assert!(
+            removal_errors(&results).is_none(),
+            "errors: {:?}",
+            removal_errors(&results)
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("[dry-run] would run: flatpak uninstall -y org.example.App"));
+        assert!(text.contains("[dry-run] would run: systemctl --user stop flat-app.service"));
+        assert!(text.contains("[dry-run] would run: systemctl --user disable flat-app.service"));
+
         fs::remove_dir_all(&home).ok();
     }
 }

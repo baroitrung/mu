@@ -305,3 +305,110 @@ fn analyze_relative_path_dry_run_reports_absolute_target() {
 
     let _ = std::fs::remove_dir_all(&test_dir);
 }
+
+/// Phase 2: `mu clean --dry-run` creates preview ledger at $XDG_CONFIG_HOME/mu/clean-list.txt.
+#[test]
+fn clean_dry_run_creates_preview_ledger() {
+    let o = mu(&["clean", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(out.contains("Potential space to free:"), "{out}");
+    assert!(out.contains("DRY RUN"), "{out}");
+
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
+                .unwrap()
+        });
+    let ledger = config_home.join("mu").join("clean-list.txt");
+    assert!(
+        ledger.exists(),
+        "clean-list.txt must exist at {}",
+        ledger.display()
+    );
+    let content = std::fs::read_to_string(&ledger).unwrap();
+    assert!(content.contains("# mu clean preview ledger"));
+}
+
+/// Phase 2: `mu clean --dry-run --include=system-trash` previews item count and size.
+#[test]
+fn clean_dry_run_system_trash_previews_count_and_size() {
+    let o = mu(&["clean", "--dry-run", "--include=system-trash"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(out.contains("System Trash"), "{out}");
+    assert!(out.contains("item"), "{out}");
+}
+
+/// Phase 2: `mu clean --include=system-trash < /dev/null` fails closed without --yes.
+#[test]
+fn clean_include_system_trash_aborts_without_yes() {
+    let o = mu(&["clean", "--include=system-trash"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(out.contains("Non-interactive: pass --yes"), "{out}");
+    assert!(out.contains("Aborted."), "{out}");
+}
+
+/// Phase 2: Sentinel immutability test for `clean --dry-run`.
+#[test]
+fn clean_dry_run_sentinel_immutability() {
+    let test_dir = std::env::temp_dir().join(format!("mu-clean-sentinel-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&test_dir);
+    let sentinel = test_dir.join("keep.txt");
+    std::fs::write(&sentinel, b"preserve me").unwrap();
+
+    let o = mu(&["clean", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(
+        sentinel.exists(),
+        "sentinel keep.txt must not be deleted during clean --dry-run"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// Phase 2: `mu uninstall --list` lists installed packages with source prefix.
+#[test]
+fn uninstall_list_outputs_packages() {
+    let o = mu(&["uninstall", "--list"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(
+        out.contains("apt:") || out.contains("snap:") || out.contains("flatpak:"),
+        "output should list packages with source prefix: {out}"
+    );
+}
+
+/// Phase 2: `mu uninstall --dry-run bash` previews removal plan without executing apt.
+#[test]
+fn uninstall_dry_run_bash_previews_plan() {
+    let o = mu(&["uninstall", "--dry-run", "bash"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(out.contains("Package to remove:"), "{out}");
+    assert!(out.contains("bash"), "{out}");
+    assert!(out.contains("[dry-run]"), "{out}");
+}
+
+/// Phase 2: `mu uninstall --permanent bash` rejected with exit 1 and safety error.
+#[test]
+fn uninstall_rejects_permanent_flag() {
+    let o = mu(&["uninstall", "--permanent", "bash"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = stderr(&o);
+    assert!(
+        err.contains("error: --permanent is rejected: mu enforces SafeDelete via trash only"),
+        "unexpected stderr: {err}"
+    );
+}
+
+/// Phase 2: `mu uninstall --help` renders updated help matching golden fixture.
+#[test]
+fn uninstall_help_matches_golden() {
+    let o = mu(&["uninstall", "--help"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), include_str!("golden/help-uninstall.txt"));
+}

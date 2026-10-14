@@ -26,6 +26,7 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 pub enum Phase {
     Search,
     Confirm,
+    ReviewRemnants,
     Done,
 }
 
@@ -51,8 +52,9 @@ pub struct UninstallTui {
     pub window_h: u16,
     pub scroll_off: usize,
     pub confirm_cursor: usize, // 0=YES 1=NO
+    pub remnant_items: Vec<(String, String, bool)>,
+    pub remnant_cursor: usize,
 }
-
 /// Package item — mirrors Go's `pkgItem`.
 #[derive(Clone, Debug)]
 pub struct PkgItem {
@@ -77,6 +79,8 @@ impl UninstallTui {
             window_h: 24,
             scroll_off: 0,
             confirm_cursor: 1, // default to NO
+            remnant_items: Vec::new(),
+            remnant_cursor: 0,
         }
     }
 
@@ -210,6 +214,25 @@ impl UninstallTui {
                 match key {
                     // Go: only q and ctrl+c quit the confirm (not Esc).
                     KeyCode::Char('q') => return true,
+                    KeyCode::Char('r') => {
+                        self.remnant_items.clear();
+                        for (key, sel) in &self.selected {
+                            if !sel {
+                                continue;
+                            }
+                            for it in &self.all_items {
+                                if it.pkg.key() == *key {
+                                    for r in &it.pkg.remnants_found {
+                                        self.remnant_items.push((key.clone(), r.clone(), true));
+                                    }
+                                }
+                            }
+                        }
+                        if !self.remnant_items.is_empty() {
+                            self.remnant_cursor = 0;
+                            self.phase = Phase::ReviewRemnants;
+                        }
+                    }
                     KeyCode::Left
                     | KeyCode::Char('h')
                     | KeyCode::Right
@@ -224,6 +247,40 @@ impl UninstallTui {
                         }
                         // NO: return to search
                         self.phase = Phase::Search;
+                    }
+                    _ => {}
+                }
+            }
+            Phase::ReviewRemnants => {
+                match key {
+                    KeyCode::Up => {
+                        if self.remnant_cursor > 0 {
+                            self.remnant_cursor -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if self.remnant_cursor + 1 < self.remnant_items.len() {
+                            self.remnant_cursor += 1;
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if self.remnant_cursor < self.remnant_items.len() {
+                            self.remnant_items[self.remnant_cursor].2 =
+                                !self.remnant_items[self.remnant_cursor].2;
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Esc => {
+                        // Apply remnant selections back to all_items
+                        for (pkg_key, path, keep) in &self.remnant_items {
+                            if !keep {
+                                for it in &mut self.all_items {
+                                    if it.pkg.key() == *pkg_key {
+                                        it.pkg.remnants_found.retain(|r| r != path);
+                                    }
+                                }
+                            }
+                        }
+                        self.phase = Phase::Confirm;
                     }
                     _ => {}
                 }
@@ -398,7 +455,36 @@ impl UninstallTui {
                 lines.push(Line::raw(""));
                 lines.push(Line::raw(""));
                 lines.push(Line::raw(""));
-                lines.push(Line::raw("  ←/→ navigate  •  Enter: confirm  •  q: quit"));
+                lines.push(Line::raw(
+                    "  ←/→: toggle  •  r: review remnants  •  Enter: confirm  •  q: quit",
+                ));
+            }
+            Phase::ReviewRemnants => {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "  Review Remnants (Space to toggle, Enter to save):",
+                    styles::bold_primary(),
+                ));
+                lines.push(Line::raw(""));
+                for (idx, (pkg_key, path, sel)) in self.remnant_items.iter().enumerate() {
+                    let check = if *sel { "[x]" } else { "[ ]" };
+                    let text = format!("  {check} {path} ({pkg_key})");
+                    if idx == self.remnant_cursor {
+                        lines.push(Line::styled(
+                            text,
+                            ratatui::style::Style::default()
+                                .bg(ratatui::style::Color::Rgb(0x1F, 0x29, 0x37))
+                                .fg(ratatui::style::Color::Rgb(0xF9, 0xFA, 0xFB)),
+                        ));
+                    } else {
+                        lines.push(Line::raw(text));
+                    }
+                }
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "  ↑/↓: navigate  •  Space: toggle  •  Enter/Esc: back to confirm",
+                    styles::faint(),
+                ));
             }
             Phase::Done => {
                 lines.push(Line::raw(""));
@@ -612,5 +698,43 @@ mod tests {
             .collect();
         assert!(content.contains("Will remove:"));
         assert!(content.contains("vim"));
+    }
+
+    #[test]
+    fn review_remnants_checklist_toggles_and_saves() {
+        let mut tui = UninstallTui::new();
+        tui.phase = Phase::Confirm;
+        tui.selected.insert("apt:vim".into(), true);
+        tui.all_items = vec![PkgItem {
+            pkg: Package {
+                name: "vim".into(),
+                source: "apt".into(),
+                remnants_found: vec![
+                    "/home/user/.config/vim".into(),
+                    "/home/user/.cache/vim".into(),
+                ],
+                ..Default::default()
+            },
+            selected: true,
+        }];
+
+        // Press 'r' to enter remnant review
+        tui.handle_key(KeyCode::Char('r'));
+        assert_eq!(tui.phase, Phase::ReviewRemnants);
+        assert_eq!(tui.remnant_items.len(), 2);
+        assert!(tui.remnant_items[0].2); // initially selected
+
+        // Toggle first remnant off with Space
+        tui.handle_key(KeyCode::Char(' '));
+        assert!(!tui.remnant_items[0].2);
+
+        // Press Enter to save and return to Confirm
+        tui.handle_key(KeyCode::Enter);
+        assert_eq!(tui.phase, Phase::Confirm);
+        // The first remnant should have been deselected and removed from remnants_found
+        assert_eq!(
+            tui.all_items[0].pkg.remnants_found,
+            vec!["/home/user/.cache/vim"]
+        );
     }
 }

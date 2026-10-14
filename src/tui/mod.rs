@@ -446,6 +446,7 @@ fn dispatch_subcommand(command: &str, debug: bool) -> anyhow::Result<Option<Stri
                 let opts = crate::uninstall::Options {
                     dry_run: false,
                     debug,
+                    ..Default::default()
                 };
                 let code = crate::uninstall::run_with_items(&opts, &items);
                 if code != 0 {

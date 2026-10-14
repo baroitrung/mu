@@ -58,12 +58,44 @@ pub(crate) fn find_remnants_in(deps: &Deps, name: &str) -> Vec<String> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
     for n in &names {
-        let candidates = [
+        let mut candidates = vec![
             deps.config_home.join(n),
             deps.data_home.join(n),
             deps.cache_home.join(n),
             Path::new("/var/lib").join(n),
+            // systemd user units
+            deps.config_home
+                .join("systemd")
+                .join("user")
+                .join(format!("{n}.service")),
+            // desktop entries
+            deps.data_home
+                .join("applications")
+                .join(format!("{n}.desktop")),
+            deps.config_home
+                .join("autostart")
+                .join(format!("{n}.desktop")),
         ];
+
+        // Steam app manifests in ~/.local/share/Steam/steamapps/appmanifest_*.acf
+        let steamapps = deps.data_home.join("Steam").join("steamapps");
+        if let Ok(entries) = std::fs::read_dir(&steamapps) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if let Some(fname) = p.file_name().and_then(|f| f.to_str())
+                    && fname.starts_with("appmanifest_")
+                    && fname.ends_with(".acf")
+                {
+                    // Check if file content references game matching n
+                    if let Ok(content) = std::fs::read_to_string(&p)
+                        && content.to_lowercase().contains(&n.to_lowercase())
+                    {
+                        candidates.push(p);
+                    }
+                }
+            }
+        }
+
         for p in candidates {
             if !seen.insert(p.clone()) {
                 continue;

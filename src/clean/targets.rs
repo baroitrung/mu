@@ -500,6 +500,56 @@ pub(crate) fn sandbox_font_cache_dirs_in(home: &Path) -> Vec<(PathBuf, PathBuf)>
     found
 }
 
+/// `count_trash_items` — counts entries in `$XDG_DATA_HOME/Trash/files`.
+pub(crate) fn count_trash_items(data_home: &Path) -> usize {
+    let files_dir = data_home.join("Trash").join("files");
+    let Ok(entries) = std::fs::read_dir(&files_dir) else {
+        return 0;
+    };
+    entries.flatten().count()
+}
+
+/// `system_trash_size` — total bytes in `$XDG_DATA_HOME/Trash`.
+pub(crate) fn system_trash_size(data_home: &Path) -> i64 {
+    let trash_dir = data_home.join("Trash");
+    if !trash_dir.exists() {
+        return 0;
+    }
+    let (sz, _) = size::dir_size(&trash_dir);
+    sz as i64
+}
+
+/// `systemTrashTarget` — CleanTarget for system trash (opt-in).
+/// Previews item count and size; executes strictly via `gio trash --empty`.
+pub(crate) fn system_trash_target_in(deps: &Deps) -> CleanTarget {
+    let scan_data = deps.data_home.clone();
+    let exec_runner = Arc::clone(&deps.runner);
+
+    CleanTarget {
+        id: "system-trash",
+        label: "System Trash",
+        requires_sudo: false,
+        opt_in: true,
+        scan: Box::new(move || {
+            let sz = system_trash_size(&scan_data);
+            (sz, None)
+        }),
+        preview: None,
+        execute: Box::new(move |dry_run| {
+            if dry_run {
+                return Ok(());
+            }
+            if exec_runner.look_path("gio").is_ok() {
+                exec_runner
+                    .run(&CommandSpec::new("gio", ["trash", "--empty"]))
+                    .map(|_| ())
+                    .map_err(|e| Error::Msg(format!("empty trash: {e}")))?;
+            }
+            Ok(())
+        }),
+    }
+}
+
 /// `JournalSize` — parses `journalctl --disk-usage` to get journal size in
 /// bytes. A missing journalctl is optional; command and parse failures are
 /// returned.

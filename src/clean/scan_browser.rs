@@ -10,22 +10,26 @@ use super::{CleanTarget, Deps, join_errors};
 
 /// `browserCachePaths` — all browser cache paths that exist on the system.
 /// `home` is `os.UserHomeDir()`.
-pub(crate) fn browser_cache_paths_in(home: &Path) -> Vec<PathBuf> {
-    let mut candidates = vec![
-        home.join(".config")
-            .join("google-chrome")
-            .join("Default")
-            .join("Cache"),
-        home.join(".config").join("Code").join("CachedData"),
-        home.join(".config").join("Code").join("CachedExtensions"),
-    ];
+/// Protected productivity domains whose ServiceWorker and IndexedDB storage
+/// must not be removed to prevent losing offline PWA state.
+const PROTECTED_PWA_DOMAINS: &[&str] = &["google", "docs.google.com", "github", "figma", "linear"];
 
-    // Firefox: ~/.mozilla/firefox/*/cache2 (may match multiple profiles).
-    // `filepath.Glob` semantics: each `*` candidate must stat as a directory
-    // (symlinks followed) and contain a child literally named `cache2`;
-    // missing/unreadable levels yield no matches rather than an error.
-    let firefox = home.join(".mozilla").join("firefox");
-    if let Ok(entries) = std::fs::read_dir(&firefox) {
+/// Returns true if the path points to ServiceWorker or IndexedDB data belonging
+/// to a protected productivity domain.
+pub(crate) fn is_protected_pwa_path(path: &Path) -> bool {
+    let s = path.to_string_lossy().to_lowercase();
+    let is_pwa_storage =
+        s.contains("service worker") || s.contains("serviceworker") || s.contains("indexeddb");
+    if !is_pwa_storage {
+        return false;
+    }
+    PROTECTED_PWA_DOMAINS.iter().any(|d| s.contains(d))
+}
+
+/// Helper to find Firefox-like `*/cache2` profile directories under a root.
+fn find_firefox_cache2_paths(parent: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(parent) {
         for e in entries.flatten() {
             let profile = e.path();
             let Ok(meta) = std::fs::metadata(&profile) else {
@@ -39,14 +43,107 @@ pub(crate) fn browser_cache_paths_in(home: &Path) -> Vec<PathBuf> {
                     .flatten()
                     .any(|ie| ie.file_name() == std::ffi::OsStr::new("cache2"))
             {
-                candidates.push(profile.join("cache2"));
+                found.push(profile.join("cache2"));
+            }
+        }
+    }
+    found
+}
+
+/// `browserCachePaths` — all browser cache paths that exist on the system.
+/// `home` is `os.UserHomeDir()`.
+pub(crate) fn browser_cache_paths_in(home: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![
+        // Google Chrome
+        home.join(".config")
+            .join("google-chrome")
+            .join("Default")
+            .join("Cache"),
+        // Chromium
+        home.join(".config")
+            .join("chromium")
+            .join("Default")
+            .join("Cache"),
+        // VSCode
+        home.join(".config").join("Code").join("CachedData"),
+        home.join(".config").join("Code").join("CachedExtensions"),
+        // Brave
+        home.join(".config")
+            .join("BraveSoftware")
+            .join("Brave-Browser")
+            .join("Default")
+            .join("Cache"),
+        // Microsoft Edge
+        home.join(".config")
+            .join("microsoft-edge")
+            .join("Default")
+            .join("Cache"),
+        // Opera
+        home.join(".config").join("opera").join("Cache"),
+        // Vivaldi
+        home.join(".config")
+            .join("vivaldi")
+            .join("Default")
+            .join("Cache"),
+        // Snap Chromium
+        home.join("snap")
+            .join("chromium")
+            .join("common")
+            .join(".cache")
+            .join("chromium")
+            .join("Default")
+            .join("Cache"),
+    ];
+
+    // Firefox native: ~/.mozilla/firefox/*/cache2
+    candidates.extend(find_firefox_cache2_paths(
+        &home.join(".mozilla").join("firefox"),
+    ));
+
+    // Zen Browser: ~/.zen/*/cache2
+    candidates.extend(find_firefox_cache2_paths(&home.join(".zen")));
+
+    // Snap Firefox: ~/snap/firefox/common/.cache/mozilla/firefox/*/cache2
+    candidates.extend(find_firefox_cache2_paths(
+        &home
+            .join("snap")
+            .join("firefox")
+            .join("common")
+            .join(".cache")
+            .join("mozilla")
+            .join("firefox"),
+    ));
+
+    // Flatpak browsers under ~/.var/app/*/cache
+    let var_app = home.join(".var").join("app");
+    if let Ok(entries) = std::fs::read_dir(&var_app) {
+        for e in entries.flatten() {
+            let app_dir = e.path();
+            let name = e.file_name();
+            let name_str = name.to_string_lossy().to_lowercase();
+            if name_str.contains("firefox")
+                || name_str.contains("chrome")
+                || name_str.contains("brave")
+                || name_str.contains("chromium")
+                || name_str.contains("zen")
+            {
+                let cache_dir = app_dir.join("cache");
+                if paths::path_exists(&cache_dir) {
+                    // Check for inner cache2 if firefox-based
+                    let ff_inner = find_firefox_cache2_paths(&cache_dir);
+                    if !ff_inner.is_empty() {
+                        candidates.extend(ff_inner);
+                    } else {
+                        candidates.push(cache_dir);
+                    }
+                }
             }
         }
     }
 
     candidates
         .into_iter()
-        .filter(|p| paths::path_exists(p))
+        .filter(|p| paths::path_exists(p) && !is_protected_pwa_path(p))
         .collect()
 }
 
@@ -60,7 +157,7 @@ pub(crate) fn browser_cache_target_in(deps: &Deps) -> CleanTarget {
 
     CleanTarget {
         id: "browser-cache",
-        label: "Browser Caches (Chrome/Firefox/VSCode)",
+        label: "Browser Caches (Chrome/Firefox/VSCode/Snap/Flatpak)",
         requires_sudo: false,
         opt_in: true,
         scan: Box::new(move || {
@@ -73,8 +170,6 @@ pub(crate) fn browser_cache_target_in(deps: &Deps) -> CleanTarget {
                     Some(e) => scan_errors.push(e),
                 }
             }
-            // Go: `return total, errors.Join(scanErrors...)` — partial
-            // total rides back with the error.
             if scan_errors.is_empty() {
                 (total, None)
             } else {
@@ -85,6 +180,9 @@ pub(crate) fn browser_cache_target_in(deps: &Deps) -> CleanTarget {
         execute: Box::new(move |dry_run| {
             let mut delete_errors: Vec<Error> = Vec::new();
             for p in browser_cache_paths_in(&exec_home) {
+                if is_protected_pwa_path(&p) {
+                    continue;
+                }
                 let root = browser_cleanup_root(&exec_home, &p);
                 if let Err(e) = paths::validate_cleanup_candidate(&root, &p) {
                     delete_errors.push(e);
@@ -105,12 +203,21 @@ pub(crate) fn browser_cache_target_in(deps: &Deps) -> CleanTarget {
     }
 }
 
-/// `browserCleanupRoot` — paths under `~/.mozilla` validate against the
-/// `.mozilla` root; everything else against `~/.config`.
+/// `browserCleanupRoot` — paths under `~/.mozilla`, `~/snap`, `~/.var`, `~/.zen`
+/// validate against their respective roots; everything else against `~/.config`.
 pub(crate) fn browser_cleanup_root(home: &Path, path: &Path) -> PathBuf {
     let mozilla = home.join(".mozilla");
+    let snap = home.join("snap");
+    let var = home.join(".var");
+    let zen = home.join(".zen");
     if path == mozilla || path.starts_with(&mozilla) {
         mozilla
+    } else if path == snap || path.starts_with(&snap) {
+        snap
+    } else if path == var || path.starts_with(&var) {
+        var
+    } else if path == zen || path.starts_with(&zen) {
+        zen
     } else {
         home.join(".config")
     }
@@ -193,5 +300,49 @@ mod tests {
             "mozilla root"
         );
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_is_protected_pwa_path() {
+        assert!(is_protected_pwa_path(Path::new(
+            "/home/user/.config/google-chrome/Default/Service Worker/CacheStorage/docs.google.com"
+        )));
+        assert!(is_protected_pwa_path(Path::new(
+            "/home/user/.config/google-chrome/Default/IndexedDB/https_github.com_0.indexeddb.leveldb"
+        )));
+        assert!(is_protected_pwa_path(Path::new(
+            "/home/user/.config/BraveSoftware/Brave-Browser/Default/ServiceWorker/figma"
+        )));
+        assert!(!is_protected_pwa_path(Path::new(
+            "/home/user/.config/google-chrome/Default/Cache"
+        )));
+        assert!(!is_protected_pwa_path(Path::new(
+            "/home/user/.mozilla/firefox/abc/cache2"
+        )));
+    }
+
+    #[test]
+    fn test_browser_cleanup_root_expanded() {
+        let home = Path::new("/home/user");
+        assert_eq!(
+            browser_cleanup_root(home, &home.join("snap/firefox/common/.cache")),
+            home.join("snap")
+        );
+        assert_eq!(
+            browser_cleanup_root(home, &home.join(".var/app/org.mozilla.firefox/cache")),
+            home.join(".var")
+        );
+        assert_eq!(
+            browser_cleanup_root(home, &home.join(".zen/profile.default/cache2")),
+            home.join(".zen")
+        );
+        assert_eq!(
+            browser_cleanup_root(home, &home.join(".mozilla/firefox/profile.default/cache2")),
+            home.join(".mozilla")
+        );
+        assert_eq!(
+            browser_cleanup_root(home, &home.join(".config/google-chrome/Default/Cache")),
+            home.join(".config")
+        );
     }
 }

@@ -42,12 +42,18 @@ pub(crate) use model::{Phase, UninstallModel};
 pub(crate) use remove::remove_selected_in;
 
 /// `uninstall.Options` — controls uninstall behavior.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Options {
     /// `DryRun` — preview actions without making changes.
     pub dry_run: bool,
     /// `Debug` — verbose logging (warn when the ops log cannot open).
     pub debug: bool,
+    /// `List` — list installed packages and exit.
+    pub list: bool,
+    /// `Permanent` — bypass trash (rejected for safety).
+    pub permanent: bool,
+    /// `Packages` — direct CLI package names to remove.
+    pub packages: Vec<String>,
 }
 
 /// Dependency bundle replacing the Go package vars. `runner` is
@@ -153,7 +159,7 @@ fn finish_with_items(
     out: &mut dyn Write,
     err_out: &mut dyn Write,
 ) -> i32 {
-    let mut model = crate::uninstall::model::new_model(*opts);
+    let mut model = crate::uninstall::model::new_model(opts.clone());
     model.phase = Phase::Done;
     for it in items.iter().filter(|it| it.selected) {
         model.selected.insert(it.pkg.key(), true);
@@ -181,6 +187,39 @@ pub(crate) fn run_in(opts: &Options, deps: &Deps, err_out: &mut dyn Write) -> i3
     }
     let _log = CloseLoggerGuard;
 
+    // Reject --permanent with exit code 1 and explanatory safety error
+    if opts.permanent {
+        let _ = writeln!(
+            err_out,
+            "error: --permanent is rejected: mu enforces SafeDelete via trash only to guarantee recoverability. To free space after uninstalling, review and empty trash via 'gio trash --empty' or 'mu clean --include=system-trash'."
+        );
+        return 1;
+    }
+
+    // Handle --list
+    if opts.list {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let (pkgs, err) = discover(&*deps.runner);
+        if let Some(e) = err
+            && opts.debug
+        {
+            let _ = writeln!(err_out, "warn: discovery errors: {e}");
+        }
+        for pkg in pkgs {
+            let sz = crate::size::human_kb(pkg.installed_kb as u64);
+            let _ = writeln!(out, "{}:{} ({})", pkg.source, pkg.name, sz);
+        }
+        return 0;
+    }
+
+    // Handle direct CLI package uninstall
+    if !opts.packages.is_empty() {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        return run_cli_uninstall(opts, deps, &mut out, err_out);
+    }
+
     // Go: `tea.NewProgram(m, tea.WithAltScreen()).Run()` is the only path.
     // A headless run fails inside tea's program init with
     // `could not open a new TTY: open /dev/tty: no such device or address`,
@@ -192,7 +231,6 @@ pub(crate) fn run_in(opts: &Options, deps: &Deps, err_out: &mut dyn Write) -> i3
         );
         return 1;
     }
-
     // TTY: the interactive TUI returns its full item list with selected
     // flags (None when they quit/abort — Go's `final.phase != phaseDone` →
     // nil → exit 0).
@@ -241,6 +279,70 @@ pub(crate) fn finish(
     if let Some(e) = removal_errors(&results) {
         let _ = writeln!(err_out, "error: {e}");
         let _ = writeln!(err_out, "{e}");
+        return 1;
+    }
+    let _ = writeln!(out, "\nUninstall complete.");
+    0
+}
+fn run_cli_uninstall(
+    opts: &Options,
+    deps: &Deps,
+    out: &mut dyn Write,
+    err_out: &mut dyn Write,
+) -> i32 {
+    let (all_installed, err) = discover(&*deps.runner);
+    if let Some(e) = err
+        && opts.debug
+    {
+        let _ = writeln!(err_out, "warn: discovery error: {e}");
+    }
+    let mut selected = Vec::new();
+    for target in &opts.packages {
+        let found = all_installed
+            .iter()
+            .find(|p| p.name == *target || p.key() == *target);
+        match found {
+            Some(pkg) => {
+                let mut pkg = pkg.clone();
+                pkg.remnants_found = remnants::find_remnants_in(deps, &pkg.name);
+                pkg.remnants_kb = remnants::remnant_size(&pkg.remnants_found) / 1024;
+                selected.push(pkg);
+            }
+            None => {
+                let _ = writeln!(err_out, "error: package '{target}' not found");
+                return 1;
+            }
+        }
+    }
+
+    if opts.dry_run {
+        let _ = writeln!(out, "Dry run: previewing package removal plan.");
+        for pkg in &selected {
+            let _ = writeln!(
+                out,
+                "Package to remove: {}:{} ({})",
+                pkg.source,
+                pkg.name,
+                crate::size::human_kb(pkg.installed_kb as u64)
+            );
+            if !pkg.remnants_found.is_empty() {
+                let _ = writeln!(out, "Remnants to remove:");
+                for r in &pkg.remnants_found {
+                    let _ = writeln!(out, "  - {r}");
+                }
+            }
+        }
+        let results = remove_selected_in(deps, &selected, &all_installed, true, out, err_out);
+        if let Some(e) = removal_errors(&results) {
+            let _ = writeln!(err_out, "error: {e}");
+            return 1;
+        }
+        return 0;
+    }
+
+    let results = remove_selected_in(deps, &selected, &all_installed, false, out, err_out);
+    if let Some(e) = removal_errors(&results) {
+        let _ = writeln!(err_out, "error: {e}");
         return 1;
     }
     let _ = writeln!(out, "\nUninstall complete.");
@@ -346,6 +448,7 @@ mod tests {
         let opts = Options {
             dry_run: false,
             debug: false,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let mut err_out = Vec::new();
@@ -415,6 +518,7 @@ mod tests {
         let opts = Options {
             dry_run: false,
             debug: false,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let mut err_out = Vec::new();
@@ -443,6 +547,7 @@ mod tests {
             &Options {
                 dry_run: true,
                 debug: false,
+                ..Default::default()
             },
             &deps,
             &mut err_out,
@@ -453,6 +558,56 @@ mod tests {
             text.contains("invalid mu configuration"),
             "expected config error, got {text:?}"
         );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_rejects_permanent_flag_with_code_1() {
+        let root = tempdir("perm");
+        let deps = deps_for_test(&root, Arc::new(FakeRunner::new()));
+        let mut err_out = Vec::new();
+        let code = run_in(
+            &Options {
+                permanent: true,
+                ..Default::default()
+            },
+            &deps,
+            &mut err_out,
+        );
+        assert_eq!(code, 1);
+        let text = String::from_utf8_lossy(&err_out);
+        assert!(
+            text.contains("error: --permanent is rejected: mu enforces SafeDelete via trash only")
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_direct_cli_uninstall_dry_run() {
+        let root = tempdir("direct-dry");
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_look_path("dpkg-query", "/usr/bin/dpkg-query");
+        runner.set_handler(|spec| {
+            if spec.program == "dpkg-query" {
+                return Ok(crate::runner::Output {
+                    stdout: b"install ok installed\t1024\ttest-pkg\t1.0.0\n".to_vec(),
+                    ..Default::default()
+                });
+            }
+            Ok(crate::runner::Output::default())
+        });
+        let deps = deps_for_test(&root, runner);
+        let mut err_out = Vec::new();
+        let code = run_in(
+            &Options {
+                dry_run: true,
+                packages: vec!["test-pkg".to_string()],
+                ..Default::default()
+            },
+            &deps,
+            &mut err_out,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
         fs::remove_dir_all(&root).ok();
     }
 }

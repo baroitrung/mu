@@ -193,11 +193,13 @@ Executes: apt purge <pkg> + remnant cleanup.
 Use --dry-run to preview without removing anything.
 
 Usage:
-  mu uninstall [flags]
+  mu uninstall [flags] [package...]
 
 Flags:
-      --dry-run   Preview actions without making changes
-  -h, --help      help for uninstall
+      --dry-run     Preview actions without making changes
+  -h, --help        help for uninstall
+      --list        List installed packages and exit
+      --permanent   Bypass trash (rejected for safety)
 
 Global Flags:
       --debug   Enable verbose debug logging
@@ -447,6 +449,9 @@ enum Command {
     },
     Uninstall {
         dry_run: bool,
+        list: bool,
+        permanent: bool,
+        packages: Vec<String>,
     },
 }
 
@@ -553,9 +558,18 @@ pub fn run() -> ! {
                     debug,
                     include,
                 })),
-                Command::Uninstall { dry_run } => {
-                    std::process::exit(uninstall::run(&uninstall::Options { dry_run, debug }))
-                }
+                Command::Uninstall {
+                    dry_run,
+                    list,
+                    permanent,
+                    packages,
+                } => std::process::exit(uninstall::run(&uninstall::Options {
+                    dry_run,
+                    debug,
+                    list,
+                    permanent,
+                    packages,
+                })),
             }
         }
     }
@@ -676,6 +690,18 @@ const F_NODESC: FlagSpec = FlagSpec {
     takes_value: false,
     display: "--no-descriptions",
 };
+const F_PERMANENT: FlagSpec = FlagSpec {
+    long: "permanent",
+    short: None,
+    takes_value: false,
+    display: "--permanent",
+};
+const F_LIST: FlagSpec = FlagSpec {
+    long: "list",
+    short: None,
+    takes_value: false,
+    display: "--list",
+};
 
 const ROOT_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_VERSION];
 const HELP_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP];
@@ -689,7 +715,7 @@ fn cmd_flagset(name: &str) -> &'static [FlagSpec] {
         "clean" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_INCLUDE],
         "optimize" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_SKIP],
         "audit" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON, F_REPORT, F_INCLUDE],
-        "uninstall" => &[F_DEBUG, F_HELP, F_DRY_RUN],
+        "uninstall" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_PERMANENT, F_LIST],
         _ => &[],
     }
 }
@@ -1003,6 +1029,7 @@ fn exec_subcommand(name: &str, args: &[String]) -> Outcome {
     if p.get("help") {
         return Outcome::Stdout(cmd_help(name).unwrap().to_string());
     }
+    let debug = p.get("debug");
     let cmd = match name {
         "analyze" => Command::Analyze {
             path: p.positionals.first().map(std::path::PathBuf::from),
@@ -1030,13 +1057,13 @@ fn exec_subcommand(name: &str, args: &[String]) -> Outcome {
         },
         "uninstall" => Command::Uninstall {
             dry_run: p.get("dry-run"),
+            list: p.get("list"),
+            permanent: p.get("permanent"),
+            packages: p.positionals,
         },
         _ => unreachable!(),
     };
-    Outcome::Run {
-        debug: p.get("debug"),
-        cmd,
-    }
+    Outcome::Run { debug, cmd }
 }
 
 /// `mu help [topics]` — cobra's help command. Flags parse first (so

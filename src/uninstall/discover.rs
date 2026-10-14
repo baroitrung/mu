@@ -141,6 +141,84 @@ fn scan_i64(s: &str) -> i64 {
     if neg { -v } else { v }
 }
 
+/// `DiscoverFlatpak` — installed Flatpak application packages.
+pub fn discover_flatpak(runner: &dyn Runner) -> Result<Vec<Package>> {
+    if runner.look_path("flatpak").is_err() {
+        return Ok(Vec::new());
+    }
+    let out = runner
+        .run(&CommandSpec::new(
+            "flatpak",
+            ["list", "--app", "--columns=application,version,size,origin"],
+        ))
+        .map_err(|e| Error::Msg(format!("flatpak list: {e}")))?;
+    Ok(parse_flatpak_output(&out.stdout_lossy()))
+}
+
+/// `parseFlatpakOutput` — parses rows of `flatpak list --app`.
+pub(crate) fn parse_flatpak_output(output: &str) -> Vec<Package> {
+    let mut pkgs = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        let fields: Vec<&str> = if fields.len() >= 2 {
+            fields
+        } else {
+            line.split_whitespace().collect()
+        };
+        if fields.is_empty() {
+            continue;
+        }
+        let name = fields[0].trim().to_string();
+        let version = fields
+            .get(1)
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        let size_str = fields.get(2).map(|s| s.trim()).unwrap_or("");
+        let installed_kb = parse_size_to_kb(size_str);
+        pkgs.push(Package {
+            name,
+            version,
+            source: "flatpak".to_string(),
+            installed_kb,
+            ..Default::default()
+        });
+    }
+    pkgs
+}
+
+fn parse_size_to_kb(s: &str) -> i64 {
+    let s = s.trim();
+    if s.is_empty() {
+        return 0;
+    }
+    let mut num_str = String::new();
+    let mut unit_str = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() || c == '.' {
+            num_str.push(c);
+        } else if !c.is_whitespace() {
+            unit_str.push(c);
+        }
+    }
+    let val: f64 = num_str.parse().unwrap_or(0.0);
+    let unit = unit_str.to_uppercase();
+    if unit.starts_with('G') {
+        (val * 1024.0 * 1024.0) as i64
+    } else if unit.starts_with('M') {
+        (val * 1024.0) as i64
+    } else if unit.starts_with('K') {
+        val as i64
+    } else if unit.starts_with('B') {
+        (val / 1024.0) as i64
+    } else {
+        val as i64
+    }
+}
+
 /// `Discover` — all installed packages (APT + Snap) sorted by name, plus the
 /// joined per-source errors. Partial results are returned alongside the error
 /// exactly like Go's `(all, errors.Join(aptErr, snapErr))` pair. Rust's sort
@@ -155,17 +233,25 @@ pub fn discover(runner: &dyn Runner) -> (Vec<Package>, Option<Error>) {
         Ok(pkgs) => (pkgs, None),
         Err(e) => (Vec::new(), Some(e)),
     };
+    let (flatpak, flatpak_err) = match discover_flatpak(runner) {
+        Ok(pkgs) => (pkgs, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
     let mut all = apt;
     all.extend(snap);
+    all.extend(flatpak);
     all.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // `errors.Join(apt discovery: %w, snap discovery: %w)` — newline-joined.
+    // `errors.Join(apt discovery: %w, snap discovery: %w, flatpak discovery: %w)`
     let mut errs: Vec<String> = Vec::new();
     if let Some(e) = apt_err {
         errs.push(format!("apt discovery: {e}"));
     }
     if let Some(e) = snap_err {
         errs.push(format!("snap discovery: {e}"));
+    }
+    if let Some(e) = flatpak_err {
+        errs.push(format!("flatpak discovery: {e}"));
     }
     let err = if errs.is_empty() {
         None
@@ -215,6 +301,19 @@ mod tests {
         assert_eq!(pkgs.len(), 2, "expected 2 snap packages, got {pkgs:?}");
         assert_eq!(pkgs[0].name, "firefox");
         assert_eq!(pkgs[0].source, "snap");
+    }
+
+    #[test]
+    fn parse_flatpak_output_parses_rows() {
+        let fixture = "org.mozilla.firefox\t120.0\t250 MB\tflathub\n\
+             com.spotify.Client\t1.2.0\t1.5 GB\tflathub\n";
+        let pkgs = parse_flatpak_output(fixture);
+        assert_eq!(pkgs.len(), 2);
+        assert_eq!(pkgs[0].name, "org.mozilla.firefox");
+        assert_eq!(pkgs[0].source, "flatpak");
+        assert_eq!(pkgs[0].installed_kb, 250 * 1024);
+        assert_eq!(pkgs[1].name, "com.spotify.Client");
+        assert_eq!(pkgs[1].installed_kb, (1.5 * 1024.0 * 1024.0) as i64);
     }
 
     // discover_test.go: TestDiscoverReturnsPartialPackagesAndJoinedErrors

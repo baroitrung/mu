@@ -138,6 +138,7 @@ pub(crate) fn all_targets_in(deps: &Deps) -> Vec<CleanTarget> {
         scan_snap::snap_target_in(deps),
         scan_kernels::kernels_target_in(deps),
         scan_browser::browser_cache_target_in(deps),
+        targets::system_trash_target_in(deps),
     ];
     if let Some(docker) = scan_docker::docker_target_in(deps) {
         targets.push(docker);
@@ -298,15 +299,17 @@ fn run_plain(
     });
 
     for res in &results {
-        // `r.Line("%-40s %s", ...)`.
-        r.line(format_args!(
-            "{:<40} {}",
-            res.target.label,
-            size::human_size(res.size)
-        ))?;
+        let label = if res.target.id == "system-trash" {
+            let count = targets::count_trash_items(&deps.data_home);
+            format!(
+                "System Trash ({count} item{})",
+                if count == 1 { "" } else { "s" }
+            )
+        } else {
+            res.target.label.to_string()
+        };
+        r.line(format_args!("{:<40} {}", label, size::human_size(res.size)))?;
         for item in &res.items {
-            // `r.Line("  - %s", item)` — the renderer's 2-space indent plus
-            // the format's own 2 spaces.
             r.line(format_args!("  - {item}"))?;
         }
     }
@@ -315,6 +318,7 @@ fn run_plain(
         "Potential space to free: {}",
         size::human_size(total)
     ))?;
+    export_preview_ledger(&results, total, &deps.config_home, &deps.data_home);
     if !scan_errors.is_empty() {
         return Err(join_errors(&scan_errors));
     }
@@ -325,6 +329,7 @@ fn run_plain(
             "Validating the exact cleanup actions without changing data."
         ))?;
         execute(&mut r, &results, opts, deps)?;
+        let _ = print_downloads_large_files_hint(&deps.home, &mut r);
         let summary = format!("Dry run — {} reclaimable", size::human_size(total));
         r.summary(&summary)?;
         return Ok(summary);
@@ -339,10 +344,77 @@ fn run_plain(
     }
 
     let freed = execute(&mut r, &results, opts, deps)?;
+    let _ = print_downloads_large_files_hint(&deps.home, &mut r);
     r.summary(&format!("All done — freed {}", size::human_size(freed)))?;
     Ok(format!("Freed {}", size::human_size(freed)))
 }
 
+fn export_preview_ledger(
+    results: &[ScanResult],
+    total: i64,
+    config_home: &std::path::Path,
+    data_home: &std::path::Path,
+) {
+    let mu_dir = config_home.join("mu");
+    let _ = std::fs::create_dir_all(&mu_dir);
+    let ledger_path = mu_dir.join("clean-list.txt");
+    let mut f = match std::fs::File::create(&ledger_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let _ = writeln!(f, "# mu clean preview ledger");
+    let _ = writeln!(
+        f,
+        "# Total potential space to free: {}",
+        size::human_size(total)
+    );
+    let _ = writeln!(f, "--------------------------------------------------");
+    for res in results {
+        let label = if res.target.id == "system-trash" {
+            let count = targets::count_trash_items(data_home);
+            format!(
+                "System Trash ({count} item{})",
+                if count == 1 { "" } else { "s" }
+            )
+        } else {
+            res.target.label.to_string()
+        };
+        let _ = writeln!(f, "{:<40} {}", label, size::human_size(res.size));
+        for item in &res.items {
+            let _ = writeln!(f, "  - {item}");
+        }
+    }
+}
+
+fn print_downloads_large_files_hint(
+    home: &std::path::Path,
+    r: &mut runtext::Run<'_>,
+) -> Result<()> {
+    let downloads = home.join("Downloads");
+    let Ok(entries) = std::fs::read_dir(&downloads) else {
+        return Ok(());
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            continue;
+        }
+        if meta.len() > 500 * 1024 * 1024 {
+            count += 1;
+        }
+    }
+    if count > 0 {
+        r.line(format_args!(
+            "\nHint: found {count} large file{} (>500MB) in ~/Downloads (run 'mu analyze' to inspect)",
+            if count == 1 { "" } else { "s" }
+        ))?;
+    }
+    Ok(())
+}
 /// `execute` — run each target's `Execute` in order, logging per-target
 /// outcomes and warning on stderr for failures. Returns the summed size of
 /// the successful targets; one or more failures yield
@@ -741,6 +813,66 @@ mod tests {
         assert_eq!(size, 3, "thumbnail size");
         (target.execute)(true).expect("dry-run execute");
         assert!(paths::path_exists(&thumbs), "dry-run removed thumbnails");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn system_trash_target_and_ledger_test() {
+        let tmp = tempdir("systrash");
+        let fake_runner = Arc::new(FakeRunner::new());
+        fake_runner.set_look_path("gio", "/usr/bin/gio");
+        let deps = deps_for_test(&tmp, fake_runner);
+        let trash_files = deps.data_home.join("Trash").join("files");
+        fs::create_dir_all(&trash_files).unwrap();
+        fs::write(trash_files.join("item1.txt"), "hello").unwrap();
+        fs::write(trash_files.join("item2.txt"), "world!").unwrap();
+
+        let trash_target = targets::system_trash_target_in(&deps);
+        assert!(trash_target.opt_in, "system-trash should be opt-in");
+        assert_eq!(trash_target.id, "system-trash");
+
+        let (sz, err) = (trash_target.scan)();
+        assert!(err.is_none());
+        assert!(sz > 0);
+        assert_eq!(targets::count_trash_items(&deps.data_home), 2);
+
+        // Execute in dry-run mode
+        (trash_target.execute)(true).expect("dry-run should succeed");
+        assert!(trash_files.join("item1.txt").exists());
+
+        // Test export_preview_ledger
+        let res = ScanResult {
+            target: trash_target,
+            size: sz,
+            items: vec!["item1.txt".into(), "item2.txt".into()],
+        };
+        export_preview_ledger(&[res], sz, &deps.config_home, &deps.data_home);
+        let ledger = tmp.join(".config").join("mu").join("clean-list.txt");
+        assert!(ledger.exists(), "clean-list.txt should be created");
+        let content = fs::read_to_string(&ledger).unwrap();
+        assert!(content.contains("System Trash (2 items)"));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn downloads_large_files_hint_test() {
+        let tmp = tempdir("dlhint");
+        let downloads = tmp.join("Downloads");
+        fs::create_dir_all(&downloads).unwrap();
+        let big_file = downloads.join("large_iso.img");
+        // Allocate sparse or small file? We can check with mock or small if size is tested
+        // But wait: metadata.len() needs to be > 500MB.
+        // With set_len:
+        let f = fs::File::create(&big_file).unwrap();
+        f.set_len(501 * 1024 * 1024).unwrap(); // sparse file, takes 0 actual disk space
+
+        let mut out = Vec::new();
+        let mut r = runtext::Run::new(&mut out);
+        print_downloads_large_files_hint(&tmp, &mut r).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("Hint: found 1 large file (>500MB) in ~/Downloads"));
+
         fs::remove_dir_all(&tmp).ok();
     }
 }
