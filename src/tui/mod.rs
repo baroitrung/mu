@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+pub mod analyze;
 pub mod audit;
 pub mod clean;
 pub mod confirm;
@@ -222,6 +223,76 @@ pub fn run_status_dashboard() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Run the interactive disk analyzer in its own alt-screen loop.
+pub fn run_analyze_tui(
+    opts: &crate::analyze::Options,
+    target: &std::path::Path,
+) -> anyhow::Result<()> {
+    if !std::io::stdout().is_terminal() {
+        return Err(anyhow::anyhow!(
+            "could not open a new TTY: open /dev/tty: no such device or address"
+        ));
+    }
+
+    if let Err(e) = std::fs::metadata(target).or_else(|_| std::fs::symlink_metadata(target)) {
+        return Err(anyhow::anyhow!("cannot inspect {}: {e}", target.display()));
+    }
+
+    enable_raw_mode()?;
+    let _raw_guard = RawModeGuard;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let _alt_guard = AltScreenGuard;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut tui = analyze::AnalyzeTui::new(opts.dry_run);
+
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_for_worker = cancel.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let target_buf = target.to_path_buf();
+
+    std::thread::spawn(move || {
+        let _ = std::panic::catch_unwind(move || {
+            let _ = crate::analyze::walker::scan_path(
+                &target_buf,
+                crate::analyze::walker::WalkerOptions::default(),
+                Some(tx),
+                cancel_for_worker,
+            );
+        });
+    });
+
+    loop {
+        terminal.draw(|f| tui.render(f, f.area()))?;
+
+        while let Ok(msg) = rx.try_recv() {
+            tui.apply_message(msg);
+        }
+
+        if event::poll(std::time::Duration::from_millis(60))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if tui.handle_key_event(key) {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                }
+                Event::Resize(w, h) => {
+                    tui.resize(w, h);
+                }
+                _ => {}
+            }
+        } else {
+            tui.tick();
+        }
+    }
+
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 

@@ -1,0 +1,22 @@
+Interactive disk usage explorer (ncdu-like).
+Navigate directories, inspect large files, and safely move items to trash.
+
+Interactive (default on a TTY):
+  ↑/k, ↓/j to navigate, Enter/→/l to open, Esc/←/h to go up.
+  d to delete item to trash (requires confirmation).
+  s to change sort order, Tab to view largest files.
+
+Scripting:
+  mu analyze --json [PATH]      output JSON directory tree and exit
+  mu analyze --dry-run [PATH]   preview scan metrics with deletion disabled
+
+Usage:
+  mu analyze [PATH] [flags]
+
+Flags:
+      --dry-run   Preview actions without making changes
+  -h, --help      help for analyze
+      --json      Output JSON directory tree and exit
+
+Global Flags:
+      --debug   Enable verbose debug logging

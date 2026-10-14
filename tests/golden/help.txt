@@ -8,6 +8,7 @@ Usage:
   mu [command]
 
 Available Commands:
+  analyze     Interactive disk usage explorer (ncdu-like)
   audit       Diagnose cleanup issues and apply recommended fixes
   clean       Free disk space by removing caches, logs, and old packages
   completion  Generate the autocompletion script for the specified shell
