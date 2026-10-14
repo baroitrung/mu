@@ -63,6 +63,60 @@ fn status_json_flag() {
     serde_json::from_str::<serde_json::Value>(&stdout(&o)).expect("status --json parse");
 }
 
+/// `mu status --json` emits extended fields `cpu_cores` and `disk_io`.
+#[test]
+fn status_json_extended_fields() {
+    let o = mu(&["status", "--json"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).expect("status --json parse");
+    for key in [
+        "cpu_percent",
+        "memory",
+        "disks",
+        "network",
+        "health",
+        "cpu_cores",
+        "disk_io",
+    ] {
+        assert!(v.get(key).is_some(), "missing {key} in {v}");
+    }
+}
+
+/// `mu status --watch` streams valid NDJSON lines containing required metrics.
+#[test]
+fn status_watch_ndjson_streaming() {
+    let mu_bin = env!("CARGO_BIN_EXE_mu");
+    let mut child = Command::new(mu_bin)
+        .args(["status", "--watch", "--interval", "100ms"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mu status --watch");
+
+    let stdout_pipe = child.stdout.take().expect("stdout pipe");
+    let reader = std::io::BufReader::new(stdout_pipe);
+    let mut lines = Vec::new();
+    for line in std::io::BufRead::lines(reader).take(2) {
+        let line = line.expect("read line from watch");
+        let v: serde_json::Value = serde_json::from_str(&line).expect("parse NDJSON line");
+        for key in ["cpu_percent", "memory", "disks", "network", "health"] {
+            assert!(v.get(key).is_some(), "missing {key} in {line}");
+        }
+        lines.push(v);
+    }
+    assert_eq!(lines.len(), 2);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `mu status --help` renders usage matching golden fixture.
+#[test]
+fn status_help_output() {
+    let o = mu(&["status", "--help"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), include_str!("golden/help-status.txt"));
+}
+
 /// `mu audit` piped → human report on stdout (Go falls back to report
 /// mode), exit code is the severity-driven 0/1/2 — never the old stub's 2+
 /// or an arg error.

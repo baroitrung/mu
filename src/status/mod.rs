@@ -12,7 +12,10 @@ pub mod model;
 pub mod proc;
 
 pub use health::health_score_available;
-pub use model::{CPUSample, DiskStat, MemStats, NetRate, NetStat, Snapshot};
+pub use model::{
+    BatteryInfo, CPUSample, DiskIORate, DiskIOSample, DiskStat, HardwareInfo, MemStats, NetRate,
+    NetStat, ProcessInfo, Snapshot,
+};
 // Re-exported for the TUI phase (view.go ports) — not yet consumed.
 #[allow(unused_imports)]
 pub use health::health_score;
@@ -32,28 +35,56 @@ use crate::error::{Error, Result};
 /// errors, matching `proc::read_disk_full`.
 pub type DiskReader = Box<dyn FnMut() -> (Vec<DiskStat>, Option<Error>)>;
 
+/// DiskIOReader returns (map of device to DiskIOSample, scan error).
+pub type DiskIOReader = Box<dyn FnMut() -> (BTreeMap<String, DiskIOSample>, Option<Error>)>;
+
 /// Go's `readNetworkFn` — `(values, joinedErr)` pair, matching
 /// `proc::read_network_full`.
 pub type NetReader = Box<dyn FnMut() -> (BTreeMap<String, NetStat>, Option<Error>)>;
 
 /// Injectable metric readers — the port of Go's package-var hooks
 /// (`readCPUFn`, `readMemoryFn`, `readDiskFn`, `readNetworkFn`) that
-/// `status_test.go` swaps out for fakes.
+/// `status_test.go` swaps out for fakes, plus Phase 5 extended collectors.
 pub struct Readers {
     pub cpu: Box<dyn FnMut() -> Result<CPUSample>>,
+    pub cpu_cores: Box<dyn FnMut() -> Result<Vec<CPUSample>>>,
     pub memory: Box<dyn FnMut() -> Result<MemStats>>,
     pub disk: DiskReader,
+    pub disk_io: DiskIOReader,
     pub network: NetReader,
+    pub hardware: Box<dyn FnMut() -> HardwareInfo>,
+    pub battery: Box<dyn FnMut() -> Result<Option<BatteryInfo>>>,
+    pub processes: Box<dyn FnMut() -> Result<Vec<ProcessInfo>>>,
 }
 
+impl Default for Readers {
+    fn default() -> Self {
+        Readers {
+            cpu: Box::new(|| Ok(CPUSample::default())),
+            cpu_cores: Box::new(|| Ok(Vec::new())),
+            memory: Box::new(|| Ok(MemStats::default())),
+            disk: Box::new(|| (Vec::new(), None)),
+            disk_io: Box::new(|| (BTreeMap::new(), None)),
+            network: Box::new(|| (BTreeMap::new(), None)),
+            hardware: Box::new(HardwareInfo::default),
+            battery: Box::new(|| Ok(None)),
+            processes: Box::new(|| Ok(Vec::new())),
+        }
+    }
+}
 impl Readers {
     /// Readers bound to the real /proc + mountinfo parsers.
     pub fn real() -> Self {
         Readers {
             cpu: Box::new(proc::read_cpu),
+            cpu_cores: Box::new(proc::read_cpu_cores),
             memory: Box::new(proc::read_memory),
             disk: Box::new(proc::read_disk_full),
+            disk_io: Box::new(proc::read_disk_io_full),
             network: Box::new(proc::read_network_full),
+            hardware: Box::new(proc::read_hardware),
+            battery: Box::new(proc::read_battery),
+            processes: Box::new(proc::read_top_processes),
         }
     }
 }
@@ -78,19 +109,38 @@ pub fn collect_snapshot(interval: Duration) -> Snapshot {
 pub fn collect_snapshot_with(interval: Duration, readers: &mut Readers) -> Snapshot {
     let mut snap = Snapshot::default();
 
+    // Sample initial rates
+    let cpu1 = (readers.cpu)();
+    let cores1 = (readers.cpu_cores)();
+    let (disk_io1, _) = (readers.disk_io)();
+    let net1 = (readers.network)();
+
+    wait(interval);
+
     let mut cpu_available = false;
-    match (readers.cpu)() {
+    match cpu1 {
         Err(err) => snap.scan_errors.push(format!("cpu: {err}")),
-        Ok(s1) => {
-            wait(interval);
-            match (readers.cpu)() {
-                Err(second_err) => snap.scan_errors.push(format!("cpu: {second_err}")),
-                Ok(s2) => {
-                    snap.cpu_percent = cpu_percent(s1, s2);
-                    cpu_available = true;
-                }
+        Ok(s1) => match (readers.cpu)() {
+            Err(second_err) => snap.scan_errors.push(format!("cpu: {second_err}")),
+            Ok(s2) => {
+                snap.cpu_percent = cpu_percent(s1, s2);
+                cpu_available = true;
             }
-        }
+        },
+    }
+
+    if let (Ok(c1), Ok(c2)) = (cores1, (readers.cpu_cores)()) {
+        snap.cpu_cores =
+            (!c1.is_empty() && !c2.is_empty()).then(|| proc::cpu_cores_percent(&c1, &c2));
+    }
+
+    let seconds = interval.as_secs_f64();
+    let seconds = if seconds <= 0.0 { 1.0 } else { seconds };
+
+    let (disk_io2, _) = (readers.disk_io)();
+    if !disk_io1.is_empty() || !disk_io2.is_empty() {
+        let rates = proc::disk_io_rates(&disk_io1, &disk_io2, seconds);
+        snap.disk_io = Some(rates);
     }
 
     let mut mem_available = false;
@@ -109,24 +159,32 @@ pub fn collect_snapshot_with(interval: Duration, readers: &mut Readers) -> Snaps
         snap.scan_errors.push(format!("disk: {disk_err}"));
     }
 
-    match (readers.network)() {
+    match net1 {
         (_, Some(net_err)) => snap.scan_errors.push(format!("network: {net_err}")),
-        (n1, None) => {
-            wait(interval);
-            match (readers.network)() {
-                (_, Some(second_err)) => {
-                    snap.scan_errors.push(format!("network: {second_err}"));
-                }
-                (n2, None) => {
-                    let seconds = interval.as_secs_f64();
-                    let seconds = if seconds <= 0.0 { 1.0 } else { seconds };
-                    // Go: NetworkRates returns make(map) → `{}` even when
-                    // empty; Some(_) distinguishes success from the nil/null
-                    // error paths above.
-                    snap.network = Some(network_rates(&n1, &n2, seconds));
-                }
+        (n1, None) => match (readers.network)() {
+            (_, Some(second_err)) => {
+                snap.scan_errors.push(format!("network: {second_err}"));
             }
-        }
+            (n2, None) => {
+                // Go: NetworkRates returns make(map) → `{}` even when
+                // empty; Some(_) distinguishes success from the nil/null
+                // error paths above.
+                snap.network = Some(network_rates(&n1, &n2, seconds));
+            }
+        },
+    }
+
+    let hw = (readers.hardware)();
+    if hw.model.is_some() || hw.cpu_model.is_some() || hw.cpu_cores.is_some() {
+        snap.hardware = Some(hw);
+    }
+
+    if let Ok(Some(bat)) = (readers.battery)() {
+        snap.battery = Some(bat);
+    }
+
+    if let Ok(procs) = (readers.processes)() {
+        snap.processes = (!procs.is_empty()).then_some(procs);
     }
 
     snap.health = health_score_available(
@@ -139,6 +197,11 @@ pub fn collect_snapshot_with(interval: Duration, readers: &mut Readers) -> Snaps
     snap
 }
 
+/// Snapshot JSON helper: one-shot collection with default 1s interval.
+pub fn collect_snapshot_json() -> Snapshot {
+    collect_snapshot(Duration::from_secs(1))
+}
+
 /// Dashboard ports Go's `Model` tick-time state machine for the later TUI.
 /// `tick` mirrors the `tickMsg` branch of `Model.Update`; Bubbletea's
 /// view/key handling and tick scheduling are deferred to the ratatui phase.
@@ -147,13 +210,20 @@ pub struct Dashboard {
     /// zero-value compare is kept verbatim: an all-zero read counts as
     /// "no previous sample" and a failed read resets it, exactly like Go.
     pub prev_cpu: CPUSample,
+    pub prev_cpu_cores: Vec<CPUSample>,
     pub cpu: f64,
+    pub cpu_cores: Vec<f64>,
     pub cpu_ready: bool,
     pub mem: MemStats,
     pub disks: Vec<DiskStat>,
+    pub prev_disk_io: Option<BTreeMap<String, DiskIOSample>>,
+    pub disk_io_rates: BTreeMap<String, DiskIORate>,
     /// `None` mirrors Go's nil map — `Some(empty)` still counts as present.
     pub prev_nets: Option<BTreeMap<String, NetStat>>,
     pub net_rates: BTreeMap<String, NetRate>,
+    pub hardware: HardwareInfo,
+    pub battery: Option<BatteryInfo>,
+    pub processes: Vec<ProcessInfo>,
     pub health: i64,
     /// Timestamp of the previous tick (Go `prevTime`); the network rate
     /// interval is `prev_time.elapsed()` clamped to >= 1s like Go.
@@ -192,6 +262,14 @@ impl Dashboard {
             }
         }
 
+        // 1b. Per-core CPU
+        if let Ok(curr_cores) = (readers.cpu_cores)() {
+            if !self.prev_cpu_cores.is_empty() && !curr_cores.is_empty() {
+                self.cpu_cores = proc::cpu_cores_percent(&self.prev_cpu_cores, &curr_cores);
+            }
+            self.prev_cpu_cores = curr_cores;
+        }
+
         // 2. Read memory.
         match (readers.memory)() {
             Err(mem_err) => self.scan_errors.push(format!("memory: {mem_err}")),
@@ -208,11 +286,18 @@ impl Dashboard {
             self.scan_errors.push(format!("disk: {disk_err}"));
         }
 
+        // 3b. Read disk I/O
+        let elapsed = self.prev_time.elapsed().as_secs_f64();
+        let elapsed = if elapsed <= 0.0 { 1.0 } else { elapsed };
+        let (curr_disk_io, _) = (readers.disk_io)();
+        if let Some(prev_io) = &self.prev_disk_io {
+            self.disk_io_rates = proc::disk_io_rates(prev_io, &curr_disk_io, elapsed);
+        }
+        self.prev_disk_io = Some(curr_disk_io);
+
         // 4. Read network; compute rates from the previous sample.
         match (readers.network)() {
             (curr_nets, None) => {
-                let elapsed = self.prev_time.elapsed().as_secs_f64();
-                let elapsed = if elapsed <= 0.0 { 1.0 } else { elapsed };
                 if let Some(prev_nets) = &self.prev_nets {
                     self.net_rates = network_rates(prev_nets, &curr_nets, elapsed);
                 }
@@ -221,6 +306,11 @@ impl Dashboard {
             (_, Some(err)) => self.scan_errors.push(format!("network: {err}")),
         }
         self.prev_time = Instant::now();
+
+        // 4b. Hardware, battery, processes
+        self.hardware = (readers.hardware)();
+        self.battery = (readers.battery)().unwrap_or(None);
+        self.processes = (readers.processes)().unwrap_or_default();
 
         // 5. Compute health.
         self.health = health_score_available(
@@ -237,12 +327,19 @@ impl Default for Dashboard {
     fn default() -> Self {
         Dashboard {
             prev_cpu: CPUSample::default(),
+            prev_cpu_cores: Vec::new(),
             cpu: 0.0,
+            cpu_cores: Vec::new(),
             cpu_ready: false,
             mem: MemStats::default(),
             disks: Vec::new(),
+            prev_disk_io: None,
+            disk_io_rates: BTreeMap::new(),
             prev_nets: None,
             net_rates: BTreeMap::new(),
+            hardware: HardwareInfo::default(),
+            battery: None,
+            processes: Vec::new(),
             health: 0,
             prev_time: Instant::now(),
             scan_errors: Vec::new(),
@@ -288,6 +385,121 @@ pub fn run(json: bool) -> i32 {
     }
 }
 
+/// RunWatch continuously streams status snapshots as NDJSON lines until cancelled
+/// or downstream pipe closes.
+pub fn run_watch(interval: Duration) -> i32 {
+    let mut readers = Readers::real();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    let mut prev_cpu = (readers.cpu)().unwrap_or_default();
+    let mut prev_cores = (readers.cpu_cores)().unwrap_or_default();
+    let (mut prev_disk_io, _) = (readers.disk_io)();
+    let (mut prev_net, _) = (readers.network)();
+    let mut prev_time = Instant::now();
+
+    loop {
+        wait(interval);
+
+        let mut snap = Snapshot::default();
+        let elapsed = prev_time.elapsed().as_secs_f64();
+        let elapsed = if elapsed <= 0.0 { 1.0 } else { elapsed };
+        prev_time = Instant::now();
+
+        let mut cpu_available = false;
+        match (readers.cpu)() {
+            Ok(curr_cpu) => {
+                if prev_cpu != CPUSample::default() {
+                    snap.cpu_percent = cpu_percent(prev_cpu, curr_cpu);
+                    cpu_available = true;
+                }
+                prev_cpu = curr_cpu;
+            }
+            Err(e) => {
+                snap.scan_errors.push(format!("cpu: {e}"));
+                prev_cpu = CPUSample::default();
+            }
+        }
+
+        if let Ok(curr_cores) = (readers.cpu_cores)() {
+            if !prev_cores.is_empty() && !curr_cores.is_empty() {
+                snap.cpu_cores = Some(proc::cpu_cores_percent(&prev_cores, &curr_cores));
+            }
+            prev_cores = curr_cores;
+        }
+
+        let (curr_disk_io, _) = (readers.disk_io)();
+        if !prev_disk_io.is_empty() || !curr_disk_io.is_empty() {
+            snap.disk_io = Some(proc::disk_io_rates(&prev_disk_io, &curr_disk_io, elapsed));
+        }
+        prev_disk_io = curr_disk_io;
+
+        match (readers.network)() {
+            (curr_net, None) => {
+                snap.network = Some(network_rates(&prev_net, &curr_net, elapsed));
+                prev_net = curr_net;
+            }
+            (_, Some(e)) => {
+                snap.scan_errors.push(format!("network: {e}"));
+            }
+        }
+
+        let mut mem_available = false;
+        match (readers.memory)() {
+            Ok(mem) => {
+                snap.memory = mem;
+                mem_available = true;
+            }
+            Err(e) => snap.scan_errors.push(format!("memory: {e}")),
+        }
+
+        let (disks, disk_err) = (readers.disk)();
+        snap.disks = if disks.is_empty() { None } else { Some(disks) };
+        if let Some(e) = disk_err {
+            snap.scan_errors.push(format!("disk: {e}"));
+        }
+
+        let hw = (readers.hardware)();
+        if hw.model.is_some() || hw.cpu_model.is_some() || hw.cpu_cores.is_some() {
+            snap.hardware = Some(hw);
+        }
+        if let Ok(Some(bat)) = (readers.battery)() {
+            snap.battery = Some(bat);
+        }
+        if let Ok(procs) = (readers.processes)() {
+            snap.processes = (!procs.is_empty()).then_some(procs);
+        }
+
+        snap.health = health_score_available(
+            snap.cpu_percent,
+            cpu_available,
+            snap.memory,
+            mem_available,
+            snap.disks.as_deref().unwrap_or(&[]),
+        );
+
+        let body = match serde_json::to_string(&snap) {
+            Ok(b) => model::escape_html_json(&b),
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        };
+
+        if let Err(e) = out
+            .write_all(body.as_bytes())
+            .and_then(|()| out.write_all(b"\n"))
+            .and_then(|()| out.flush())
+        {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                return 0;
+            }
+            eprintln!("{e}");
+            return 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +517,7 @@ mod tests {
                     Some(Error::Msg("network unavailable".to_string())),
                 )
             }),
+            ..Readers::default()
         }
     }
 
@@ -411,6 +624,7 @@ mod tests {
                 )
             }),
             network: Box::new(|| (BTreeMap::new(), None)),
+            ..Readers::default()
         };
 
         let mut dashboard = Dashboard::new();
@@ -473,6 +687,7 @@ mod tests {
                 );
                 (nets, None)
             }),
+            ..Readers::default()
         };
         let snap = collect_snapshot_with(Duration::ZERO, &mut readers);
         assert!(snap.scan_errors.is_empty());
@@ -494,5 +709,59 @@ mod tests {
             .as_array()
             .expect("scan_errors must be emitted when metrics fail");
         assert_eq!(errors.len(), 4);
+    }
+
+    #[test]
+    fn snapshot_json_includes_extended_fields_when_present() {
+        let mut readers = Readers {
+            cpu_cores: Box::new(|| {
+                Ok(vec![CPUSample {
+                    user: 10,
+                    idle: 90,
+                    ..CPUSample::default()
+                }])
+            }),
+            disk_io: Box::new(|| {
+                let mut map = BTreeMap::new();
+                map.insert(
+                    "sda".to_string(),
+                    DiskIOSample {
+                        reads: 10,
+                        sectors_read: 100,
+                        writes: 5,
+                        sectors_written: 50,
+                    },
+                );
+                (map, None)
+            }),
+            hardware: Box::new(|| HardwareInfo {
+                model: Some("TestBox".to_string()),
+                cpu_model: Some("FastCPU".to_string()),
+                cpu_cores: Some(4),
+            }),
+            battery: Box::new(|| {
+                Ok(Some(BatteryInfo {
+                    percentage: 95,
+                    status: "Charging".to_string(),
+                    health_percent: Some(99.0),
+                }))
+            }),
+            processes: Box::new(|| {
+                Ok(vec![ProcessInfo {
+                    pid: 1,
+                    name: "systemd".to_string(),
+                    cpu_percent: 0.5,
+                    memory_bytes: 1024,
+                }])
+            }),
+            ..Readers::default()
+        };
+        let snap = collect_snapshot_with(Duration::ZERO, &mut readers);
+        let v: serde_json::Value = serde_json::to_value(&snap).unwrap();
+        assert!(v.get("cpu_cores").is_some(), "missing cpu_cores");
+        assert!(v.get("disk_io").is_some(), "missing disk_io");
+        assert!(v.get("hardware").is_some(), "missing hardware");
+        assert!(v.get("battery").is_some(), "missing battery");
+        assert!(v.get("processes").is_some(), "missing processes");
     }
 }
