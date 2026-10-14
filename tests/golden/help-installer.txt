@@ -1,0 +1,13 @@
+Find and remove downloaded installer packages (.deb, .AppImage, .iso).
+
+Usage:
+  mu installer [flags]
+
+Flags:
+      --dry-run         Preview actions without making changes
+  -h, --help            help for installer
+      --paths strings   Specific directories to scan
+  -y, --yes             Skip confirmation prompt
+
+Global Flags:
+      --debug   Enable verbose debug logging

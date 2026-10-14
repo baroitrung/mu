@@ -1,0 +1,14 @@
+Safely clean heavy project build artifacts (node_modules, target, .venv).
+
+Usage:
+  mu purge [flags]
+
+Flags:
+      --dry-run         Preview actions without making changes
+  -h, --help            help for purge
+      --include-empty   Include empty build artifact directories
+      --paths strings   Specific project directories to scan
+  -y, --yes             Skip confirmation prompt
+
+Global Flags:
+      --debug   Enable verbose debug logging

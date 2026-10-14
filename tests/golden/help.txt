@@ -13,7 +13,10 @@ Available Commands:
   clean       Free disk space by removing caches, logs, and old packages
   completion  Generate the autocompletion script for the specified shell
   help        Help about any command
+  history     View recent operations and deletion log
+  installer   Find and remove downloaded installer packages (.deb, .AppImage, .iso)
   optimize    Run system maintenance: apt autoremove, journal vacuum, cache refresh
+  purge       Safely clean heavy project build artifacts (node_modules, target, .venv)
   status      Live system dashboard: CPU, RAM, disk, network, health score
   uninstall   Remove apps and all their config, cache, and data remnants
 
