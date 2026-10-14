@@ -11,14 +11,15 @@ updated: 2026-10-14
 # Plan: Upstream Mole Parity for mu (Ubuntu)
 
 ## Outcome
-- result: `mu` achieves comprehensive feature parity with upstream Mole (`tw93/mole` @ `7867c80` / `V1.59.1`), adapted idiomatically and safely to the Ubuntu/Debian Linux desktop and server ecosystem. Every missing or partial upstream feature is either implemented across 5 shippable, risk-ranked phases or documented as N/A macOS-only with technical justification. All operations preserve `mu`'s inviolable safety invariants (preview-before-destroy, trash-not-delete via `trash::SafeDelete`, fail-closed whitelist checks, and operation logging).
+- result: `mu` achieves comprehensive feature parity with upstream Mole (`tw93/mole` @ `7867c80` / `V1.59.1`), adapted idiomatically and safely to the Ubuntu/Debian Linux desktop and server ecosystem. Every missing or partial upstream feature is either implemented across 6 shippable, risk-ranked phases or documented as N/A macOS-only with technical justification. All operations preserve `mu`'s inviolable safety invariants (preview-before-destroy, trash-not-delete via `trash::SafeDelete`, fail-closed whitelist checks, and operation logging).
 - success_signals:
   - `make test` passes with zero regressions across all unit and integration suites (312+ baseline tests preserved).
-  - Clean & Uninstall enhancements (Phase 1): Snap/Flatpak browser caches detected, `system-trash` clean target reclaims space safely with size and item count preview via `gio trash --empty` (failing closed without `--yes` in headless mode), preview ledger exported to `$XDG_CONFIG_HOME/mu/clean-list.txt`, `mu uninstall <pkg>` executes non-interactively from CLI, `mu uninstall --list` outputs installed packages, and `--permanent` is explicitly rejected with a helpful safety error.
-  - Optimize & Clean extensions (Phase 2): `mu optimize` expands from 3 to 9 safe maintenance units (DNS cache flush, broken package config repair, failed systemd unit reset, unused Flatpak runtime cleanup, SQLite vacuum, stale state cleanup, broken autostart audit, broken services audit, and home permissions audit) with `--skip` support and exact shell command display in `--dry-run`; optional clean targets for developer CLI caches (`--include=dev-cache`), Podman (`--include=podman`), and orphaned system services (`--include=orphaned-services`). The dangerous route/neighbor table flush is dropped and marked N/A as it severs live SSH connections.
-  - History, Purge & Installer (Phase 3): `mu history` inspects `$XDG_DATA_HOME/mu/operations.log` in table and `--json` format; `mu purge` safely cleans heavy project build artifacts (`node_modules`, `target`, `dist`, `.venv`) with `--paths`, `--dry-run`, and `--yes`; `mu installer` finds and cleans large package installers in `~/Downloads`.
-  - Advanced Status & Disk Analysis (Phase 4): `mu status` supports continuous NDJSON streaming via `--watch [--interval 1s]` and surfaces per-core CPU, disk I/O, battery, and top process stats; `mu analyze` provides an interactive ncdu-like Ratatui disk usage explorer with `--json`, `--dry-run` immutability proof, and in-app safe trash deletion.
-  - Management & Biometrics (Phase 5): `mu sudo` provides PAM fingerprint configuration (`enable`, `disable`, `status`) mirroring `mo touchid`; `mu update` checks GitHub releases and self-updates verified binaries; `mu remove` safely uninstalls `mu`; `mu completion --install` auto-installs shell scripts.
+  - Interactive Disk Analysis (Phase 1): `mu analyze` provides an interactive ncdu-like Ratatui disk usage explorer with `--json`, `--dry-run` immutability proof, and in-app safe trash deletion.
+  - Clean & Uninstall enhancements (Phase 2): Snap/Flatpak browser caches detected, `system-trash` clean target reclaims space safely with size and item count preview via `gio trash --empty` (failing closed without `--yes` in headless mode), preview ledger exported to `$XDG_CONFIG_HOME/mu/clean-list.txt`, `mu uninstall <pkg>` executes non-interactively from CLI, `mu uninstall --list` outputs installed packages, and `--permanent` is explicitly rejected with a helpful safety error.
+  - Optimize & Clean extensions (Phase 3): `mu optimize` expands from 3 to 9 safe maintenance units (DNS cache flush, broken package config repair, failed systemd unit reset, unused Flatpak runtime cleanup, SQLite vacuum, stale state cleanup, broken autostart audit, broken services audit, and home permissions audit) with `--skip` support and exact shell command display in `--dry-run`; optional clean targets for developer CLI caches (`--include=dev-cache`), Podman (`--include=podman`), and orphaned system services (`--include=orphaned-services`). The dangerous route/neighbor table flush is dropped and marked N/A as it severs live SSH connections.
+  - History, Purge & Installer (Phase 4): `mu history` inspects `$XDG_DATA_HOME/mu/operations.log` in table and `--json` format; `mu purge` safely cleans heavy project build artifacts (`node_modules`, `target`, `dist`, `.venv`) with `--paths`, `--dry-run`, and `--yes`; `mu installer` finds and cleans large package installers in `~/Downloads`.
+  - Advanced Status Monitoring (Phase 5): `mu status` supports continuous NDJSON streaming via `--watch [--interval 1s]` and surfaces per-core CPU, disk I/O, battery, and top process stats.
+  - Management & Biometrics (Phase 6): `mu sudo` provides PAM fingerprint configuration (`enable`, `disable`, `status`) mirroring `mo touchid`; `mu update` checks GitHub releases and self-updates verified binaries; `mu remove` safely uninstalls `mu`; `mu completion --install` auto-installs shell scripts.
 
 ## Authority and Requirements
 - authority:
@@ -137,7 +138,7 @@ The following upstream Mole features are strictly tied to proprietary macOS subs
 | **Time Machine APFS Snapshots** | `bin/clean.sh:1812`, `lib/clean/system.sh` | Relies on macOS APFS filesystem snapshot thinning utility (`tmutil thinlocalsnapshots`). Linux backup tools (Timeshift, Snapper, Btrfs, ZFS) operate under entirely different user-configured paradigms. |
 | **iOS / Xcode Simulator Support & Firmware** | `bin/clean.sh:1808`, `lib/clean/user.sh` | macOS-exclusive Xcode simulator runtimes, DeviceSupport caches, and Apple IPSW firmware restore images. |
 | **Homebrew Cask App Uninstaller** | `lib/uninstall/brew.sh` | macOS Homebrew Cask GUI app management (`brew uninstall --cask`) is macOS-specific. Ubuntu native package managers (APT, Snap, Flatpak) are handled in `mu uninstall`. |
-| **Raycast & Alfred Quick Launchers** | `scripts/setup-quick-launchers.sh` | Proprietary macOS launcher script protocols (`raycast://`, `alfred://`) do not exist on Linux. Desktop launcher integration on Ubuntu uses standard Freedesktop `.desktop` files in `~/.local/share/applications/` (handled in Phase 5). |
+| **Raycast & Alfred Quick Launchers** | `scripts/setup-quick-launchers.sh` | Proprietary macOS launcher script protocols (`raycast://`, `alfred://`) do not exist on Linux. Desktop launcher integration on Ubuntu uses standard Freedesktop `.desktop` files in `~/.local/share/applications/` (handled in Phase 6). |
 | **Network Stack Refresh (Routing & ARP)** | `lib/optimize/catalog.sh:45` | Obsolete and dangerous on Linux: route cache (`sudo ip route flush cache`) was removed in Linux kernel 3.6, and neighbor table flush (`sudo ip neigh flush all`) severs active network connections and remote SSH sessions. Not a safe maintenance default on Ubuntu. |
 | **Prevent .DS_Store on Network/USB** | `lib/optimize/catalog.sh:41` | Toggles macOS Finder proprietary desktop services preference `DSDontWriteNetworkStores` / `DSDontWriteUSBStores`. |
 | **Legacy Overrides Audit** | `lib/optimize/catalog.sh:43` | Audits macOS `NSGlobalDomain` App Nap and disk image verification overrides created by legacy macOS tweakers. |
@@ -152,21 +153,58 @@ The following upstream Mole features are strictly tied to proprietary macOS subs
 
 ## Phased Implementation Roadmap
 
-The implementation is broken into 5 risk-ranked, shippable phases. Each phase is independently testable, preserves all safety invariants, and builds systematically on `mu`'s modular Rust architecture.
+The implementation is broken into 6 risk-ranked, shippable phases. Each phase is independently testable, preserves all safety invariants, and builds systematically on `mu`'s modular Rust architecture.
 
 ```mermaid
 graph TD
-    P1[Phase 1: Core Clean & Uninstall Hardening] --> P2[Phase 2: System Maintenance & Optimize Expansion]
-    P2 --> P3[Phase 3: Operational History, Purge & Installer]
-    P3 --> P4[Phase 4: Advanced Status & Interactive Disk Analyzer]
-    P4 --> P5[Phase 5: Management, Biometrics & System Integration]
+    P1[Phase 1: Interactive Disk Analysis] --> P2[Phase 2: Core Clean & Uninstall Hardening]
+    P2 --> P3[Phase 3: System Maintenance & Optimize Expansion]
+    P3 --> P4[Phase 4: Operational History, Purge & Installer]
+    P4 --> P5[Phase 5: Advanced Status Monitoring]
+    P5 --> P6[Phase 6: Management, Biometrics & System Integration]
 ```
 
 ---
 
-### Phase 1: Core Clean & Uninstall Hardening & Parity
+### Phase 1: Interactive Disk Analysis (`mu analyze`)
+- **Slug:** `interactive-disk-analyzer`
+- **Story ID:** `MU-002-interactive-disk-analyzer`
+- **Value:** **High** — Completes PRD §5.1 P1 command `mu analyze` (ncdu-style interactive disk usage explorer).
+- **Risk:** **High** — Large new Ratatui TUI component (`analyze`), filesystem walker traversing entire directory trees, and interactive tree navigation.
+- **Scope:**
+  - **`mu analyze` Subsystem:**
+    - Argument: `mu analyze [PATH]` (defaults to overview of root `/` and `$HOME`).
+    - Flag: `--json` for machine-readable tree output.
+    - Flag: `--dry-run` to preview scan metrics and ensure in-app deletion is disabled.
+    - High-performance directory tree scanner with size aggregation and largest file heap.
+    - Ratatui interactive explorer: navigate folders with arrow/Vim keys, sort by size/name, drill into subdirectories.
+    - In-app deletion: select item, press 'd', confirm with YES/NO dialog, delete via `trash::SafeDelete`.
+- **Files Likely Touched:**
+  - `src/analyze/` (new module: `walker.rs`, `model.rs`, `json.rs`)
+  - `src/tui/analyze.rs` (new Ratatui explorer widget)
+  - `src/cli.rs`
+  - `tests/cli_integration.rs`
+- **Safety Invariants Preserved:**
+  - Disk analysis deletion strictly uses `trash::SafeDelete` with default-NO confirmation.
+  - Path validation prevents attempting deletion of protected root prefixes (`/`, `/usr`, `/etc`).
+  - `--dry-run` guarantees zero deletions.
+- **Concrete Acceptance Tests:**
+  1. `cargo run --release -- analyze --json /tmp` -> exit 0; emits JSON directory tree structure.
+  2. Sentinel immutability test (analyze):
+     ```bash
+     mkdir -p /tmp/mu-analyze-test && touch /tmp/mu-analyze-test/sentinel.dat
+     cargo run --release -- analyze --dry-run /tmp/mu-analyze-test
+     test -f /tmp/mu-analyze-test/sentinel.dat
+     ```
+     -> exit 0; confirms analyze dry-run did not modify or delete `sentinel.dat`.
+  3. `cargo run --release -- analyze --help` -> exit 0; renders analyze usage, arguments, and options.
+  4. `make test` -> all unit and integration tests pass.
+
+---
+
+### Phase 2: Core Clean & Uninstall Hardening & Parity
 - **Slug:** `core-clean-uninstall`
-- **Story ID:** `MU-002-clean-uninstall-parity`
+- **Story ID:** `MU-003-clean-uninstall-parity`
 - **Value:** **High** — Solves critical gaps in primary P0 commands (`clean` and `uninstall`). Enables CLI scripting, expands browser coverage to modern Ubuntu Snap/Flatpak defaults, adds safe Trash reclamation with item count preview, and adds interactive remnant review.
 - **Risk:** **Medium** — Touches destructive deletion paths; must strictly adhere to `trash::SafeDelete` and safety invariants.
 - **Scope:**
@@ -225,9 +263,9 @@ graph TD
 
 ---
 
-### Phase 2: System Maintenance & Optimize Expansion
+### Phase 3: System Maintenance & Optimize Expansion
 - **Slug:** `optimize-maintenance-expansion`
-- **Story ID:** `MU-003-optimize-expansion`
+- **Story ID:** `MU-004-optimize-expansion`
 - **Value:** **High** — Upgrades `mu optimize` from 3 basic tasks to 9 safe Linux maintenance units, covering networking, systemd, package repair, database compression, and integrity auditing.
 - **Risk:** **Low-Medium** — Most operations are idempotent system maintenance commands; package repair operations use standard Ubuntu recovery commands (`dpkg --configure -a`). Network route/neighbor flush is strictly excluded.
 - **Scope:**
@@ -288,9 +326,9 @@ graph TD
 
 ---
 
-### Phase 3: Operational History, Purge & Installer Commands
+### Phase 4: Operational History, Purge & Installer Commands
 - **Slug:** `history-purge-installer`
-- **Story ID:** `MU-004-history-purge-installer`
+- **Story ID:** `MU-005-history-purge-installer`
 - **Value:** **High** — Delivers PRD P1 (`mu purge`) and P2 (`mu installer`) user-facing commands, project artifact hints in `clean`, and unlocks visibility into the existing `operations.log` via `mu history`.
 - **Risk:** **Medium** — `mu purge` deletes deep build directories (`node_modules`, `target`, `.venv`); must strictly enforce root validation (`src/paths.rs`) and route everything through `trash::SafeDelete`.
 - **Scope:**
@@ -346,11 +384,11 @@ graph TD
 
 ---
 
-### Phase 4: Advanced Status Monitoring & Interactive Disk Analysis (`mu analyze`)
-- **Slug:** `status-watch-analyze`
-- **Story ID:** `MU-005-status-analyze`
-- **Value:** **High** — Completes PRD §5.1 P1 command `mu analyze` (ncdu-style interactive disk usage explorer) and brings `mu status` to full parity with Mole's real-time monitoring and NDJSON streaming capabilities.
-- **Risk:** **High** — Large new Ratatui TUI component (`analyze`), filesystem walker traversing entire directory trees, and high-frequency `/proc` collectors.
+### Phase 5: Advanced Status Monitoring (`mu status --watch` & Extended Metrics)
+- **Slug:** `status-watch-monitoring`
+- **Story ID:** `MU-006-status-watch-monitoring`
+- **Value:** **High** — Brings `mu status` to full parity with Mole's real-time monitoring and NDJSON streaming capabilities.
+- **Risk:** **Medium** — High-frequency `/proc` collectors and continuous NDJSON streaming.
 - **Scope:**
   - **`mu status` Enhancements:**
     - Streaming watch mode: `mu status --watch [--interval <dur>]` emitting continuous NDJSON lines to stdout.
@@ -360,45 +398,25 @@ graph TD
     - Parse battery health and charge from `/sys/class/power_supply/BAT*/`.
     - Read top 5 CPU/memory processes from `/proc/[pid]/stat`.
     - TUI keybindings: 'c' to toggle per-core CPU view, 'p' to toggle process list.
-  - **`mu analyze` Subsystem:**
-    - Argument: `mu analyze [PATH]` (defaults to overview of root `/` and `$HOME`).
-    - Flag: `--json` for machine-readable tree output.
-    - Flag: `--dry-run` to preview scan metrics and ensure in-app deletion is disabled.
-    - High-performance directory tree scanner with size aggregation and largest file heap.
-    - Ratatui interactive explorer: navigate folders with arrow/Vim keys, sort by size/name, drill into subdirectories.
-    - In-app deletion: select item, press 'd', confirm with YES/NO dialog, delete via `trash::SafeDelete`.
 - **Files Likely Touched:**
   - `src/status/proc.rs`
   - `src/status/model.rs`
   - `src/tui/status.rs`
-  - `src/analyze/` (new module: `walker.rs`, `model.rs`, `json.rs`)
-  - `src/tui/analyze.rs` (new Ratatui explorer widget)
   - `src/cli.rs`
   - `tests/cli_integration.rs`
 - **Safety Invariants Preserved:**
-  - Disk analysis deletion strictly uses `trash::SafeDelete` with default-NO confirmation.
-  - Path validation prevents attempting deletion of protected root prefixes (`/`, `/usr`, `/etc`).
-  - `--dry-run` guarantees zero deletions.
+  - Read-only diagnostics; zero system state modification.
+  - Safe parsing of `/proc` and `/sys` with graceful degradation when pseudo-files are absent.
 - **Concrete Acceptance Tests:**
   1. `cargo test status::` -> `test result: ok; 0 failed`
   2. `cargo run --release -- status --watch --interval 1s | head -n 2` -> exit 0; emits 2 valid NDJSON lines containing `cpu_percent`, `memory`, `disks`, `network`, `health`.
   3. `cargo run --release -- status --json` -> exit 0; emitted JSON contains extended fields `cpu_cores` and `disk_io`.
-  4. `cargo run --release -- analyze --json /tmp` -> exit 0; emits JSON directory tree structure.
-  5. Sentinel immutability test (analyze):
-     ```bash
-     mkdir -p /tmp/mu-analyze-test && touch /tmp/mu-analyze-test/sentinel.dat
-     cargo run --release -- analyze --dry-run /tmp/mu-analyze-test
-     test -f /tmp/mu-analyze-test/sentinel.dat
-     ```
-     -> exit 0; confirms analyze dry-run did not modify or delete `sentinel.dat`.
-  6. `cargo run --release -- analyze --help` -> exit 0; renders analyze usage, arguments, and options.
-  7. `make test` -> all unit and integration tests pass.
-
+  4. `make test` -> all unit and integration tests pass.
 ---
 
-### Phase 5: Management, Biometrics & System Integration (`mu sudo`, `update`, `remove`, `completion`)
+### Phase 6: Management, Biometrics & System Integration (`mu sudo`, `update`, `remove`, `completion`)
 - **Slug:** `mgmt-biometrics-integration`
-- **Story ID:** `MU-006-mgmt-integration`
+- **Story ID:** `MU-007-mgmt-integration`
 - **Value:** **Medium** — Polishes installation lifecycle, user ergonomics, biometric convenience, and self-management.
 - **Risk:** **Low-Medium** — `mu sudo` modifies PAM configuration; must safely validate PAM files and provide dry-run. `mu update` replaces the running binary; must verify cryptographic SHA-256 checksums before atomic rename.
 - **Scope:**
