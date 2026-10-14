@@ -3,6 +3,8 @@ mod tui;
 // Port keeps Go-faithful API surfaces that are not all consumed by the CLI;
 // dead_code allowed on the leaf modules so clippy -D warnings stays clean.
 #[allow(dead_code)]
+mod analyze;
+#[allow(dead_code)]
 mod audit;
 #[allow(dead_code)]
 mod clean;

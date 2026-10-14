@@ -162,6 +162,7 @@ fn help_lists_subcommands() {
     assert_eq!(o.status.code(), Some(0));
     let out = stdout(&o);
     for cmd in [
+        "analyze",
         "clean",
         "optimize",
         "audit",
@@ -171,4 +172,56 @@ fn help_lists_subcommands() {
     ] {
         assert!(out.contains(cmd), "missing {cmd} in help");
     }
+}
+
+/// `mu analyze --json /tmp` -> valid JSON directory tree, exit 0.
+#[test]
+fn analyze_json_output() {
+    let o = mu(&["analyze", "--json", "/tmp"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(out.contains("\"path\""), "missing path in JSON: {out}");
+    assert!(out.contains("\"size\""), "missing size in JSON: {out}");
+    assert!(
+        out.contains("\"largest_files\""),
+        "missing largest_files in JSON: {out}"
+    );
+}
+
+/// `mu analyze --dry-run` sentinel immutability test -> exit 0, sentinel untouched.
+#[test]
+fn analyze_dry_run_sentinel() {
+    let test_dir = std::env::temp_dir().join(format!("mu-analyze-test-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&test_dir);
+    let sentinel = test_dir.join("sentinel.dat");
+    std::fs::write(&sentinel, b"precious data").unwrap();
+
+    let o = mu(&["analyze", "--dry-run", test_dir.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(
+        sentinel.exists(),
+        "sentinel.dat must not be removed during --dry-run"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// `mu analyze --help` -> renders usage and options matching golden fixture, exit 0.
+#[test]
+fn analyze_help_output() {
+    let o = mu(&["analyze", "--help"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), include_str!("golden/help-analyze.txt"));
+}
+
+/// `mu analyze` piped without flags -> exit 1 with standard headless TTY error.
+#[test]
+fn analyze_headless_matches_go_error() {
+    let o = mu(&["analyze"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).contains("could not open a new TTY: open /dev/tty"),
+        "unexpected stderr: {}",
+        stderr(&o)
+    );
 }

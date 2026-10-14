@@ -13,7 +13,7 @@
 
 use std::io::{IsTerminal, Write};
 
-use crate::{audit, clean, optimize, status, uninstall};
+use crate::{analyze, audit, clean, optimize, status, uninstall};
 
 /// `MU_VERSION` — set by `build.rs` from `git describe --tags --always --dirty`
 /// (the Go Makefile's `-X` ldflag equivalent). `option_env!` keeps the
@@ -38,6 +38,7 @@ Usage:
   mu [command]
 
 Available Commands:
+  analyze     Interactive disk usage explorer (ncdu-like)
   audit       Diagnose cleanup issues and apply recommended fixes
   clean       Free disk space by removing caches, logs, and old packages
   completion  Generate the autocompletion script for the specified shell
@@ -52,6 +53,31 @@ Flags:
   -v, --version   version for mu
 
 Use \"mu [command] --help\" for more information about a command.
+";
+
+const ANALYZE_HELP: &str = "\
+Interactive disk usage explorer (ncdu-like).
+Navigate directories, inspect large files, and safely move items to trash.
+
+Interactive (default on a TTY):
+  ↑/k, ↓/j to navigate, Enter/→/l to open, Esc/←/h to go up.
+  d to delete item to trash (requires confirmation).
+  s to change sort order, Tab to view largest files.
+
+Scripting:
+  mu analyze --json [PATH]      output JSON directory tree and exit
+  mu analyze --dry-run [PATH]   preview scan metrics with deletion disabled
+
+Usage:
+  mu analyze [PATH] [flags]
+
+Flags:
+      --dry-run   Preview actions without making changes
+  -h, --help      help for analyze
+      --json      Output JSON directory tree and exit
+
+Global Flags:
+      --debug   Enable verbose debug logging
 ";
 
 const AUDIT_HELP: &str = "\
@@ -186,6 +212,7 @@ Usage:
   mu [command]
 
 Available Commands:
+  analyze     Interactive disk usage explorer (ncdu-like)
   audit       Diagnose cleanup issues and apply recommended fixes
   clean       Free disk space by removing caches, logs, and old packages
   completion  Generate the autocompletion script for the specified shell
@@ -353,11 +380,18 @@ Global Flags:
 // Subcommand metadata
 // ---------------------------------------------------------------------------
 
-const REAL_COMMANDS: &[&str] = &["audit", "clean", "optimize", "status", "uninstall"];
-
+const REAL_COMMANDS: &[&str] = &[
+    "analyze",
+    "audit",
+    "clean",
+    "optimize",
+    "status",
+    "uninstall",
+];
 /// Per-command help text for the known real commands.
 fn cmd_help(name: &str) -> Option<&'static str> {
     match name {
+        "analyze" => Some(ANALYZE_HELP),
         "audit" => Some(AUDIT_HELP),
         "clean" => Some(CLEAN_HELP),
         "optimize" => Some(OPTIMIZE_HELP),
@@ -387,6 +421,11 @@ enum Outcome {
 
 /// A parsed subcommand with its flag values, ready to dispatch.
 enum Command {
+    Analyze {
+        path: Option<std::path::PathBuf>,
+        dry_run: bool,
+        json: bool,
+    },
     Status {
         json: bool,
     },
@@ -454,6 +493,19 @@ pub fn run() -> ! {
         Outcome::Run { debug, cmd } => {
             let _ = debug; // threaded into each command's Options below
             match cmd {
+                Command::Analyze {
+                    path,
+                    dry_run,
+                    json,
+                } => {
+                    let code = analyze::run(&analyze::Options {
+                        path,
+                        dry_run,
+                        json,
+                        debug,
+                    });
+                    std::process::exit(code);
+                }
                 Command::Status { json } => std::process::exit(status::run(json)),
                 Command::Optimize { dry_run, skip, yes } => {
                     let code = match optimize::run(&optimize::Options {
@@ -632,6 +684,7 @@ const SHELL_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_NODESC];
 
 fn cmd_flagset(name: &str) -> &'static [FlagSpec] {
     match name {
+        "analyze" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON],
         "status" => &[F_DEBUG, F_HELP, F_JSON],
         "clean" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_INCLUDE],
         "optimize" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_SKIP],
@@ -870,6 +923,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// Commands cobra suggests for typos — `help` is registered lazily and is
 /// never suggested (verified: `mu hlp`/`mu hep` → no suggestion).
 const SUGGEST_COMMANDS: &[&str] = &[
+    "analyze",
     "audit",
     "clean",
     "uninstall",
@@ -950,6 +1004,11 @@ fn exec_subcommand(name: &str, args: &[String]) -> Outcome {
         return Outcome::Stdout(cmd_help(name).unwrap().to_string());
     }
     let cmd = match name {
+        "analyze" => Command::Analyze {
+            path: p.positionals.first().map(std::path::PathBuf::from),
+            dry_run: p.get("dry-run"),
+            json: p.get("json"),
+        },
         "status" => Command::Status {
             json: p.get("json"),
         },
@@ -1736,6 +1795,47 @@ mod tests {
             },
             _ => panic!("expected Run"),
         }
+    }
+    #[test]
+    fn analyze_flag_parsing() {
+        match parse(&args(&["analyze", "--json", "/var/log"])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::Analyze {
+                    path,
+                    dry_run,
+                    json,
+                } => {
+                    assert_eq!(path, Some(std::path::PathBuf::from("/var/log")));
+                    assert!(!dry_run);
+                    assert!(json);
+                }
+                _ => panic!("expected Analyze"),
+            },
+            _ => panic!("expected Run"),
+        }
+        match parse(&args(&["analyze", "--dry-run"])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::Analyze {
+                    path,
+                    dry_run,
+                    json,
+                } => {
+                    assert_eq!(path, None);
+                    assert!(dry_run);
+                    assert!(!json);
+                }
+                _ => panic!("expected Analyze"),
+            },
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn golden_analyze_help_byte_exact() {
+        assert_eq!(
+            ANALYZE_HELP,
+            include_str!("../tests/golden/help-analyze.txt")
+        );
     }
 
     #[test]
