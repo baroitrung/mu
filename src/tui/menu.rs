@@ -232,6 +232,33 @@ impl MainMenu {
             styles::bold_primary(),
         ));
 
+        // Biometric hint
+        let sudo_status = crate::sudo::get_status(&crate::sudo::resolve_pam_path(None));
+        if sudo_status.enabled {
+            lines.push(Line::styled(
+                "  [Biometrics: Enabled (pam_fprintd)]",
+                styles::faint(),
+            ));
+        } else if sudo_status.module_installed {
+            lines.push(Line::styled(
+                "  [Biometrics: Available (run 'mu sudo enable')]",
+                styles::faint(),
+            ));
+        }
+
+        // Update notice if cached check shows newer version
+        let cache_check = crate::xdg::cache_home().join("mu/last_version_check.json");
+        if let Ok(content) = std::fs::read_to_string(&cache_check)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Some(latest) = v.get("latest").and_then(|s| s.as_str())
+            && crate::update::is_newer_version(latest, crate::update::current_version())
+        {
+            lines.push(Line::styled(
+                format!("  ★ Update available: {latest} (run 'mu update')"),
+                styles::bold_primary(),
+            ));
+        }
+
         // Banner (transient done/error summary)
         if !self.banner.is_empty() {
             let style = if self.banner_err {

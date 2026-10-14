@@ -1,0 +1,13 @@
+Check for updates and self-update to the latest release.
+Verifies SHA-256 cryptographic checksums before replacing the binary.
+
+Usage:
+  mu update [flags]
+
+Flags:
+      --dry-run   Check for updates without downloading or installing
+      --force     Force reinstall or re-download even if already up-to-date
+  -h, --help      help for update
+
+Global Flags:
+      --debug   Enable verbose debug logging

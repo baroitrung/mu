@@ -1,0 +1,206 @@
+//! Interactive Whitelist Editor — Ratatui widget to view and manage
+//! protected paths, cache skip patterns, and optimize skip steps.
+
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::{Line, Text};
+use ratatui::widgets::Paragraph;
+
+use super::styles;
+use crate::config::{self, Whitelist};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhitelistTab {
+    ProtectedPaths,
+    CacheSkip,
+    OptimizeSkip,
+}
+
+pub struct WhitelistTui {
+    pub tab: WhitelistTab,
+    pub cursor: usize,
+    pub config: Whitelist,
+    pub modified: bool,
+    pub status_msg: Option<String>,
+}
+
+impl WhitelistTui {
+    pub fn new() -> Self {
+        let config = config::load_whitelist().unwrap_or_default();
+        Self {
+            tab: WhitelistTab::ProtectedPaths,
+            cursor: 0,
+            config,
+            modified: false,
+            status_msg: None,
+        }
+    }
+
+    pub fn current_items(&self) -> &[String] {
+        match self.tab {
+            WhitelistTab::ProtectedPaths => &self.config.protected_paths.system,
+            WhitelistTab::CacheSkip => &self.config.cache_skip.dirs,
+            WhitelistTab::OptimizeSkip => &self.config.optimize_skip.steps,
+        }
+    }
+
+    pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => true,
+            KeyCode::Tab => {
+                self.tab = match self.tab {
+                    WhitelistTab::ProtectedPaths => WhitelistTab::CacheSkip,
+                    WhitelistTab::CacheSkip => WhitelistTab::OptimizeSkip,
+                    WhitelistTab::OptimizeSkip => WhitelistTab::ProtectedPaths,
+                };
+                self.cursor = 0;
+                false
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                }
+                false
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = self.current_items().len();
+                if len > 0 && self.cursor < len - 1 {
+                    self.cursor += 1;
+                }
+                false
+            }
+            KeyCode::Char('s') => {
+                match config::save_whitelist(&self.config) {
+                    Ok(path) => {
+                        self.status_msg = Some(format!("Saved to {}", path.display()));
+                        self.modified = false;
+                    }
+                    Err(e) => {
+                        self.status_msg = Some(format!("Error saving: {e}"));
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    pub fn render(&self, frame: &mut Frame, area: Rect) {
+        let mut lines = Vec::new();
+
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "  Whitelist Configuration Editor",
+            styles::bold_primary(),
+        ));
+
+        // Tab bar
+        let tab_prot = if self.tab == WhitelistTab::ProtectedPaths {
+            "[ 1. Protected Paths ]"
+        } else {
+            "  1. Protected Paths  "
+        };
+        let tab_cache = if self.tab == WhitelistTab::CacheSkip {
+            "[ 2. Cache Skip ]"
+        } else {
+            "  2. Cache Skip  "
+        };
+        let tab_opt = if self.tab == WhitelistTab::OptimizeSkip {
+            "[ 3. Optimize Skip ]"
+        } else {
+            "  3. Optimize Skip  "
+        };
+
+        lines.push(Line::styled(
+            format!("  {tab_prot}   {tab_cache}   {tab_opt}"),
+            Style::default(),
+        ));
+        lines.push(Line::raw(""));
+
+        // Status / notice
+        if let Some(msg) = &self.status_msg {
+            lines.push(Line::styled(format!("  {msg}"), styles::bold_primary()));
+            lines.push(Line::raw(""));
+        }
+
+        // List
+        let items = self.current_items();
+        if items.is_empty() {
+            lines.push(Line::styled(
+                "  (no entries in this category)",
+                styles::faint(),
+            ));
+        } else {
+            for (idx, item) in items.iter().enumerate() {
+                let prefix = if idx == self.cursor { "▶ " } else { "  " };
+                let style = if idx == self.cursor {
+                    styles::bold_primary()
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::styled(format!("  {prefix}{item}"), style));
+            }
+        }
+
+        // Footer
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "  Tab switch category  •  ↑/↓ navigate  •  s save  •  q quit",
+            styles::faint(),
+        ));
+
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    }
+}
+
+pub fn run_whitelist_tui() -> crate::error::Result<()> {
+    let mut terminal = ratatui::init();
+    let mut app = WhitelistTui::new();
+
+    loop {
+        terminal
+            .draw(|f| app.render(f, f.area()))
+            .map_err(crate::error::Error::Io)?;
+
+        if let crossterm::event::Event::Key(key) =
+            crossterm::event::read().map_err(crate::error::Error::Io)?
+            && app.handle_key_event(key)
+        {
+            break;
+        }
+    }
+
+    ratatui::restore();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_whitelist_tui_tab_switch() {
+        let mut tui = WhitelistTui::new();
+        assert_eq!(tui.tab, WhitelistTab::ProtectedPaths);
+
+        let tab_key = KeyEvent::from(KeyCode::Tab);
+        assert!(!tui.handle_key_event(tab_key));
+        assert_eq!(tui.tab, WhitelistTab::CacheSkip);
+
+        assert!(!tui.handle_key_event(tab_key));
+        assert_eq!(tui.tab, WhitelistTab::OptimizeSkip);
+
+        assert!(!tui.handle_key_event(tab_key));
+        assert_eq!(tui.tab, WhitelistTab::ProtectedPaths);
+    }
+
+    #[test]
+    fn test_whitelist_tui_quit() {
+        let mut tui = WhitelistTui::new();
+        let q_key = KeyEvent::from(KeyCode::Char('q'));
+        assert!(tui.handle_key_event(q_key));
+    }
+}

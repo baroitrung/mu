@@ -44,8 +44,11 @@ Available Commands:
   completion  Generate the autocompletion script for the specified shell
   help        Help about any command
   optimize    Run system maintenance: apt autoremove, journal vacuum, cache refresh
+  remove      Safely uninstall mu and remove configuration, logs, and cache
   status      Live system dashboard: CPU, RAM, disk, network, health score
+  sudo        Configure fingerprint authentication for sudo (pam_fprintd)
   uninstall   Remove apps and all their config, cache, and data remnants
+  update      Check for updates and self-update to the latest release
 
 Flags:
       --debug     Enable verbose debug logging
@@ -203,6 +206,61 @@ Global Flags:
       --debug   Enable verbose debug logging
 ";
 
+const REMOVE_HELP: &str = "\
+Safely uninstall mu and remove configuration, logs, and cache.
+All deletions route strictly through trash::SafeDelete.
+
+Usage:
+  mu remove [flags]
+
+Flags:
+      --dry-run   Preview actions without making changes
+  -h, --help      help for remove
+  -y, --yes       Confirm removal without prompting
+
+Global Flags:
+      --debug   Enable verbose debug logging
+";
+
+const SUDO_HELP: &str = "\
+Configure fingerprint authentication for sudo (pam_fprintd).
+Enables or disables biometric authentication in /etc/pam.d/sudo with
+automatic backup creation to prevent user lockout.
+
+Usage:
+  mu sudo [command] [flags]
+
+Available Commands:
+  disable     Disable fingerprint authentication for sudo
+  enable      Enable fingerprint authentication for sudo
+  status      Show current fingerprint authentication status
+
+Flags:
+      --dry-run   Preview actions without making changes
+  -h, --help      help for sudo
+
+Global Flags:
+      --debug   Enable verbose debug logging
+
+Use \"mu sudo [command] --help\" for more information about a command.
+";
+
+const UPDATE_HELP: &str = "\
+Check for updates and self-update to the latest release.
+Verifies SHA-256 cryptographic checksums before replacing the binary.
+
+Usage:
+  mu update [flags]
+
+Flags:
+      --dry-run   Check for updates without downloading or installing
+      --force     Force reinstall or re-download even if already up-to-date
+  -h, --help      help for update
+
+Global Flags:
+      --debug   Enable verbose debug logging
+";
+
 /// Cobra's "usage" template — shown on errors and `help <bogus>`. Same as
 /// ROOT_HELP but without the `-h`/`-v` flag lines (cobra's UsageTemplate
 /// omits the help/version flags that HelpTemplate includes).
@@ -218,8 +276,11 @@ Available Commands:
   completion  Generate the autocompletion script for the specified shell
   help        Help about any command
   optimize    Run system maintenance: apt autoremove, journal vacuum, cache refresh
+  remove      Safely uninstall mu and remove configuration, logs, and cache
   status      Live system dashboard: CPU, RAM, disk, network, health score
+  sudo        Configure fingerprint authentication for sudo (pam_fprintd)
   uninstall   Remove apps and all their config, cache, and data remnants
+  update      Check for updates and self-update to the latest release
 
 Flags:
       --debug   Enable verbose debug logging
@@ -385,8 +446,11 @@ const REAL_COMMANDS: &[&str] = &[
     "audit",
     "clean",
     "optimize",
+    "remove",
     "status",
+    "sudo",
     "uninstall",
+    "update",
 ];
 /// Per-command help text for the known real commands.
 fn cmd_help(name: &str) -> Option<&'static str> {
@@ -395,8 +459,11 @@ fn cmd_help(name: &str) -> Option<&'static str> {
         "audit" => Some(AUDIT_HELP),
         "clean" => Some(CLEAN_HELP),
         "optimize" => Some(OPTIMIZE_HELP),
+        "remove" => Some(REMOVE_HELP),
         "status" => Some(STATUS_HELP),
+        "sudo" => Some(SUDO_HELP),
         "uninstall" => Some(UNINSTALL_HELP),
+        "update" => Some(UPDATE_HELP),
         _ => None,
     }
 }
@@ -433,11 +500,13 @@ enum Command {
         dry_run: bool,
         include: Vec<String>,
         yes: bool,
+        whitelist: bool,
     },
     Optimize {
         dry_run: bool,
         skip: Vec<String>,
         yes: bool,
+        whitelist: bool,
     },
     Audit {
         report: bool,
@@ -447,6 +516,20 @@ enum Command {
     },
     Uninstall {
         dry_run: bool,
+    },
+    Remove {
+        dry_run: bool,
+        yes: bool,
+    },
+    Sudo {
+        command: crate::sudo::SudoCommand,
+        dry_run: bool,
+        pam_path: Option<std::path::PathBuf>,
+    },
+    Update {
+        dry_run: bool,
+        force: bool,
+        api_url: Option<String>,
     },
 }
 
@@ -507,7 +590,21 @@ pub fn run() -> ! {
                     std::process::exit(code);
                 }
                 Command::Status { json } => std::process::exit(status::run(json)),
-                Command::Optimize { dry_run, skip, yes } => {
+                Command::Optimize {
+                    dry_run,
+                    skip,
+                    yes,
+                    whitelist,
+                } => {
+                    if whitelist {
+                        if std::io::stdout().is_terminal() {
+                            let _ = crate::tui::whitelist::run_whitelist_tui();
+                            std::process::exit(0);
+                        } else {
+                            println!("Whitelist configuration: ~/.config/mu/config.toml");
+                            std::process::exit(0);
+                        }
+                    }
                     let code = match optimize::run(&optimize::Options {
                         dry_run,
                         debug,
@@ -526,7 +623,17 @@ pub fn run() -> ! {
                     dry_run,
                     include,
                     yes,
+                    whitelist,
                 } => {
+                    if whitelist {
+                        if std::io::stdout().is_terminal() {
+                            let _ = crate::tui::whitelist::run_whitelist_tui();
+                            std::process::exit(0);
+                        } else {
+                            println!("Whitelist configuration: ~/.config/mu/config.toml");
+                            std::process::exit(0);
+                        }
+                    }
                     let code = match clean::run(&clean::Options {
                         dry_run,
                         debug,
@@ -555,6 +662,41 @@ pub fn run() -> ! {
                 })),
                 Command::Uninstall { dry_run } => {
                     std::process::exit(uninstall::run(&uninstall::Options { dry_run, debug }))
+                }
+                Command::Remove { dry_run, yes } => {
+                    let code = crate::remove::run(&crate::remove::Options {
+                        dry_run,
+                        auto_yes: yes,
+                        debug,
+                    });
+                    std::process::exit(code);
+                }
+                Command::Sudo {
+                    command,
+                    dry_run,
+                    pam_path,
+                } => {
+                    let code = crate::sudo::run(&crate::sudo::Options {
+                        command,
+                        dry_run,
+                        debug,
+                        pam_path,
+                    });
+                    std::process::exit(code);
+                }
+                Command::Update {
+                    dry_run,
+                    force,
+                    api_url,
+                } => {
+                    let code = crate::update::run(&crate::update::Options {
+                        dry_run,
+                        force,
+                        debug,
+                        target_bin: None,
+                        api_url,
+                    });
+                    std::process::exit(code);
                 }
             }
         }
@@ -676,20 +818,41 @@ const F_NODESC: FlagSpec = FlagSpec {
     takes_value: false,
     display: "--no-descriptions",
 };
+const F_FORCE: FlagSpec = FlagSpec {
+    long: "force",
+    short: None,
+    takes_value: false,
+    display: "--force",
+};
+const F_INSTALL: FlagSpec = FlagSpec {
+    long: "install",
+    short: None,
+    takes_value: false,
+    display: "--install",
+};
+const F_WHITELIST: FlagSpec = FlagSpec {
+    long: "whitelist",
+    short: None,
+    takes_value: false,
+    display: "--whitelist",
+};
 
 const ROOT_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_VERSION];
 const HELP_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP];
-const COMPLETION_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP];
-const SHELL_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_NODESC];
+const COMPLETION_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_INSTALL];
+const SHELL_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_NODESC, F_INSTALL];
 
 fn cmd_flagset(name: &str) -> &'static [FlagSpec] {
     match name {
         "analyze" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON],
         "status" => &[F_DEBUG, F_HELP, F_JSON],
-        "clean" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_INCLUDE],
-        "optimize" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_SKIP],
+        "clean" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_INCLUDE, F_WHITELIST],
+        "optimize" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_SKIP, F_WHITELIST],
         "audit" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON, F_REPORT, F_INCLUDE],
+        "remove" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES],
+        "sudo" => &[F_DEBUG, F_HELP, F_DRY_RUN],
         "uninstall" => &[F_DEBUG, F_HELP, F_DRY_RUN],
+        "update" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_FORCE],
         _ => &[],
     }
 }
@@ -1016,11 +1179,13 @@ fn exec_subcommand(name: &str, args: &[String]) -> Outcome {
             dry_run: p.get("dry-run"),
             include: p.vals("include"),
             yes: p.get("yes"),
+            whitelist: p.get("whitelist"),
         },
         "optimize" => Command::Optimize {
             dry_run: p.get("dry-run"),
             skip: p.vals("skip"),
             yes: p.get("yes"),
+            whitelist: p.get("whitelist"),
         },
         "audit" => Command::Audit {
             report: p.get("report"),
@@ -1030,6 +1195,30 @@ fn exec_subcommand(name: &str, args: &[String]) -> Outcome {
         },
         "uninstall" => Command::Uninstall {
             dry_run: p.get("dry-run"),
+        },
+        "remove" => Command::Remove {
+            dry_run: p.get("dry-run"),
+            yes: p.get("yes"),
+        },
+        "sudo" => {
+            let subcmd = match p.positionals.first().map(|s| s.as_str()) {
+                Some("enable") => crate::sudo::SudoCommand::Enable,
+                Some("disable") => crate::sudo::SudoCommand::Disable,
+                Some("status") | None => crate::sudo::SudoCommand::Status,
+                Some(other) => {
+                    return perr(format!("unknown command \"{other}\" for \"mu sudo\"\n"));
+                }
+            };
+            Command::Sudo {
+                command: subcmd,
+                dry_run: p.get("dry-run"),
+                pam_path: None,
+            }
+        }
+        "update" => Command::Update {
+            dry_run: p.get("dry-run"),
+            force: p.get("force"),
+            api_url: None,
         },
         _ => unreachable!(),
     };
@@ -1088,6 +1277,19 @@ fn exec_completion(args: &[String]) -> Outcome {
         if p.get("help") {
             return Outcome::Stdout(shell_help(&shell).to_string());
         }
+        if p.get("install") {
+            match install_completion(&shell) {
+                Ok(path) => {
+                    return Outcome::Stdout(format!(
+                        "Installed completion for {shell} to {}\n",
+                        path.display()
+                    ));
+                }
+                Err(e) => {
+                    return perr(format!("error installing completion for {shell}: {e}\n"));
+                }
+            }
+        }
         if let Some(x) = p.positionals.first() {
             return perr(format!(
                 "unknown command \"{x}\" for \"mu completion {shell}\"\n"
@@ -1097,7 +1299,29 @@ fn exec_completion(args: &[String]) -> Outcome {
     }
     match flag_parse(args, COMPLETION_FLAGS) {
         Err(o) => o,
-        Ok(_) => Outcome::Stdout(COMPLETION_HELP.to_string()),
+        Ok(p) => {
+            if p.get("install") {
+                let shell = p.positionals.first().map(|s| s.as_str()).unwrap_or("bash");
+                if is_shell(shell) {
+                    match install_completion(shell) {
+                        Ok(path) => {
+                            return Outcome::Stdout(format!(
+                                "Installed completion for {shell} to {}\n",
+                                path.display()
+                            ));
+                        }
+                        Err(e) => {
+                            return perr(format!("error installing completion for {shell}: {e}\n"));
+                        }
+                    }
+                } else {
+                    return perr(format!(
+                        "unknown shell \"{shell}\" for completion --install\n"
+                    ));
+                }
+            }
+            Outcome::Stdout(COMPLETION_HELP.to_string())
+        }
     }
 }
 
@@ -1119,7 +1343,7 @@ fn shell_help(shell: &str) -> &'static str {
 /// Generate a minimal shell completion script. The content differs from
 /// cobra's (accepted divergence — functional parity, not byte parity).
 fn completion_script(shell: &str) -> String {
-    let cmds = "audit clean optimize status uninstall";
+    let cmds = "analyze audit clean completion help optimize remove status sudo uninstall update";
     match shell {
         "bash" => format!(
             "# bash completion for mu\n\
@@ -1151,6 +1375,51 @@ Register-ArgumentCompleter -Native -CommandName mu -ScriptBlock {{\n\
         ),
         _ => COMPLETION_HELP.to_string(),
     }
+}
+
+fn install_completion(shell: &str) -> std::result::Result<std::path::PathBuf, String> {
+    let script = completion_script(shell);
+    let target = match shell {
+        "bash" => {
+            let sys_dir = std::path::Path::new("/etc/bash_completion.d");
+            if sys_dir.exists()
+                && nix::unistd::access(sys_dir, nix::unistd::AccessFlags::W_OK).is_ok()
+            {
+                sys_dir.join("mu")
+            } else {
+                let user_dir = crate::xdg::data_home().join("bash-completion/completions");
+                std::fs::create_dir_all(&user_dir).map_err(|e| {
+                    format!("failed to create directory {}: {}", user_dir.display(), e)
+                })?;
+                user_dir.join("mu")
+            }
+        }
+        "zsh" => {
+            let home = crate::xdg::home_dir();
+            let zsh_dir = home.join(".zsh/completion");
+            std::fs::create_dir_all(&zsh_dir)
+                .map_err(|e| format!("failed to create directory {}: {}", zsh_dir.display(), e))?;
+            zsh_dir.join("_mu")
+        }
+        "fish" => {
+            let home = crate::xdg::home_dir();
+            let fish_dir = home.join(".config/fish/completions");
+            std::fs::create_dir_all(&fish_dir)
+                .map_err(|e| format!("failed to create directory {}: {}", fish_dir.display(), e))?;
+            fish_dir.join("mu.fish")
+        }
+        _ => return Err(format!("unsupported shell for auto-install: {shell}")),
+    };
+
+    std::fs::write(&target, script).map_err(|e| {
+        format!(
+            "failed to write completion script to {}: {}",
+            target.display(),
+            e
+        )
+    })?;
+
+    Ok(target)
 }
 
 // ---------------------------------------------------------------------------
@@ -1872,5 +2141,20 @@ mod tests {
             UNINSTALL_HELP,
             include_str!("../tests/golden/help-uninstall.txt")
         );
+    }
+
+    #[test]
+    fn golden_remove_help_byte_exact() {
+        assert_eq!(REMOVE_HELP, include_str!("../tests/golden/help-remove.txt"));
+    }
+
+    #[test]
+    fn golden_sudo_help_byte_exact() {
+        assert_eq!(SUDO_HELP, include_str!("../tests/golden/help-sudo.txt"));
+    }
+
+    #[test]
+    fn golden_update_help_byte_exact() {
+        assert_eq!(UPDATE_HELP, include_str!("../tests/golden/help-update.txt"));
     }
 }

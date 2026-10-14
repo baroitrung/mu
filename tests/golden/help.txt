@@ -14,8 +14,11 @@ Available Commands:
   completion  Generate the autocompletion script for the specified shell
   help        Help about any command
   optimize    Run system maintenance: apt autoremove, journal vacuum, cache refresh
+  remove      Safely uninstall mu and remove configuration, logs, and cache
   status      Live system dashboard: CPU, RAM, disk, network, health score
+  sudo        Configure fingerprint authentication for sudo (pam_fprintd)
   uninstall   Remove apps and all their config, cache, and data remnants
+  update      Check for updates and self-update to the latest release
 
 Flags:
       --debug     Enable verbose debug logging
