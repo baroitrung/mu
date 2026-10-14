@@ -14,10 +14,10 @@ updated: 2026-10-14
 - result: `mu` achieves comprehensive feature parity with upstream Mole (`tw93/mole` @ `7867c80` / `V1.59.1`), adapted idiomatically and safely to the Ubuntu/Debian Linux desktop and server ecosystem. Every missing or partial upstream feature is either implemented across 5 shippable, risk-ranked phases or documented as N/A macOS-only with technical justification. All operations preserve `mu`'s inviolable safety invariants (preview-before-destroy, trash-not-delete via `trash::SafeDelete`, fail-closed whitelist checks, and operation logging).
 - success_signals:
   - `make test` passes with zero regressions across all unit and integration suites (312+ baseline tests preserved).
-  - Clean & Uninstall enhancements (Phase 1): Snap/Flatpak browser caches detected, `system-trash` clean target reclaims space safely, preview ledger exported to `$XDG_CONFIG_HOME/mu/clean-list.txt`, `mu uninstall <pkg>` executes non-interactively from CLI, `mu uninstall --list` outputs installed packages, and `--permanent` is explicitly rejected with a helpful safety error.
-  - Optimize & Clean extensions (Phase 2): `mu optimize` expands from 3 to 10 standard maintenance units (DNS cache flush, network stack flush, broken package config repair, failed systemd unit reset, unused Flatpak runtime cleanup, SQLite vacuum, and stale state cleanup) with `--skip` support; optional clean targets for developer CLI caches (`--include=dev-cache`) and Podman (`--include=podman`).
+  - Clean & Uninstall enhancements (Phase 1): Snap/Flatpak browser caches detected, `system-trash` clean target reclaims space safely with size and item count preview via `gio trash --empty` (failing closed without `--yes` in headless mode), preview ledger exported to `$XDG_CONFIG_HOME/mu/clean-list.txt`, `mu uninstall <pkg>` executes non-interactively from CLI, `mu uninstall --list` outputs installed packages, and `--permanent` is explicitly rejected with a helpful safety error.
+  - Optimize & Clean extensions (Phase 2): `mu optimize` expands from 3 to 9 safe maintenance units (DNS cache flush, broken package config repair, failed systemd unit reset, unused Flatpak runtime cleanup, SQLite vacuum, stale state cleanup, broken autostart audit, broken services audit, and home permissions audit) with `--skip` support and exact shell command display in `--dry-run`; optional clean targets for developer CLI caches (`--include=dev-cache`), Podman (`--include=podman`), and orphaned system services (`--include=orphaned-services`). The dangerous route/neighbor table flush is dropped and marked N/A as it severs live SSH connections.
   - History, Purge & Installer (Phase 3): `mu history` inspects `$XDG_DATA_HOME/mu/operations.log` in table and `--json` format; `mu purge` safely cleans heavy project build artifacts (`node_modules`, `target`, `dist`, `.venv`) with `--paths`, `--dry-run`, and `--yes`; `mu installer` finds and cleans large package installers in `~/Downloads`.
-  - Advanced Status & Disk Analysis (Phase 4): `mu status` supports continuous NDJSON streaming via `--watch [--interval 1s]` and surfaces per-core CPU, disk I/O, battery, and top process stats; `mu analyze` provides an interactive ncdu-like Ratatui disk usage explorer with `--json` and in-app safe trash deletion.
+  - Advanced Status & Disk Analysis (Phase 4): `mu status` supports continuous NDJSON streaming via `--watch [--interval 1s]` and surfaces per-core CPU, disk I/O, battery, and top process stats; `mu analyze` provides an interactive ncdu-like Ratatui disk usage explorer with `--json`, `--dry-run` immutability proof, and in-app safe trash deletion.
   - Management & Biometrics (Phase 5): `mu sudo` provides PAM fingerprint configuration (`enable`, `disable`, `status`) mirroring `mo touchid`; `mu update` checks GitHub releases and self-updates verified binaries; `mu remove` safely uninstalls `mu`; `mu completion --install` auto-installs shell scripts.
 
 ## Authority and Requirements
@@ -29,23 +29,23 @@ updated: 2026-10-14
   - Inventory Baseline: `~/quaqua/runs/detu-muinv2.md` comprehensive feature inventory.
 - requirements:
   - R1 [safety]: All user-file deletions must route strictly through `trash::SafeDelete` — moves to trash, never `rm`. Upstream features bypassing trash (e.g. `--permanent`) must be explicitly rejected.
-  - R2 [preview]: Every destructive command (`clean`, `uninstall`, `optimize`, `purge`, `installer`, `remove`) must implement a `--dry-run` flag that previews actions and disk space without side effects.
+  - R2 [preview]: Every destructive command (`clean`, `uninstall`, `optimize`, `purge`, `installer`, `remove`) must implement a `--dry-run` flag that previews actions, exact commands, and disk space without side effects, proven by sentinel file immutability tests.
   - R3 [parity]: Implement missing and partial Mole CLI commands and sub-flags where valid on Linux: `mu uninstall <pkgs...>`, `mu uninstall --list`, `mu history`, `mu purge`, `mu installer`, `mu analyze`, `mu sudo`, `mu update`, `mu remove`.
-  - R4 [ubuntu-native]: Map upstream macOS mechanisms to native Ubuntu/Debian equivalents: APT/Snap/Flatpak packages, systemd user and system services, XDG base directories, PAM fingerprint authentication (`pam_fprintd.so`), `resolvectl` / `ip route` network maintenance.
+  - R4 [ubuntu-native]: Map upstream macOS mechanisms to native Ubuntu/Debian equivalents: APT/Snap/Flatpak packages, systemd user and system services, XDG base directories, PAM fingerprint authentication (`pam_fprintd.so`), `resolvectl` DNS maintenance.
   - R5 [contract]: Retain byte-exact CLI contract compatibility for existing commands where golden tests assert output (`tests/golden/`), updating golden files only alongside intentional new CLI subcommands.
   - R6 [headless]: Non-interactive / headless scripting paths must be supported when flags or arguments are explicitly passed (`mu uninstall <pkg>`, `mu clean --yes`, `mu optimize --yes`, `mu status --json`), while preserving existing TTY-check error behavior when interactive TUI commands are called headless without args.
 
 ## Non-goals
-- NG1: Implementing macOS-specific features on Linux (e.g. Rosetta 2 caches, iOS simulator firmware, APFS Time Machine snapshot thinning, Gatekeeper quarantine database, macOS `.DS_Store` suppression, Spotlight `mdutil` index rebuilds).
+- NG1: Implementing macOS-specific features on Linux (e.g. Rosetta 2 caches, iOS simulator firmware, APFS Time Machine snapshot thinning, Gatekeeper quarantine database, macOS `.DS_Store` suppression, Spotlight `mdutil` index rebuilds, Raycast/Alfred launcher scripts).
 - NG2: Transliterating macOS launchd / launchctl workflows into systemd without respecting Linux multi-user session architecture.
 - NG3: Bypassing trash for faster deletion or adding unsafe raw `rm -rf` flags.
 - NG4: Driving real GUI desktop sessions or taking screen captures (must obey `No GUI driving` constraint).
-- NG5: Replacing native packaging tools (APT, Snap, Flatpak) with custom package management logic.
+- NG5: Running unsafe network stack flushes (`ip route/neigh flush`) that drop live SSH or network connections.
 
 ## Safety Invariants & Conflict Decisions
 
 ### Conflict 1: Upstream `--permanent` Flag on Uninstall
-- **Upstream Behavior:** `mo uninstall --permanent [APP]` (`bin/uninstall.sh:1989-1991`) calls `rm -rf` directly on app files and leftovers, bypassing the macOS Trash.
+- **Upstream Behavior:** `mo uninstall --permanent [APP]` (`bin/uninstall.sh:1989-1991`) calls `rm -rf` directly on app files and leftovers, bypassing the macOS Trash (`lib/uninstall/batch.sh:657`).
 - **mu Safety Invariant:** `CLAUDE.md` and `AGENTS.md` explicitly mandate:
   > "Safety invariants (never bypass): All user-file deletion goes through `trash::SafeDelete` — moves to trash, never `rm`."
 - **Conflict Analysis:** In `mu`, the zero-data-loss guarantee is an inviolable architectural premise. App remnant scanning relies on pattern and directory name heuristics (`~/.config/<name>`, `~/.local/share/<name>`). If remnants resolution captures a path that contains user data or a shared directory, `trash::SafeDelete` ensures the user can restore it from `$XDG_DATA_HOME/Trash`. Bypassing trash with immediate `rm -rf` introduces irreversible data loss risk.
@@ -60,9 +60,13 @@ updated: 2026-10-14
 - **Decision:** All root-level maintenance and clean targets must remain explicitly labeled with `requires_sudo: true`. `mu` requests elevated permissions only for those specific targets and informs the user in the plan preview before executing.
 
 ### Conflict 3: Empty System Trash Safety & Preview
-- **Upstream Behavior:** Mole empties Trash during standard clean (`lib/clean/user.sh`).
-- **mu Safety Invariant:** Moving deleted items to Trash is `mu`'s primary safety net. If `mu clean` immediately emptied Trash by default, the safety net would be neutralized for items deleted immediately prior.
-- **Decision:** Emptying Trash must be an **Opt-In** clean target (`id: "system-trash"`, `--include=system-trash`). In interactive TUI mode, it defaults to deselected and requires explicit confirmation. In `--dry-run` mode, it calculates and displays the size of `$XDG_DATA_HOME/Trash` without deleting.
+- **Upstream Behavior:** Mole empties Trash during standard clean (`lib/clean/user.sh:40-149`, `bin/clean.sh:1741`).
+- **mu Safety Invariant:** Moving deleted items to Trash is `mu`'s primary safety net. Emptying Trash is a permanent, non-recoverable deletion. If `mu clean` emptied Trash by default, the safety net would be neutralized for items deleted immediately prior.
+- **Decision:** Emptying Trash must be strictly an **Opt-In** clean target (`id: "system-trash"`, `--include=system-trash`).
+  1. **Default Off:** It is deselected by default in interactive TUI mode and excluded from default CLI clean.
+  2. **Size & Item Count Preview:** In `--dry-run` and interactive preview, it calculates and displays both total bytes and item count (e.g. `System Trash (14 items) ... 82.4 MB`).
+  3. **Strict Confirmation & Headless Fail-Closed:** In interactive TUI mode, it requires an explicit YES confirmation dialog. In non-interactive CLI mode, it requires the `--yes` flag; without `--yes`, it aborts and fails closed without emptying anything.
+  4. **Strict `gio trash --empty` Execution:** Execution must strictly run via `gio trash --empty` (or standard FreeDesktop trash specification traversal). Direct directory purging (`rm -rf ~/.local/share/Trash/*`) is forbidden.
 
 ---
 
@@ -76,21 +80,21 @@ The following table catalogs every user-facing feature from upstream Mole (`tw93
 | **CLI: Biometric Status Hint** | `mole:134-141`, `mole:288` | **missing**: no biometric detection in `src/` | Probe PAM configuration (`/etc/pam.d/sudo` contains `pam_fprintd.so` or `fprintd-verify`); display biometric status hint in root TUI menu. |
 | **Clean: Exported Preview Ledger** | `bin/clean.sh:38`, `bin/clean.sh:75` | **missing**: output only printed to screen | During `clean --dry-run` or before execution, serialize scanned target items and paths to `$XDG_CONFIG_HOME/mu/clean-list.txt` for auditability. |
 | **Clean: Whitelist Interactive TUI** | `bin/clean.sh:34`, `lib/manage/whitelist.sh:32` | **missing**: `src/config.rs:75` loads TOML; no interactive editor | Implement interactive checklist in Ratatui to view and toggle `protected_paths` and `cache_skip.dirs` in `~/.config/mu/config.toml`. |
-| **Clean: External Volume Metadata** | `bin/clean.sh:495-499`, `lib/clean/system.sh` | **missing**: `src/clean/targets.rs` only targets root & home | Flag `mu clean --external <MOUNT_PATH>`: cleans `.Trash-*`, `.directory`, temporary mounts under `/media/$USER/*` or `/mnt/*`. |
-| **Clean: Empty System Trash** | `lib/clean/user.sh`, `bin/clean.sh:515` | **partial**: `src/trash.rs:24-80` deletes *to* Trash; `src/clean/targets.rs` has no target to empty Trash | Add opt-in clean target `system-trash`: evaluates size of `$XDG_DATA_HOME/Trash/{files,info}`, deletes via `gio trash --empty` or purges trash directory with dry-run support. |
-| **Clean: Browser Caches (Extended)** | `lib/clean/caches.sh`, `bin/clean.sh:524` | **partial**: `src/clean/scan_browser.rs:13-50` only handles native Chrome, Firefox, VSCode under `~/.config` and `~/.mozilla` | Add Snap browser paths (`~/snap/firefox/common/.cache/`, `~/snap/chromium/common/.cache/`), Flatpak paths (`~/.var/app/*/cache/`), and Chromium forks (Brave, Edge, Opera, Vivaldi, Zen). |
-| **Clean: Protected Web Domains** | `bin/clean.sh:44-63`, `lib/clean/caches.sh` | **missing**: `src/clean/scan_browser.rs:85-100` deletes whole cache paths | Whitelist ServiceWorker and IndexedDB folders for key productivity domains (Google Docs, GitHub, Figma, Linear) to prevent losing offline PWA state. |
-| **Clean: Virtualization Tools** | `lib/clean/dev.sh`, `bin/clean.sh:555` | **missing**: `src/clean/scan_docker.rs` only handles Docker | Add opt-in clean target `podman` (`podman system prune -f`) and `multipass` (`multipass purge`) when their CLI sockets/binaries exist. |
-| **Clean: Developer CLI Caches** | `lib/clean/dev.sh`, `bin/clean.sh:547` | **missing**: denylisted in `src/default-whitelist.toml:28-37` | Add opt-in clean target `dev-cache` (`--include=dev-cache`) for `~/.cache/pip`, `~/.npm/_cacache`, `~/.cargo/registry/cache`, `~/.cache/go-build`. |
-| **Clean: IDE Caches** | `lib/clean/dev.sh` | **missing**: whitelisted in `src/default-whitelist.toml:44` | Add opt-in clean target `ide-cache` for stale caches in `~/.cache/JetBrains/*/caches` and `~/.cache/Google/AndroidStudio*/caches`. |
-| **Clean: Cloud & Office Caches** | `lib/clean/caches.sh`, `bin/clean.sh:528` | **missing**: no cloud/office targets in `src/clean/` | Clean caches for `~/.dropbox/cache`, `~/.config/Slack/Cache`, `~/.config/Slack/Service Worker/CacheStorage`, `~/.config/Microsoft/Teams/Cache`. |
-| **Clean: Orphaned App Data** | `lib/clean/apps.sh:80`, `bin/clean.sh:564` | **missing**: `src/uninstall/remnants.rs` only runs during uninstallation | Scan `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` for directory names that do not map to any currently installed APT, Snap, or Flatpak package; present as opt-in clean target. |
-| **Clean: Orphaned System Services** | `lib/clean/apps.sh:130`, `bin/clean.sh:565` | **missing**: no service orphan cleaner in `src/clean/` | Scan `~/.config/systemd/user/` and `/etc/systemd/system/` for broken symlinks or service units pointing to non-existent executable binaries. |
-| **Clean: Large Files Hint** | `lib/clean/hints.sh`, `bin/clean.sh:594` | **missing**: no hints in `src/clean/` | Scan `$HOME/Downloads` for files >500MB and print an informative advisory at the end of `mu clean`. |
-| **Clean: Project Artifacts Hint** | `lib/clean/hints.sh`, `bin/clean.sh:599` | **missing**: no project hint in `src/clean/` | Probe default code directories (`~/Projects`, `~/Code`) and suggest running `mu purge` if build artifacts exceed 2 GB. |
+| **Clean: External Volume Metadata** | `bin/clean.sh:1717-1721`, `lib/clean/system.sh` | **missing**: `src/clean/targets.rs` only targets root & home | Flag `mu clean --external <MOUNT_PATH>`: cleans `.Trash-*`, `.directory`, temporary mount metadata under `/media/$USER/*` or `/mnt/*`. |
+| **Clean: Empty System Trash** | `lib/clean/user.sh:40-149`, `bin/clean.sh:1741` | **partial**: `src/trash.rs:24-80` deletes *to* Trash; `src/clean/targets.rs` has no target to empty Trash | Add opt-in clean target `system-trash`: previews size and item count; requires `--yes` or explicit confirmation; executes only via `gio trash --empty`. |
+| **Clean: Browser Caches (Extended)** | `lib/clean/caches.sh`, `bin/clean.sh:1752` | **partial**: `src/clean/scan_browser.rs:13-50` only handles native Chrome, Firefox, VSCode under `~/.config` and `~/.mozilla` | Add Snap browser paths (`~/snap/firefox/common/.cache/`, `~/snap/chromium/common/.cache/`), Flatpak paths (`~/.var/app/*/cache/`), and Chromium forks (Brave, Edge, Opera, Vivaldi, Zen). |
+| **Clean: Protected Web Domains** | `lib/clean/caches.sh:44-63`, `bin/clean.sh:1752` | **missing**: `src/clean/scan_browser.rs:85-100` deletes whole cache paths | Whitelist ServiceWorker and IndexedDB folders for key productivity domains (Google Docs, GitHub, Figma, Linear) to prevent losing offline PWA state. |
+| **Clean: Virtualization Tools** | `lib/clean/dev.sh`, `bin/clean.sh:1784` | **missing**: `src/clean/scan_docker.rs` only handles Docker | Add opt-in clean target `podman` (`podman system prune -f`) and `multipass` (`multipass purge`) when their CLI sockets/binaries exist. |
+| **Clean: Developer CLI Caches** | `lib/clean/dev.sh`, `bin/clean.sh:1774` | **missing**: denylisted in `src/default-whitelist.toml:28-37` | Add opt-in clean target `dev-cache` (`--include=dev-cache`) for `~/.cache/pip`, `~/.npm/_cacache`, `~/.cargo/registry/cache`, `~/.cache/go-build`. |
+| **Clean: IDE Caches** | `lib/clean/dev.sh`, `bin/clean.sh:1774` | **missing**: whitelisted in `src/default-whitelist.toml:44` | Add opt-in clean target `ide-cache` for stale caches in `~/.cache/JetBrains/*/caches` and `~/.cache/Google/AndroidStudio*/caches`. |
+| **Clean: Cloud & Office Caches** | `lib/clean/caches.sh`, `bin/clean.sh:1760` | **missing**: no cloud/office targets in `src/clean/` | Clean caches for `~/.dropbox/cache`, `~/.config/Slack/Cache`, `~/.config/Slack/Service Worker/CacheStorage`, `~/.config/Microsoft/Teams/Cache`. |
+| **Clean: Orphaned App Data** | `lib/clean/apps.sh:650`, `bin/clean.sh:1794` | **missing**: `src/uninstall/remnants.rs` only runs during uninstallation | Scan `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` for directory names that do not map to any currently installed APT, Snap, or Flatpak package; present as opt-in clean target. |
+| **Clean: Orphaned System Services** | `lib/clean/apps.sh:933`, `bin/clean.sh:1795` | **missing**: no service orphan cleaner in `src/clean/` | Scan `~/.config/systemd/user/` and `/etc/systemd/system/` for broken symlinks or service units pointing to non-existent executable binaries. |
+| **Clean: Large Files Hint** | `lib/clean/hints.sh`, `bin/clean.sh:1817` | **missing**: no hints in `src/clean/` | Scan `$HOME/Downloads` for files >500MB and print an informative advisory at the end of `mu clean`. |
+| **Clean: Project Artifacts Hint** | `lib/clean/hints.sh`, `bin/clean.sh:1822` | **missing**: no project hint in `src/clean/` | Probe default code directories (`~/Projects`, `~/Code`) and suggest running `mu purge` if build artifacts exceed 2 GB. |
 | **Uninstall: Direct CLI Args** | `bin/uninstall.sh:1975-2015`, `lib/uninstall/batch.sh` | **missing**: `src/cli.rs:504-506`, `src/cli.rs:972-974` ignore positional args | Enable `mu uninstall <pkg1> <pkg2>`: resolves packages across APT, Snap, and Flatpak; scans remnants; prints removal plan; prompts or respects `--yes`/`--dry-run`. |
 | **Uninstall: List Packages Flag** | `bin/uninstall.sh:1992-1994` | **missing**: no `--list` in `src/cli.rs:170-178` | Add `mu uninstall --list`: prints all discovered installed packages with source prefix (`apt:<name>`, `snap:<name>`, `flatpak:<name>`) and size to stdout. |
-| **Uninstall: Trash Bypass Flag** | `bin/uninstall.sh:1989-1991` (`--permanent`) | **missing / conflicts**: `src/uninstall/remove.rs` uses `trash::SafeDelete` | **Explicit Decision: REJECT.** Exit with code 1 and explanatory safety error (R1). |
+| **Uninstall: Trash Bypass Flag** | `bin/uninstall.sh:1989-1991`, `lib/uninstall/batch.sh:657` (`--permanent`) | **missing / conflicts**: `src/uninstall/remove.rs` uses `trash::SafeDelete` | **Explicit Decision: REJECT.** Exit with code 1 and explanatory safety error (R1). |
 | **Uninstall: Headless / Non-TTY** | `lib/uninstall/batch.sh` | **missing**: `src/uninstall/mod.rs:199-205` exits 1 on non-TTY | Allow headless execution when explicit package args or `--list` are passed; preserve exit 1 error only when bare `mu uninstall` is called without TTY. |
 | **Uninstall: Flatpak Discovery** | `bin/uninstall.sh:843-900` | **partial**: `src/uninstall/discover.rs:32, 74` only does APT and Snap | Add Flatpak discovery via `flatpak list --app --columns=application,version,size,origin`. |
 | **Uninstall: Systemd Remnants** | `lib/core/app_protection.sh:1111-1260` | **partial**: `src/uninstall/remnants.rs:44-77` misses systemd & .desktop | Scan for `~/.config/systemd/user/<pkg>.service`, `~/.local/share/applications/<pkg>.desktop`, and `~/.config/autostart/<pkg>.desktop`. |
@@ -99,7 +103,7 @@ The following table catalogs every user-facing feature from upstream Mole (`tw93
 | **Uninstall: Steam Game Detection** | `lib/uninstall/steam.sh` | **missing**: no Steam handling in `src/uninstall/` | Detect Steam app manifests under `~/.local/share/Steam/steamapps/appmanifest_*.acf` and provide uninstallation delegation via `steam steam://uninstall/<id>`. |
 | **Optimize: Whitelist TUI Editor** | `bin/optimize.sh`, `lib/manage/whitelist.sh:32` | **missing**: `src/config.rs:49` reads `optimize_skip` from TOML | Provide interactive TUI screen to toggle `optimize_skip` steps in `~/.config/mu/config.toml`. |
 | **Optimize: Flush DNS Cache** | `lib/optimize/catalog.sh:29, 37` | **missing**: not in `src/optimize.rs:92-121` | Implement step `dns`: execute `resolvectl flush-caches` (or fallback `systemd-resolve --flush-caches`). |
-| **Optimize: Network Stack Refresh** | `lib/optimize/catalog.sh:45` | **missing**: not in `src/optimize.rs` | Implement step `network`: execute `sudo ip route flush cache` and `sudo ip neigh flush all`. |
+| **Optimize: Network Stack Refresh** | `lib/optimize/catalog.sh:45` | **N/A on Linux**: unsafe on Ubuntu | **DROPPED:** Route cache is obsolete on Linux >= 3.6; neighbor table flush (`ip neigh flush all`) drops active SSH/network sessions. Moved to N/A section. |
 | **Optimize: Package Repair** | `lib/optimize/catalog.sh:35` | **missing**: not in `src/optimize.rs` | Implement step `packages`: execute `sudo dpkg --configure -a` and `sudo apt-get install -f -y`. |
 | **Optimize: SQLite Database VACUUM** | `lib/optimize/catalog.sh:39` | **missing**: not in `src/optimize.rs` | Implement step `sqlite`: scan Firefox/Chrome/Thunderbird profiles and run `sqlite3 <db> "VACUUM;"` when browser processes are not running. |
 | **Optimize: Systemd Failed Units** | Linux equivalent of launchd repair | **missing**: not in `src/optimize.rs` | Implement step `systemd`: execute `systemctl reset-failed` and `systemctl --user reset-failed`. |
@@ -109,8 +113,8 @@ The following table catalogs every user-facing feature from upstream Mole (`tw93
 | **Optimize: Filesystem Integrity** | `lib/optimize/catalog.sh:57` | **missing**: not in `src/optimize.rs` | Implement step `disk-health`: query `smartctl` or inspect systemd filesystem check logs in journal. |
 | **Optimize: Broken Autostart Audit** | `lib/optimize/catalog.sh:59` | **missing**: not in `src/optimize.rs` | Implement step `autostart`: audit `~/.config/autostart/*.desktop` for missing `Exec` binaries. |
 | **Optimize: Broken Services Audit** | `lib/optimize/catalog.sh:63` | **missing**: not in `src/optimize.rs` | Implement step `services`: audit broken symlinks in `/etc/systemd/system/` and `~/.config/systemd/user/`. |
-| **Analyze: Full Command Subsystem** | `bin/analyze.sh`, `cmd/analyze/*` | **missing**: PRD P1 scope; zero code in `src/` | Implement `mu analyze [PATH]` with Ratatui directory tree navigator, `--json` mode, size sorting, largest files summary, and in-app `trash::SafeDelete`. |
-| **Status: Streaming Watch Mode** | `cmd/status/main.go:33-35` | **missing**: only one-shot `--json` in `src/cli.rs:150-159` | Add `mu status --watch [--interval <dur>]` emitting continuous NDJSON lines to stdout. |
+| **Analyze: Full Command Subsystem** | `bin/analyze.sh`, `cmd/analyze/main.go` | **missing**: PRD P1 scope; zero code in `src/` | Implement `mu analyze [PATH]` with Ratatui directory tree navigator, `--json` mode, size sorting, largest files summary, and in-app `trash::SafeDelete`. |
+| **Status: Streaming Watch Mode** | `bin/status.sh`, `cmd/status/main.go:33-35` | **missing**: only one-shot `--json` in `src/cli.rs:150-159` | Add `mu status --watch [--interval <dur>]` emitting continuous NDJSON lines to stdout. |
 | **Status: Extended System Metrics** | `cmd/status/metrics_*.go` | **partial**: `src/status/proc.rs` only aggregates CPU/Mem/Disk/Net | Add per-core CPU usage, `/proc/diskstats` I/O throughput, hardware model (`/proc/cpuinfo`, DMI), battery status (`/sys/class/power_supply/`), and top processes. |
 | **History: Full Command Subsystem** | `bin/history.sh`, `lib/core/history.sh` | **missing**: logging exists in `src/oplog.rs:43`; no CLI command | Implement `mu history [--json] [--limit N]`: reads and parses `$XDG_DATA_HOME/mu/operations.log`, rendering a clean table or structured JSON array. |
 | **Purge: Full Command Subsystem** | `bin/purge.sh`, `lib/clean/project.sh` | **missing**: PRD P1 scope; zero code in `src/` | Implement `mu purge`: scans configurable roots (`--paths`) for `node_modules`, `target`, `dist`, `build`, `.venv`; supports `--dry-run`, `--yes`, `--include-empty`. |
@@ -125,14 +129,16 @@ The following table catalogs every user-facing feature from upstream Mole (`tw93
 
 ## Features N/A on Ubuntu (macOS-Only)
 
-The following upstream Mole features are strictly tied to proprietary macOS subsystems, Darwin kernel APIs, or Apple Silicon hardware. They have no meaningful equivalent on Ubuntu/Linux and are intentionally excluded from `mu`:
+The following upstream Mole features are strictly tied to proprietary macOS subsystems, Darwin kernel APIs, Apple Silicon hardware, or are demonstrably dangerous on Linux systems. They have no meaningful equivalent on Ubuntu/Linux and are intentionally excluded from `mu`:
 
 | Upstream Feature | Upstream Ref | Technical Reason N/A on Ubuntu / Linux |
 | :--- | :--- | :--- |
-| **Rosetta 2 & dyld Shared Caches** | `lib/clean/system.sh:120`, `bin/clean.sh:579` | Apple Silicon architecture translation layer (`/Library/Apple/usr/libexec/oah/`) and Darwin dyld shared cache files do not exist on Linux ELF systems. |
-| **Time Machine APFS Snapshots** | `lib/clean/system.sh`, `bin/clean.sh:589` | Relies on macOS APFS filesystem snapshot thinning utility (`tmutil thinlocalsnapshots`). Linux backup tools (Timeshift, Snapper, Btrfs, ZFS) operate under entirely different user-configured paradigms. |
-| **iOS / Xcode Simulator Support & Firmware** | `lib/clean/user.sh`, `bin/clean.sh:584` | macOS-exclusive Xcode simulator runtimes, DeviceSupport caches, and Apple IPSW firmware restore images. |
+| **Rosetta 2 & dyld Shared Caches** | `bin/clean.sh:1803`, `lib/clean/system.sh:120` | Apple Silicon architecture translation layer (`/Library/Apple/usr/libexec/oah/`) and Darwin dyld shared cache files do not exist on Linux ELF systems. |
+| **Time Machine APFS Snapshots** | `bin/clean.sh:1812`, `lib/clean/system.sh` | Relies on macOS APFS filesystem snapshot thinning utility (`tmutil thinlocalsnapshots`). Linux backup tools (Timeshift, Snapper, Btrfs, ZFS) operate under entirely different user-configured paradigms. |
+| **iOS / Xcode Simulator Support & Firmware** | `bin/clean.sh:1808`, `lib/clean/user.sh` | macOS-exclusive Xcode simulator runtimes, DeviceSupport caches, and Apple IPSW firmware restore images. |
 | **Homebrew Cask App Uninstaller** | `lib/uninstall/brew.sh` | macOS Homebrew Cask GUI app management (`brew uninstall --cask`) is macOS-specific. Ubuntu native package managers (APT, Snap, Flatpak) are handled in `mu uninstall`. |
+| **Raycast & Alfred Quick Launchers** | `scripts/setup-quick-launchers.sh` | Proprietary macOS launcher script protocols (`raycast://`, `alfred://`) do not exist on Linux. Desktop launcher integration on Ubuntu uses standard Freedesktop `.desktop` files in `~/.local/share/applications/` (handled in Phase 5). |
+| **Network Stack Refresh (Routing & ARP)** | `lib/optimize/catalog.sh:45` | Obsolete and dangerous on Linux: route cache (`sudo ip route flush cache`) was removed in Linux kernel 3.6, and neighbor table flush (`sudo ip neigh flush all`) severs active network connections and remote SSH sessions. Not a safe maintenance default on Ubuntu. |
 | **Prevent .DS_Store on Network/USB** | `lib/optimize/catalog.sh:41` | Toggles macOS Finder proprietary desktop services preference `DSDontWriteNetworkStores` / `DSDontWriteUSBStores`. |
 | **Legacy Overrides Audit** | `lib/optimize/catalog.sh:43` | Audits macOS `NSGlobalDomain` App Nap and disk image verification overrides created by legacy macOS tweakers. |
 | **Spotlight Index Optimization & Rebuild** | `lib/optimize/catalog.sh:49-53` | Manages Darwin Spotlight metadata search indexing engine via `mdutil -E /` and `mdimport`. |
@@ -161,18 +167,25 @@ graph TD
 ### Phase 1: Core Clean & Uninstall Hardening & Parity
 - **Slug:** `core-clean-uninstall`
 - **Story ID:** `MU-002-clean-uninstall-parity`
-- **Value:** **High** — Solves critical gaps in primary P0 commands (`clean` and `uninstall`). Enables CLI scripting, expands browser coverage to modern Ubuntu Snap/Flatpak defaults, and adds safe Trash reclamation.
+- **Value:** **High** — Solves critical gaps in primary P0 commands (`clean` and `uninstall`). Enables CLI scripting, expands browser coverage to modern Ubuntu Snap/Flatpak defaults, adds safe Trash reclamation with item count preview, and adds interactive remnant review.
 - **Risk:** **Medium** — Touches destructive deletion paths; must strictly adhere to `trash::SafeDelete` and safety invariants.
 - **Scope:**
   - Expand `browser-cache` scanner in `src/clean/scan_browser.rs` to detect Snap Firefox/Chromium, Flatpak browsers, and Brave/Edge/Opera/Zen.
   - Implement PWA domain protection for ServiceWorker/IndexedDB directories.
-  - Add `system-trash` opt-in clean target (`--include=system-trash`) to calculate and empty Trash via `gio trash --empty` or safe purge.
+  - Add `system-trash` opt-in clean target (`--include=system-trash`):
+    - Previews BOTH size and item count: e.g. `System Trash (14 items) ... 82.4 MB`.
+    - Requires explicit confirmation dialog in TUI mode.
+    - In non-interactive CLI mode, requires `--yes`; without `--yes`, it aborts and fails closed without touching trash.
+    - Executes strictly via `gio trash --empty`, never raw directory purging (`rm -rf`).
+  - Add optional clean target `external-volume` (`--external <PATH>`) in `src/clean/targets.rs` to clean `.Trash-*`, `.directory`, and temporary mount metadata.
   - Export clean preview ledger to `$XDG_CONFIG_HOME/mu/clean-list.txt` during `clean --dry-run`.
+  - Add post-clean advisory in `mu clean` scanning `$HOME/Downloads` for files >500MB (large files hint).
   - Add CLI argument parsing for direct uninstall: `mu uninstall <pkg1> <pkg2>`.
   - Add `mu uninstall --list` flag to print installed packages and sources.
   - Add Flatpak app discovery to `src/uninstall/discover.rs` (`flatpak list --app`).
-  - Expand remnant scanner to discover systemd user units (`~/.config/systemd/user/<pkg>.service`) and `.desktop` files.
+  - Expand remnant scanner to discover systemd user units (`~/.config/systemd/user/<pkg>.service`), `.desktop` files, and Steam game manifests (`~/.local/share/Steam/steamapps/appmanifest_*.acf` delegating to `steam steam://uninstall/<id>`).
   - Add systemd user unit stopping (`systemctl --user stop`) prior to remnant deletion.
+  - Provide an interactive TUI remnant checklist dialog allowing users to selectively deselect config/data directories before deletion.
   - Allow headless non-TTY execution for `mu uninstall <pkg>` and `mu uninstall --list` while preserving existing exit 1 error on bare headless `mu uninstall`.
   - **Explicit Decision:** Reject `--permanent` flag with exit code 1 and explanatory safety message.
 - **Files Likely Touched:**
@@ -186,42 +199,68 @@ graph TD
   - `src/uninstall/mod.rs`
   - `src/cli.rs`
   - `tests/cli_integration.rs`
+  - `tests/golden/help-uninstall.txt`
 - **Safety Invariants Preserved:**
   - All removals route through `trash::SafeDelete`.
   - `--permanent` is explicitly rejected.
-  - `system-trash` is opt-in (`--include=system-trash`).
-  - `--dry-run` previews actions without side effects.
+  - `system-trash` is opt-in (`--include=system-trash`) and executes only via `gio trash --empty`.
+  - `--dry-run` previews actions without side effects, verified by sentinel file checks.
 - **Concrete Acceptance Tests:**
   1. `cargo test clean::` -> `test result: ok; 0 failed`
   2. `cargo test uninstall::` -> `test result: ok; 0 failed`
   3. `cargo run --release -- clean --dry-run` -> exit 0; output contains `Potential space to free:`, `DRY RUN`, and creates/updates `$XDG_CONFIG_HOME/mu/clean-list.txt`.
-  4. `cargo run --release -- clean --dry-run --include=system-trash` -> exit 0; output includes `System Trash` target line with size.
-  5. `cargo run --release -- uninstall --list` -> exit 0; output lists installed packages with source prefix (e.g. `apt:...`, `snap:...`).
-  6. `cargo run --release -- uninstall --dry-run bash` -> exit 0; output previews removal plan without executing apt or deleting files.
-  7. `cargo run --release -- uninstall --permanent bash` -> exit 1; stderr contains `error: --permanent is rejected: mu enforces SafeDelete via trash only`.
-  8. `make test` -> all unit and integration tests pass (312+ passed).
+  4. `cargo run --release -- clean --dry-run --include=system-trash` -> exit 0; output includes `System Trash` target line with both size and item count preview (e.g. `System Trash (N items) ... X.Y MB`).
+  5. `cargo run --release -- clean --include=system-trash < /dev/null` -> exit 0; prints non-interactive abort note `Non-interactive: pass --yes` and does not empty trash.
+  6. Sentinel immutability test:
+     ```bash
+     mkdir -p /tmp/mu-clean-sentinel && touch /tmp/mu-clean-sentinel/keep.txt
+     cargo run --release -- clean --dry-run
+     test -f /tmp/mu-clean-sentinel/keep.txt
+     ```
+     -> exit 0; confirms sentinel file is untouched.
+  7. `cargo run --release -- uninstall --list` -> exit 0; output lists installed packages with source prefix (e.g. `apt:...`, `snap:...`, `flatpak:...`).
+  8. `cargo run --release -- uninstall --dry-run bash` -> exit 0; output previews removal plan without executing apt or deleting files.
+  9. `cargo run --release -- uninstall --permanent bash` -> exit 1; stderr contains `error: --permanent is rejected: mu enforces SafeDelete via trash only`.
+  10. `make test` -> all unit and integration tests pass (312+ passed).
 
 ---
 
 ### Phase 2: System Maintenance & Optimize Expansion
 - **Slug:** `optimize-maintenance-expansion`
 - **Story ID:** `MU-003-optimize-expansion`
-- **Value:** **High** — Upgrades `mu optimize` from 3 basic tasks to a comprehensive 10-step Linux maintenance suite, covering networking, systemd, package repair, and database compression.
-- **Risk:** **Low-Medium** — Most operations are idempotent system maintenance commands; package repair operations use standard Ubuntu recovery commands (`dpkg --configure -a`).
+- **Value:** **High** — Upgrades `mu optimize` from 3 basic tasks to 9 safe Linux maintenance units, covering networking, systemd, package repair, database compression, and integrity auditing.
+- **Risk:** **Low-Medium** — Most operations are idempotent system maintenance commands; package repair operations use standard Ubuntu recovery commands (`dpkg --configure -a`). Network route/neighbor flush is strictly excluded.
 - **Scope:**
-  - Expand `all_steps` in `src/optimize.rs` with new modular maintenance tasks:
+  - Expand `all_steps` in `src/optimize.rs` with safe modular maintenance tasks:
+    - `apt`: `sudo apt-get update && sudo apt-get autoremove --purge -y`
+    - `journal`: `sudo journalctl --vacuum-size=500M`
+    - `caches`: `sudo update-mime-database /usr/share/mime && fc-cache -f`
     - `dns`: Flush DNS cache via `resolvectl flush-caches` (fallback `systemd-resolve --flush-caches`).
-    - `network`: Refresh routing and neighbor caches via `ip route flush cache` and `ip neigh flush all`.
-    - `packages`: Repair interrupted package installs via `dpkg --configure -a` and `apt-get install -f -y`.
-    - `systemd`: Reset failed systemd units via `systemctl reset-failed` and `systemctl --user reset-failed`.
+    - `packages`: Repair interrupted package installs via `sudo dpkg --configure -a && sudo apt-get install -f -y`.
+    - `systemd`: Reset failed systemd units via `systemctl reset-failed && systemctl --user reset-failed`.
     - `flatpak`: Clean unused Flatpak runtimes via `flatpak uninstall --unused -y` (skipped if Flatpak absent).
     - `sqlite`: Vacuum closed application databases (Firefox, Chrome, Thunderbird sqlite databases).
     - `state`: Clean stale files older than 30 days in `~/.local/state/`.
-  - Support `--skip` for all new step IDs (`apt`, `journal`, `caches`, `dns`, `network`, `packages`, `systemd`, `flatpak`, `sqlite`, `state`).
+    - `autostart`: Audit `~/.config/autostart/*.desktop` for missing `Exec` binaries.
+    - `services`: Audit broken symlinks in `/etc/systemd/system/` and `~/.config/systemd/user/`.
+    - `permissions`: Audit files in `$HOME` owned by root or with broken permissions.
+    - `disk-health`: Audit SMART status via `smartctl` or journalctl filesystem check logs.
+  - **Mandatory Exact Command Display:** In `--dry-run` output, every step must display the exact shell command string it would execute:
+    - `apt`: `[dry-run] sudo apt-get update && sudo apt-get autoremove --purge -y`
+    - `journal`: `[dry-run] sudo journalctl --vacuum-size=500M`
+    - `caches`: `[dry-run] sudo update-mime-database /usr/share/mime && fc-cache -f`
+    - `dns`: `[dry-run] resolvectl flush-caches`
+    - `packages`: `[dry-run] sudo dpkg --configure -a && sudo apt-get install -f -y`
+    - `systemd`: `[dry-run] systemctl reset-failed && systemctl --user reset-failed`
+    - `flatpak`: `[dry-run] flatpak uninstall --unused -y`
+    - `sqlite`: `[dry-run] sqlite3 <db_path> "VACUUM;"`
+    - `state`: `[dry-run] find ~/.local/state -type f -mtime +30 -delete`
+  - Support `--skip` for all registered step IDs.
   - Add optional clean targets in `src/clean/targets.rs`:
     - `dev-cache` (`--include=dev-cache`): clean `~/.cache/pip`, `~/.npm/_cacache`, `~/.cargo/registry/cache`, `~/.cache/go-build`.
     - `podman` (`--include=podman`): run `podman system prune -f` when Podman socket or binary is detected.
-    - `orphaned-app-data`: scan `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` for uninstalled packages.
+    - `orphaned-app-data` (`--include=orphaned-app-data`): scan `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` for uninstalled packages.
+    - `orphaned-services` (`--include=orphaned-services`): clean broken systemd user and system unit symlinks.
 - **Files Likely Touched:**
   - `src/optimize.rs`
   - `src/clean/targets.rs`
@@ -229,22 +268,30 @@ graph TD
   - `src/cli.rs`
   - `tests/cli_integration.rs`
 - **Safety Invariants Preserved:**
-  - Every step supports `--dry-run` preview.
+  - Every step supports `--dry-run` preview displaying exact commands.
   - Failures in one step do not abort subsequent steps; summary aggregates non-zero exit codes.
   - Developer caches remain strictly opt-in (`--include=dev-cache`).
+  - Network route/neighbor table flush is excluded.
 - **Concrete Acceptance Tests:**
   1. `cargo test optimize::` -> `test result: ok; 0 failed`
-  2. `cargo run --release -- optimize --dry-run` -> exit 0; output lists all 10 registered steps with their descriptions.
+  2. `cargo run --release -- optimize --dry-run` -> exit 0; output lists registered steps showing the exact shell command string for each step (e.g. `[dry-run] sudo journalctl --vacuum-size=500M`, `[dry-run] resolvectl flush-caches`).
   3. `cargo run --release -- optimize --dry-run --skip=apt,dns,packages` -> exit 0; output explicitly indicates `[skip]` for `apt`, `dns`, and `packages`.
-  4. `cargo run --release -- clean --dry-run --include=dev-cache` -> exit 0; output includes `Developer CLI Caches` target line.
-  5. `make test` -> all unit and integration tests pass.
+  4. Sentinel immutability test:
+     ```bash
+     mkdir -p ~/.local/state/sentinel-test && touch -d "40 days ago" ~/.local/state/sentinel-test/stale.log 2>/dev/null || touch ~/.local/state/sentinel-test/stale.log
+     cargo run --release -- optimize --dry-run
+     test -f ~/.local/state/sentinel-test/stale.log
+     ```
+     -> exit 0; confirms sentinel file was not removed during dry-run.
+  5. `cargo run --release -- clean --dry-run --include=dev-cache` -> exit 0; output includes `Developer CLI Caches` target line.
+  6. `make test` -> all unit and integration tests pass.
 
 ---
 
 ### Phase 3: Operational History, Purge & Installer Commands
 - **Slug:** `history-purge-installer`
 - **Story ID:** `MU-004-history-purge-installer`
-- **Value:** **High** — Delivers PRD P1 (`mu purge`) and P2 (`mu installer`) user-facing commands, and unlocks visibility into the existing `operations.log` via `mu history`.
+- **Value:** **High** — Delivers PRD P1 (`mu purge`) and P2 (`mu installer`) user-facing commands, project artifact hints in `clean`, and unlocks visibility into the existing `operations.log` via `mu history`.
 - **Risk:** **Medium** — `mu purge` deletes deep build directories (`node_modules`, `target`, `.venv`); must strictly enforce root validation (`src/paths.rs`) and route everything through `trash::SafeDelete`.
 - **Scope:**
   - **`mu history`**:
@@ -261,9 +308,11 @@ graph TD
     - Inspects archive contents to verify presence of binaries or installer packages.
     - Flags: `--dry-run`, `--yes`.
     - Interactive selection in TUI or headless removal with `--yes`.
+  - **Project Artifacts Hint**: Add post-clean advisory in `mu clean` suggesting `mu purge` when detected project build artifacts exceed 2 GB.
 - **Files Likely Touched:**
   - `src/cli.rs`
   - `src/oplog.rs`
+  - `src/clean/mod.rs`
   - `src/history.rs` (new module)
   - `src/purge/` (new module: scanner, model, execution)
   - `src/installer/` (new module: scanner, model, execution)
@@ -278,9 +327,22 @@ graph TD
   1. `cargo run --release -- history --limit 5` -> exit 0; output renders tabular log of recent operations.
   2. `cargo run --release -- history --json` -> exit 0; output parses as valid JSON array with fields `timestamp`, `action`, `outcome`, `target`.
   3. `cargo run --release -- purge --dry-run` -> exit 0; output scans search paths and reports discoverable project artifacts.
-  4. `cargo run --release -- installer --dry-run` -> exit 0; output lists discoverable installer files in Downloads without deleting.
-  5. `cargo run --release -- help` -> exit 0; lists `history`, `purge`, and `installer` subcommands.
-  6. `make test` -> all unit and integration tests pass.
+  4. Sentinel immutability test (purge):
+     ```bash
+     mkdir -p /tmp/mu-purge-test/node_modules && touch /tmp/mu-purge-test/node_modules/sentinel.js
+     cargo run --release -- purge --dry-run --paths=/tmp/mu-purge-test
+     test -f /tmp/mu-purge-test/node_modules/sentinel.js
+     ```
+     -> exit 0; confirms purge dry-run leaves `sentinel.js` intact.
+  5. Sentinel immutability test (installer):
+     ```bash
+     mkdir -p /tmp/mu-installer-test && touch /tmp/mu-installer-test/dummy.deb
+     cargo run --release -- installer --dry-run --paths=/tmp/mu-installer-test
+     test -f /tmp/mu-installer-test/dummy.deb
+     ```
+     -> exit 0; confirms installer dry-run leaves `dummy.deb` intact.
+  6. `cargo run --release -- help` -> exit 0; lists `history`, `purge`, and `installer` subcommands.
+  7. `make test` -> all unit and integration tests pass.
 
 ---
 
@@ -301,6 +363,7 @@ graph TD
   - **`mu analyze` Subsystem:**
     - Argument: `mu analyze [PATH]` (defaults to overview of root `/` and `$HOME`).
     - Flag: `--json` for machine-readable tree output.
+    - Flag: `--dry-run` to preview scan metrics and ensure in-app deletion is disabled.
     - High-performance directory tree scanner with size aggregation and largest file heap.
     - Ratatui interactive explorer: navigate folders with arrow/Vim keys, sort by size/name, drill into subdirectories.
     - In-app deletion: select item, press 'd', confirm with YES/NO dialog, delete via `trash::SafeDelete`.
@@ -315,13 +378,21 @@ graph TD
 - **Safety Invariants Preserved:**
   - Disk analysis deletion strictly uses `trash::SafeDelete` with default-NO confirmation.
   - Path validation prevents attempting deletion of protected root prefixes (`/`, `/usr`, `/etc`).
+  - `--dry-run` guarantees zero deletions.
 - **Concrete Acceptance Tests:**
   1. `cargo test status::` -> `test result: ok; 0 failed`
   2. `cargo run --release -- status --watch --interval 1s | head -n 2` -> exit 0; emits 2 valid NDJSON lines containing `cpu_percent`, `memory`, `disks`, `network`, `health`.
   3. `cargo run --release -- status --json` -> exit 0; emitted JSON contains extended fields `cpu_cores` and `disk_io`.
   4. `cargo run --release -- analyze --json /tmp` -> exit 0; emits JSON directory tree structure.
-  5. `cargo run --release -- analyze --help` -> exit 0; renders analyze usage, arguments, and options.
-  6. `make test` -> all unit and integration tests pass.
+  5. Sentinel immutability test (analyze):
+     ```bash
+     mkdir -p /tmp/mu-analyze-test && touch /tmp/mu-analyze-test/sentinel.dat
+     cargo run --release -- analyze --dry-run /tmp/mu-analyze-test
+     test -f /tmp/mu-analyze-test/sentinel.dat
+     ```
+     -> exit 0; confirms analyze dry-run did not modify or delete `sentinel.dat`.
+  6. `cargo run --release -- analyze --help` -> exit 0; renders analyze usage, arguments, and options.
+  7. `make test` -> all unit and integration tests pass.
 
 ---
 
@@ -372,7 +443,13 @@ graph TD
   1. `cargo run --release -- sudo status` -> exit 0; reports whether PAM fingerprint authentication is active.
   2. `cargo run --release -- sudo --dry-run enable` -> exit 0; previews PAM configuration changes without modifying files.
   3. `cargo run --release -- update --dry-run` -> exit 0; checks release API and reports whether local version is up-to-date.
-  4. `cargo run --release -- remove --dry-run` -> exit 0; lists all binary, configuration, and log paths that would be cleaned.
+  4. Sentinel immutability test (remove):
+     ```bash
+     mkdir -p ~/.config/mu && touch ~/.config/mu/config.toml
+     cargo run --release -- remove --dry-run
+     test -f ~/.config/mu/config.toml
+     ```
+     -> exit 0; confirms remove dry-run does not delete configuration file.
   5. `cargo run --release -- completion --install bash` -> exit 0; writes completion script to bash completions directory.
   6. `make test` -> all unit and integration tests pass.
 
