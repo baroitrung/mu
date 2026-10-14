@@ -1,6 +1,6 @@
 //! Ratatui ncdu-like interactive disk usage explorer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -203,7 +203,7 @@ impl AnalyzeTui {
                     self.navigate_up();
                 }
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('d') if self.view_mode == ViewMode::Tree => {
                 self.trigger_delete();
             }
             _ => {}
@@ -286,6 +286,10 @@ impl AnalyzeTui {
             return;
         }
 
+        if self.view_mode != ViewMode::Tree {
+            return;
+        }
+
         let Some(node) = self.current_node() else {
             return;
         };
@@ -296,7 +300,25 @@ impl AnalyzeTui {
         let target_path = node.children[self.cursor].path.clone();
         let target_size = node.children[self.cursor].size;
 
-        if paths::is_protected(&target_path) {
+        let abs_path = if target_path.is_relative() {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&target_path))
+                .unwrap_or_else(|_| target_path.clone())
+        } else {
+            target_path.clone()
+        };
+        let clean_path = crate::xdg::clean(&abs_path);
+
+        let as_root = if target_path.is_relative() {
+            let stripped = target_path.strip_prefix(".").unwrap_or(&target_path);
+            let stripped = stripped.strip_prefix("/").unwrap_or(stripped);
+            Path::new("/").join(stripped)
+        } else {
+            target_path.clone()
+        };
+        let clean_as_root = crate::xdg::clean(&as_root);
+
+        if paths::is_protected(&clean_path) || paths::is_protected(&clean_as_root) {
             self.message = Some((
                 format!("Refused: {} is a protected path", target_path.display()),
                 true,
@@ -738,5 +760,48 @@ mod tests {
         tui.handle_key_event(dummy_key(KeyCode::Char('d')));
         assert!(tui.confirm_delete.is_none());
         assert!(tui.message.unwrap().0.contains("protected path"));
+    }
+
+    #[test]
+    fn test_relative_protected_path_prevents_delete() {
+        let mut tui = AnalyzeTui::new(false);
+        let mut root = FileNode::new("root".into(), PathBuf::from("."), 100, true, 1);
+        let etc = FileNode::new("etc".into(), PathBuf::from("etc"), 100, true, 1);
+        root.children = vec![etc];
+        tui.root = Some(root);
+
+        tui.handle_key_event(dummy_key(KeyCode::Char('d')));
+        assert!(
+            tui.confirm_delete.is_none(),
+            "relative protected path should not trigger delete confirmation"
+        );
+        assert!(tui.message.unwrap().0.contains("protected path"));
+    }
+
+    #[test]
+    fn test_delete_in_largest_files_view_is_prevented() {
+        let mut tui = AnalyzeTui::new(false);
+        let mut root = FileNode::new("root".into(), PathBuf::from("/tmp/root"), 100, true, 1);
+        let c = FileNode::new(
+            "unrelated.txt".into(),
+            PathBuf::from("/tmp/root/unrelated.txt"),
+            100,
+            false,
+            1,
+        );
+        root.children = vec![c];
+        tui.root = Some(root);
+        tui.largest_files = vec![crate::analyze::model::LargestFile::new(
+            PathBuf::from("/tmp/other/big.dat"),
+            1000,
+        )];
+        tui.view_mode = crate::analyze::model::ViewMode::LargestFiles;
+        tui.cursor = 0;
+
+        tui.handle_key_event(dummy_key(KeyCode::Char('d')));
+        assert!(
+            tui.confirm_delete.is_none(),
+            "deletion must not be triggered from largest files view"
+        );
     }
 }

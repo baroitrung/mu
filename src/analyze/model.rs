@@ -1,10 +1,18 @@
 //! Data models for interactive disk analysis.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
 
+/// Serialize a `PathBuf` as a lossy UTF-8 string, preventing serialization failure
+/// when encountering non-UTF-8 filenames on Unix filesystems.
+pub fn serialize_path_lossy<S>(path: &Path, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&path.to_string_lossy())
+}
 /// Sorting criteria for directory entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SortMode {
@@ -44,6 +52,7 @@ pub enum ViewMode {
 #[derive(Clone, Debug, Serialize)]
 pub struct FileNode {
     pub name: String,
+    #[serde(serialize_with = "serialize_path_lossy")]
     pub path: PathBuf,
     pub size: u64,
     pub size_human: String,
@@ -112,6 +121,7 @@ impl FileNode {
 /// A discovered large file.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct LargestFile {
+    #[serde(serialize_with = "serialize_path_lossy")]
     pub path: PathBuf,
     pub size: u64,
     pub size_human: String,

@@ -120,12 +120,19 @@ pub fn scan_path(
 ) -> Result<(FileNode, ScanStats), String> {
     let start_time = Instant::now();
 
-    let root_meta = fs::symlink_metadata(root_path)
-        .map_err(|e| format!("cannot inspect {}: {e}", root_path.display()))?;
+    let root_meta = match fs::metadata(root_path).or_else(|_| fs::symlink_metadata(root_path)) {
+        Ok(m) => m,
+        Err(e) => {
+            let msg = format!("cannot inspect {}: {e}", root_path.display());
+            if let Some(tx) = &tx {
+                let _ = tx.send(ScanMessage::Error(msg.clone()));
+            }
+            return Err(msg);
+        }
+    };
 
     let root_dev = root_meta.dev();
-    let is_dir = root_meta.is_dir() && !root_meta.file_type().is_symlink();
-
+    let is_dir = root_meta.is_dir();
     let mut ctx = WalkerContext::new(options, root_dev, tx.clone(), cancel);
 
     let mut root_node = if is_dir {
@@ -369,6 +376,68 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(true)); // Pre-cancelled
         let (root, _) = scan_path(&dir, WalkerOptions::default(), None, cancel).unwrap();
         assert!(root.children.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_scan_path_sends_error_on_root_failure() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let non_existent = Path::new("/tmp/mu-test-nonexistent-path-12345");
+        let res = scan_path(non_existent, WalkerOptions::default(), Some(tx), cancel);
+        assert!(res.is_err());
+        let msg = rx
+            .try_recv()
+            .expect("ScanMessage::Error should be sent over tx on root inspect error");
+        match msg {
+            ScanMessage::Error(err) => {
+                assert!(
+                    err.contains("cannot inspect"),
+                    "expected error message, got: {err}"
+                );
+            }
+            _ => panic!("expected ScanMessage::Error, got: {:?}", msg),
+        }
+    }
+
+    #[test]
+    fn test_scan_root_symlink_to_directory_is_traversed() {
+        let dir = tempdir("root_symlink_test");
+        let real_dir = dir.join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let inner_file = real_dir.join("inner.txt");
+        fs::write(&inner_file, b"hello world").unwrap();
+
+        let child_sub = real_dir.join("sub");
+        fs::create_dir(&child_sub).unwrap();
+        let child_sub_file = child_sub.join("sub_file.txt");
+        fs::write(&child_sub_file, b"deep").unwrap();
+
+        let child_link = real_dir.join("child_symlink");
+        std::os::unix::fs::symlink(&child_sub, &child_link).unwrap();
+
+        let link_dir = dir.join("link_to_real");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (root, stats) = scan_path(&link_dir, WalkerOptions::default(), None, cancel).unwrap();
+
+        assert!(
+            root.is_dir,
+            "root symlink pointing to directory should be scanned as directory"
+        );
+        assert_eq!(stats.total_files, 3); // inner.txt (11), sub_file.txt (4), child_symlink (len)
+        assert_eq!(stats.total_dirs, 2); // root + sub (child_symlink is NOT counted as dir)
+        let child_link_node = root
+            .children
+            .iter()
+            .find(|c| c.name == "child_symlink")
+            .expect("child_symlink should be in children");
+        assert!(
+            !child_link_node.is_dir,
+            "child symlinks must not be followed as directories"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

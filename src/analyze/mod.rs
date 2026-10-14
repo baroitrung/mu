@@ -74,12 +74,18 @@ pub fn run(opts: &Options) -> i32 {
 }
 
 pub fn resolve_target_path(path: Option<&Path>) -> PathBuf {
-    match path {
+    let p = match path {
         Some(p) => p.to_path_buf(),
         None => std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-    }
+    };
+    let abs = if p.is_relative() {
+        std::env::current_dir().map(|cwd| cwd.join(&p)).unwrap_or(p)
+    } else {
+        p
+    };
+    crate::xdg::clean(&abs)
 }
 
 fn print_headless_summary(root: &model::FileNode, stats: &ScanStats, dry_run: bool) {
@@ -103,5 +109,18 @@ fn print_headless_summary(root: &model::FileNode, stats: &ScanStats, dry_run: bo
             out,
             "\n[DRY RUN] In-app deletion disabled; no files were removed."
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_target_path_makes_relative_paths_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        let res = resolve_target_path(Some(Path::new(".")));
+        assert!(res.is_absolute(), "path should be absolute, got {:?}", res);
+        assert_eq!(res, crate::xdg::clean(&cwd));
     }
 }

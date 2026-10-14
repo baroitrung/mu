@@ -225,3 +225,83 @@ fn analyze_headless_matches_go_error() {
         stderr(&o)
     );
 }
+
+/// `mu analyze --json` with non-UTF8 filename -> exit 0 and valid JSON report.
+#[test]
+fn analyze_json_non_utf8_filename() {
+    use std::os::unix::ffi::OsStrExt;
+    let test_dir = std::env::temp_dir().join(format!("mu-analyze-utf8-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&test_dir);
+    let bad_file_name = std::ffi::OsStr::from_bytes(b"bad-\xff-file.dat");
+    let bad_file = test_dir.join(bad_file_name);
+    let _ = std::fs::write(&bad_file, b"content");
+
+    let o = mu(&["analyze", "--json", test_dir.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(out.contains("\"path\""), "missing path in JSON: {out}");
+    assert!(out.contains("bad-"), "missing file in JSON: {out}");
+
+    let _ = std::fs::remove_file(&bad_file);
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// `mu analyze --json` targeting a symlink to directory -> treats target as directory, exit 0.
+#[test]
+fn analyze_root_symlink_directory() {
+    let test_dir = std::env::temp_dir().join(format!("mu-analyze-sym-{}", std::process::id()));
+    let real_dir = test_dir.join("real");
+    let _ = std::fs::create_dir_all(&real_dir);
+    let file = real_dir.join("f.txt");
+    std::fs::write(&file, b"hello").unwrap();
+
+    let link_dir = test_dir.join("link");
+    std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+    let o = mu(&["analyze", "--json", link_dir.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(
+        out.contains("\"is_dir\": true"),
+        "root symlink should be is_dir: true: {out}"
+    );
+    assert!(
+        out.contains("f.txt"),
+        "should scan children of symlinked root: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// `mu analyze` with nonexistent target path -> exit 1 with inspect error.
+#[test]
+fn analyze_nonexistent_target_exits_with_error() {
+    let non_existent = format!("/tmp/mu-nonexistent-path-{}", std::process::id());
+    let o = mu(&["analyze", "--dry-run", &non_existent]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).contains("cannot inspect"),
+        "expected 'cannot inspect' in stderr: {}",
+        stderr(&o)
+    );
+}
+
+/// `mu analyze --dry-run` on relative path -> resolves to absolute target path.
+#[test]
+fn analyze_relative_path_dry_run_reports_absolute_target() {
+    let test_dir = std::env::temp_dir().join(format!("mu-analyze-rel-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&test_dir);
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["analyze", "--dry-run", "."]);
+    cmd.current_dir(&test_dir);
+    let output = cmd.output().expect("failed to execute mu");
+    assert_eq!(output.status.code(), Some(0));
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains(&format!("Target: {}", test_dir.display())),
+        "target should be absolute: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}

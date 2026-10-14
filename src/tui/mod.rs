@@ -237,6 +237,10 @@ pub fn run_analyze_tui(
         ));
     }
 
+    if let Err(e) = std::fs::metadata(target).or_else(|_| std::fs::symlink_metadata(target)) {
+        return Err(anyhow::anyhow!("cannot inspect {}: {e}", target.display()));
+    }
+
     enable_raw_mode()?;
     let _raw_guard = RawModeGuard;
     let mut stdout = std::io::stdout();

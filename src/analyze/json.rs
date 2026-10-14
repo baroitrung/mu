@@ -9,6 +9,7 @@ use crate::analyze::model::{FileNode, LargestFile, ScanStats};
 /// Top-level report emitted by `mu analyze --json`.
 #[derive(Clone, Debug, Serialize)]
 pub struct AnalyzeReport {
+    #[serde(serialize_with = "crate::analyze::model::serialize_path_lossy")]
     pub path: PathBuf,
     pub size: u64,
     pub size_human: String,
@@ -55,5 +56,40 @@ mod tests {
         assert!(json.contains("\"path\": \"/tmp/test\""));
         assert!(json.contains("\"size\": 1024"));
         assert!(json.contains("\"largest_files\""));
+    }
+
+    #[test]
+    fn test_non_utf8_path_serialization() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad_path = PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/tmp/mu-test/bad-\xff-file.dat",
+        ));
+        let mut root = FileNode::new("test".into(), PathBuf::from("/tmp/mu-test"), 1024, true, 1);
+        let child = FileNode::new(
+            "bad-\u{fffd}-file.dat".into(),
+            bad_path.clone(),
+            1024,
+            false,
+            1,
+        );
+        root.children = vec![child];
+        let stats = ScanStats {
+            total_bytes: 1024,
+            total_bytes_human: "1.0 KB".into(),
+            total_files: 1,
+            total_dirs: 1,
+            errors: 0,
+            duration: std::time::Duration::from_millis(10),
+            largest_files: vec![LargestFile::new(bad_path, 1024)],
+        };
+
+        let res = to_json_pretty(&root, &stats);
+        assert!(
+            res.is_ok(),
+            "serialization of non-UTF8 paths must succeed: {:?}",
+            res.err()
+        );
+        let json = res.unwrap();
+        assert!(json.contains("bad-"));
     }
 }
