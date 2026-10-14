@@ -20,14 +20,15 @@
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::config;
 use crate::error::{Error, Result, msg};
 use crate::oplog;
 use crate::runner::{CommandSpec, Output, ProcessRunner, RunError, Runner};
+use crate::trash;
 use crate::xdg;
-
 /// `Options` — controls optimize behavior.
 #[derive(Debug, Default, Clone)]
 pub struct Options {
@@ -54,6 +55,12 @@ pub(crate) struct Deps {
     pub config_home: PathBuf,
     /// `$XDG_DATA_HOME` — where `mu/operations.log` is opened.
     pub data_home: PathBuf,
+    /// `$HOME` — user home directory.
+    pub home: PathBuf,
+    /// `$XDG_STATE_HOME` or `~/.local/state`.
+    pub state_home: PathBuf,
+    /// `TrashDeps` for safe deletion.
+    pub trash_deps: Rc<trash::TrashDeps>,
     /// `MU_NO_OPLOG=1` — disables `InitLogger`.
     pub no_oplog: bool,
 }
@@ -72,6 +79,11 @@ impl Deps {
             confirm: Arc::new(confirm_prompt),
             config_home: xdg::config_home(),
             data_home: xdg::data_home(),
+            home: xdg::home_dir(),
+            state_home: std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| xdg::home_dir().join(".local/state")),
+            trash_deps: Rc::new(trash::TrashDeps::real()),
             no_oplog: std::env::var_os("MU_NO_OPLOG").is_some_and(|v| v == "1"),
         }
     }
@@ -81,11 +93,29 @@ impl Deps {
 /// stdout/stderr to the sink.
 type StepRun = Box<dyn Fn(&mut dyn Write) -> Result<()>>;
 
-/// `step` — one optimize step: stable ID, plan description, action.
 pub(crate) struct Step {
     pub id: &'static str,
     pub desc: &'static str,
+    pub dry_run_cmd: &'static str,
+    pub dry_run_lines: Option<Arc<dyn Fn(&Deps) -> Vec<String> + Send + Sync>>,
     pub run: StepRun,
+}
+
+impl Step {
+    pub(crate) fn new(
+        id: &'static str,
+        desc: &'static str,
+        dry_run_cmd: &'static str,
+        run: StepRun,
+    ) -> Self {
+        Self {
+            id,
+            desc,
+            dry_run_cmd,
+            dry_run_lines: None,
+            run,
+        }
+    }
 }
 
 /// `allSteps` — apt, journal, caches, in that order.
@@ -94,6 +124,8 @@ fn all_steps(deps: &Deps) -> Vec<Step> {
         Step {
             id: "apt",
             desc: "apt-get update && apt-get autoremove --purge",
+            dry_run_cmd: "sudo apt-get update && sudo apt-get autoremove --purge -y",
+            dry_run_lines: None,
             run: {
                 let runner = deps.runner.clone();
                 let autoremove = deps.autoremove.clone();
@@ -105,6 +137,8 @@ fn all_steps(deps: &Deps) -> Vec<Step> {
         Step {
             id: "journal",
             desc: "journalctl --vacuum-size=500M",
+            dry_run_cmd: "sudo journalctl --vacuum-size=500M",
+            dry_run_lines: None,
             run: {
                 let runner = deps.runner.clone();
                 Box::new(move |out: &mut dyn Write| journal_vacuum(runner.as_ref(), out))
@@ -113,9 +147,132 @@ fn all_steps(deps: &Deps) -> Vec<Step> {
         Step {
             id: "caches",
             desc: "update icon/mime/font caches",
+            dry_run_cmd: "sudo update-mime-database /usr/share/mime && fc-cache -f",
+            dry_run_lines: None,
             run: {
                 let runner = deps.runner.clone();
                 Box::new(move |out: &mut dyn Write| update_caches(runner.as_ref(), out))
+            },
+        },
+        Step {
+            id: "dns",
+            desc: "flush DNS cache",
+            dry_run_cmd: "resolvectl flush-caches",
+            dry_run_lines: None,
+            run: {
+                let runner = deps.runner.clone();
+                Box::new(move |out: &mut dyn Write| dns_flush(runner.as_ref(), out))
+            },
+        },
+        Step {
+            id: "packages",
+            desc: "repair interrupted package installs",
+            dry_run_cmd: "sudo dpkg --configure -a && sudo apt-get install -f -y",
+            dry_run_lines: None,
+            run: {
+                let runner = deps.runner.clone();
+                Box::new(move |out: &mut dyn Write| packages_repair(runner.as_ref(), out))
+            },
+        },
+        Step {
+            id: "systemd",
+            desc: "reset failed systemd units",
+            dry_run_cmd: "systemctl reset-failed && systemctl --user reset-failed",
+            dry_run_lines: None,
+            run: {
+                let runner = deps.runner.clone();
+                Box::new(move |out: &mut dyn Write| systemd_reset_failed(runner.as_ref(), out))
+            },
+        },
+        Step {
+            id: "flatpak",
+            desc: "clean unused Flatpak runtimes",
+            dry_run_cmd: "flatpak uninstall --unused -y",
+            dry_run_lines: None,
+            run: {
+                let runner = deps.runner.clone();
+                Box::new(move |out: &mut dyn Write| flatpak_clean_unused(runner.as_ref(), out))
+            },
+        },
+        Step {
+            id: "sqlite",
+            desc: "vacuum application sqlite databases",
+            dry_run_cmd: "sqlite3 <db_path> \"VACUUM;\"",
+            dry_run_lines: Some(Arc::new(|d: &Deps| {
+                let candidates = find_sqlite_candidates(&d.home);
+                candidates
+                    .into_iter()
+                    .map(|p| format!("sqlite3 {} \"VACUUM;\"", p.display()))
+                    .collect()
+            })),
+            run: {
+                let runner = deps.runner.clone();
+                let home = deps.home.clone();
+                Box::new(move |out: &mut dyn Write| sqlite_vacuum(runner.as_ref(), &home, out))
+            },
+        },
+        Step {
+            id: "state",
+            desc: "clean stale files older than 30 days in ~/.local/state",
+            dry_run_cmd: "find ~/.local/state -type f -mtime +30 -delete",
+            dry_run_lines: None,
+            run: {
+                let runner = deps.runner.clone();
+                let config_home = deps.config_home.clone();
+                let state_home = deps.state_home.clone();
+                let trash_deps = deps.trash_deps.clone();
+                Box::new(move |out: &mut dyn Write| {
+                    state_clean(
+                        runner.as_ref(),
+                        &config_home,
+                        &state_home,
+                        trash_deps.as_ref(),
+                        out,
+                    )
+                })
+            },
+        },
+        Step {
+            id: "autostart",
+            desc: "audit autostart desktop entries for missing binaries",
+            dry_run_cmd: "audit ~/.config/autostart/*.desktop for missing Exec binaries",
+            dry_run_lines: None,
+            run: {
+                let runner = deps.runner.clone();
+                let config_home = deps.config_home.clone();
+                Box::new(move |out: &mut dyn Write| {
+                    autostart_audit(runner.as_ref(), &config_home, out)
+                })
+            },
+        },
+        Step {
+            id: "services",
+            desc: "audit broken systemd service symlinks",
+            dry_run_cmd: "audit broken symlinks in /etc/systemd/system and ~/.config/systemd/user",
+            dry_run_lines: None,
+            run: {
+                let config_home = deps.config_home.clone();
+                Box::new(move |out: &mut dyn Write| services_audit(&config_home, out))
+            },
+        },
+        Step {
+            id: "permissions",
+            desc: "audit root-owned files in home directory",
+            dry_run_cmd: "audit files in $HOME owned by root",
+            dry_run_lines: None,
+            run: {
+                let home = deps.home.clone();
+                Box::new(move |out: &mut dyn Write| permissions_audit(&home, out))
+            },
+        },
+        Step {
+            id: "disk-health",
+            desc: "audit filesystem integrity and SMART disk health",
+            dry_run_cmd: "smartctl --scan || journalctl -k --grep=EXT4-fs",
+            dry_run_lines: None,
+            run: {
+                let runner = deps.runner.clone();
+                Box::new(move |out: &mut dyn Write| disk_health_audit(runner.as_ref(), out))
             },
         },
     ]
@@ -225,7 +382,20 @@ pub(crate) fn run_with(opts: &Options, deps: &Deps, out: &mut dyn Write) -> Resu
     let _ = writeln!(out, "\n  Optimize plan");
     for s in &steps {
         if skip.iter().any(|k| k == s.id) {
-            let _ = writeln!(out, "  [skip]  {}", s.desc);
+            let _ = writeln!(out, "  [skip]  {}", s.id);
+        } else if opts.dry_run {
+            if let Some(lines_fn) = &s.dry_run_lines {
+                let lines = lines_fn(deps);
+                if lines.is_empty() {
+                    let _ = writeln!(out, "  [dry-run] {}", s.dry_run_cmd);
+                } else {
+                    for line in lines {
+                        let _ = writeln!(out, "  [dry-run] {}", line);
+                    }
+                }
+            } else {
+                let _ = writeln!(out, "  [dry-run] {}", s.dry_run_cmd);
+            }
         } else {
             let _ = writeln!(out, "  [run]   {}", s.desc);
         }
@@ -453,6 +623,439 @@ fn update_caches(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
     }
 }
 
+fn dns_flush(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
+    if runner.look_path("resolvectl").is_ok() {
+        let res = runner.run(&CommandSpec::new("resolvectl", ["flush-caches"]));
+        write_captured(out, &res);
+        if let Err(e) = res {
+            if runner.look_path("systemd-resolve").is_ok() {
+                let res2 = runner.run(&CommandSpec::new("systemd-resolve", ["--flush-caches"]));
+                write_captured(out, &res2);
+                res2.map(|_| ()).map_err(|e2| Error::Msg(format!("systemd-resolve --flush-caches: {e2}")))?;
+            } else {
+                return Err(Error::Msg(format!("resolvectl flush-caches: {e}")));
+            }
+        }
+    } else if runner.look_path("systemd-resolve").is_ok() {
+        let res = runner.run(&CommandSpec::new("systemd-resolve", ["--flush-caches"]));
+        write_captured(out, &res);
+        res.map(|_| ()).map_err(|e| Error::Msg(format!("systemd-resolve --flush-caches: {e}")))?;
+    } else {
+        let _ = writeln!(out, "neither resolvectl nor systemd-resolve found; skipped");
+    }
+    Ok(())
+}
+
+fn packages_repair(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
+    let res1 = runner.run(&CommandSpec::new("sudo", ["dpkg", "--configure", "-a"]));
+    write_captured(out, &res1);
+    let err1 = res1.err();
+
+    let res2 = runner.run(&CommandSpec::new("sudo", ["apt-get", "install", "-f", "-y"]));
+    write_captured(out, &res2);
+    let err2 = res2.err();
+
+    match (err1, err2) {
+        (Some(e1), Some(e2)) => Err(Error::Msg(format!("{e1}\n{e2}"))),
+        (Some(e1), None) => Err(Error::Msg(e1.to_string())),
+        (None, Some(e2)) => Err(Error::Msg(e2.to_string())),
+        (None, None) => Ok(()),
+    }
+}
+
+fn systemd_reset_failed(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
+    let mut errs = Vec::new();
+    let res1 = runner.run(&CommandSpec::new("systemctl", ["reset-failed"]));
+    write_captured(out, &res1);
+    if let Err(e) = res1 {
+        errs.push(e.to_string());
+    }
+    let res2 = runner.run(&CommandSpec::new("systemctl", ["--user", "reset-failed"]));
+    write_captured(out, &res2);
+    if let Err(e) = res2 {
+        errs.push(e.to_string());
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Msg(errs.join("\n")))
+    }
+}
+
+fn flatpak_clean_unused(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
+    if runner.look_path("flatpak").is_err() {
+        let _ = writeln!(out, "flatpak not found; skipped");
+        return Ok(());
+    }
+    let res = runner.run(&CommandSpec::new("flatpak", ["uninstall", "--unused", "-y"]));
+    write_captured(out, &res);
+    res.map(|_| ()).map_err(|e| Error::Msg(format!("flatpak uninstall --unused: {e}")))?;
+    Ok(())
+}
+
+fn find_sqlite_candidates(home: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    // Firefox
+    let ff = home.join(".mozilla/firefox");
+    if let Ok(entries) = std::fs::read_dir(&ff) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if let Ok(sub) = std::fs::read_dir(&p) {
+                    for f in sub.flatten() {
+                        let fp = f.path();
+                        if fp.extension().and_then(|s| s.to_str()) == Some("sqlite") {
+                            candidates.push(fp);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Google Chrome
+    let chrome_default = home.join(".config/google-chrome/Default");
+    if chrome_default.is_dir() {
+        for name in &["History", "Favicons", "Cookies", "Web Data"] {
+            let p = chrome_default.join(name);
+            if p.is_file() {
+                candidates.push(p);
+            }
+        }
+        if let Ok(sub) = std::fs::read_dir(&chrome_default) {
+            for f in sub.flatten() {
+                let fp = f.path();
+                if fp.extension().and_then(|s| s.to_str()) == Some("sqlite") {
+                    candidates.push(fp);
+                }
+            }
+        }
+    }
+    // Chromium
+    let chromium_default = home.join(".config/chromium/Default");
+    if chromium_default.is_dir() {
+        for name in &["History", "Favicons", "Cookies", "Web Data"] {
+            let p = chromium_default.join(name);
+            if p.is_file() {
+                candidates.push(p);
+            }
+        }
+        if let Ok(sub) = std::fs::read_dir(&chromium_default) {
+            for f in sub.flatten() {
+                let fp = f.path();
+                if fp.extension().and_then(|s| s.to_str()) == Some("sqlite") {
+                    candidates.push(fp);
+                }
+            }
+        }
+    }
+    // Thunderbird
+    let tb = home.join(".thunderbird");
+    if let Ok(entries) = std::fs::read_dir(&tb) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if let Ok(sub) = std::fs::read_dir(&p) {
+                    for f in sub.flatten() {
+                        let fp = f.path();
+                        if fp.extension().and_then(|s| s.to_str()) == Some("sqlite") {
+                            candidates.push(fp);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn is_process_running(name: &str) -> bool {
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if let Ok(comm) = std::fs::read_to_string(path.join("comm")) {
+                if comm.trim() == name {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn sqlite_vacuum(runner: &dyn Runner, home: &Path, out: &mut dyn Write) -> Result<()> {
+    if runner.look_path("sqlite3").is_err() {
+        let _ = writeln!(out, "sqlite3 not found in PATH; skipped");
+        return Ok(());
+    }
+    let candidates = find_sqlite_candidates(home);
+    if candidates.is_empty() {
+        let _ = writeln!(out, "no application sqlite databases found");
+        return Ok(());
+    }
+    let firefox_running = is_process_running("firefox");
+    let chrome_running = is_process_running("chrome")
+        || is_process_running("google-chrome")
+        || is_process_running("chromium");
+    let thunderbird_running = is_process_running("thunderbird");
+
+    let mut vacuumed = 0;
+    for db in candidates {
+        let db_str = db.to_string_lossy();
+        if firefox_running && db_str.contains(".mozilla") {
+            let _ = writeln!(out, "sqlite: skipping {} (firefox is running)", db.display());
+            continue;
+        }
+        if chrome_running && (db_str.contains("google-chrome") || db_str.contains("chromium")) {
+            let _ = writeln!(out, "sqlite: skipping {} (chrome is running)", db.display());
+            continue;
+        }
+        if thunderbird_running && db_str.contains(".thunderbird") {
+            let _ = writeln!(out, "sqlite: skipping {} (thunderbird is running)", db.display());
+            continue;
+        }
+        let wal = db.with_extension("sqlite-wal");
+        let journal = db.with_extension("sqlite-journal");
+        if wal.exists() || journal.exists() {
+            let _ = writeln!(out, "sqlite: skipping {} (active lock/journal)", db.display());
+            continue;
+        }
+        let res = runner.run(&CommandSpec::new(
+            "sqlite3",
+            [db_str.as_ref(), "VACUUM;"],
+        ));
+        if let Err(e) = res {
+            let _ = writeln!(out, "sqlite: vacuum warning for {}: {}", db.display(), e);
+        } else {
+            vacuumed += 1;
+        }
+    }
+    let _ = writeln!(out, "sqlite: vacuumed {vacuumed} databases");
+    Ok(())
+}
+
+fn state_clean(
+    runner: &dyn Runner,
+    config_home: &Path,
+    state_home: &Path,
+    trash_deps: &trash::TrashDeps,
+    out: &mut dyn Write,
+) -> Result<()> {
+    if !state_home.is_dir() {
+        let _ = writeln!(out, "state: state directory not found");
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now();
+    let thirty_days = std::time::Duration::from_secs(30 * 86400);
+    let mut cleaned = 0;
+    clean_stale_recursive(runner, config_home, state_home, now, thirty_days, trash_deps, &mut cleaned)?;
+    let _ = writeln!(out, "state: cleaned {cleaned} stale files older than 30 days");
+    Ok(())
+}
+
+fn clean_stale_recursive(
+    runner: &dyn Runner,
+    config_home: &Path,
+    dir: &Path,
+    now: std::time::SystemTime,
+    max_age: std::time::Duration,
+    trash_deps: &trash::TrashDeps,
+    cleaned: &mut usize,
+) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if let Ok(meta) = p.symlink_metadata() {
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                clean_stale_recursive(runner, config_home, &p, now, max_age, trash_deps, cleaned)?;
+            } else if meta.is_file() {
+                if let Ok(mtime) = meta.modified() {
+                    if let Ok(age) = now.duration_since(mtime) {
+                        if age >= max_age {
+                            if trash::safe_delete_with(
+                                runner,
+                                config_home,
+                                trash_deps,
+                                &p,
+                                false,
+                            ).is_ok() {
+                                *cleaned += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn autostart_audit(runner: &dyn Runner, config_home: &Path, out: &mut dyn Write) -> Result<()> {
+    let autostart_dir = config_home.join("autostart");
+    if !autostart_dir.is_dir() {
+        let _ = writeln!(out, "autostart: no autostart directory found");
+        return Ok(());
+    }
+    let mut broken = Vec::new();
+    let entries = std::fs::read_dir(&autostart_dir)
+        .map(|rd| rd.flatten().map(|e| e.path()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for path in entries {
+        if path.extension().and_then(|s| s.to_str()) != Some("desktop") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some(exec) = trimmed.strip_prefix("Exec=") {
+                let bin = exec.split_whitespace().next().unwrap_or_default();
+                let bin = bin.trim_matches('"').trim_matches('\'');
+                if bin.is_empty() {
+                    continue;
+                }
+                let exists = if bin.starts_with('/') {
+                    Path::new(bin).exists()
+                } else {
+                    runner.look_path(bin).is_ok()
+                };
+                if !exists {
+                    broken.push(format!("{}: binary '{}' not found", path.display(), bin));
+                }
+                break;
+            }
+        }
+    }
+    if broken.is_empty() {
+        let _ = writeln!(out, "autostart: all autostart desktop entries valid");
+    } else {
+        let _ = writeln!(out, "autostart: found {} broken entries:", broken.len());
+        for b in broken {
+            let _ = writeln!(out, "  - {}", b);
+        }
+    }
+    Ok(())
+}
+
+fn services_audit(config_home: &Path, out: &mut dyn Write) -> Result<()> {
+    let mut broken = Vec::new();
+    let dirs = [
+        PathBuf::from("/etc/systemd/system"),
+        config_home.join("systemd/user"),
+    ];
+    for dir in &dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(meta) = path.symlink_metadata() {
+                if meta.file_type().is_symlink() && std::fs::metadata(&path).is_err() {
+                    broken.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    if broken.is_empty() {
+        let _ = writeln!(out, "services: no broken unit symlinks found");
+    } else {
+        let _ = writeln!(out, "services: found {} broken unit symlinks:", broken.len());
+        for b in broken {
+            let _ = writeln!(out, "  - {}", b);
+        }
+    }
+    Ok(())
+}
+
+fn permissions_audit(home: &Path, out: &mut dyn Write) -> Result<()> {
+    if !home.is_dir() {
+        return Ok(());
+    }
+    let mut root_owned = Vec::new();
+    audit_perms_dir(home, 1, 3, &mut root_owned);
+    if root_owned.is_empty() {
+        let _ = writeln!(out, "permissions: no root-owned files found in $HOME");
+    } else {
+        let _ = writeln!(out, "permissions: found {} root-owned files in $HOME:", root_owned.len());
+        for r in root_owned.iter().take(10) {
+            let _ = writeln!(out, "  - {}", r);
+        }
+        if root_owned.len() > 10 {
+            let _ = writeln!(out, "  ... and {} more", root_owned.len() - 10);
+        }
+    }
+    Ok(())
+}
+
+fn audit_perms_dir(dir: &Path, depth: usize, max_depth: usize, root_owned: &mut Vec<String>) {
+    if depth > max_depth {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(meta) = path.symlink_metadata() {
+            if meta.uid() == 0 {
+                root_owned.push(path.display().to_string());
+            }
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                if name == ".git" || name == "node_modules" || name == "target" || name == ".cargo" || name == ".rustup" {
+                    continue;
+                }
+                audit_perms_dir(&path, depth + 1, max_depth, root_owned);
+            }
+        }
+    }
+}
+
+fn disk_health_audit(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
+    let mut probed = false;
+    if runner.look_path("smartctl").is_ok() {
+        let res = runner.run(&CommandSpec::new("smartctl", ["--scan"]));
+        if let Ok(output) = res {
+            if !output.stdout.is_empty() {
+                let _ = writeln!(out, "SMART devices detected:\n{}", output.stdout_lossy().trim());
+                probed = true;
+            }
+        }
+    }
+    if !probed && runner.look_path("journalctl").is_ok() {
+        let res = runner.run(&CommandSpec::new(
+            "journalctl",
+            ["-k", "--priority=err", "-n", "10", "--no-pager"],
+        ));
+        if let Ok(output) = res {
+            let text = output.stdout_lossy();
+            let fs_errors: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains("EXT4-fs") || l.contains("BTRFS") || l.contains("XFS") || l.contains("I/O error"))
+                .collect();
+            if !fs_errors.is_empty() {
+                let _ = writeln!(out, "Filesystem alerts in kernel log:\n{}", fs_errors.join("\n"));
+                probed = true;
+            }
+        }
+    }
+    if !probed {
+        let _ = writeln!(out, "disk-health: no hardware/filesystem errors detected");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! Port of `internal/optimize/step_test.go`.
@@ -501,6 +1104,9 @@ mod tests {
             confirm: Arc::new(|_| panic!("confirm must not be reached")),
             config_home: root.to_path_buf(),
             data_home: root.join("data"),
+            home: root.to_path_buf(),
+            state_home: root.join("state"),
+            trash_deps: Rc::new(trash::TrashDeps::real()),
             no_oplog: true,
         }
     }
@@ -512,7 +1118,24 @@ mod tests {
     // Port of TestStepIDs.
     #[test]
     fn step_ids_match_go_order() {
-        assert_eq!(step_ids(), vec!["apt", "journal", "caches"]);
+        assert_eq!(
+            step_ids(),
+            vec![
+                "apt",
+                "journal",
+                "caches",
+                "dns",
+                "packages",
+                "systemd",
+                "flatpak",
+                "sqlite",
+                "state",
+                "autostart",
+                "services",
+                "permissions",
+                "disk-health",
+            ]
+        );
     }
 
     // Port of TestOptimizeModelRecordsFailedAndSuccessfulSteps — the model's
@@ -520,16 +1143,8 @@ mod tests {
     #[test]
     fn executor_records_failed_and_successful_steps() {
         let steps = vec![
-            Step {
-                id: "bad",
-                desc: "bad",
-                run: Box::new(|_| msg("blocked")),
-            },
-            Step {
-                id: "good",
-                desc: "good",
-                run: Box::new(|_| Ok(())),
-            },
+            Step::new("bad", "bad", "bad", Box::new(|_| msg("blocked"))),
+            Step::new("good", "good", "good", Box::new(|_| Ok(()))),
         ];
         let mut out = Vec::new();
         let results = execute_steps(&steps, &[], &mut out);
@@ -550,11 +1165,12 @@ mod tests {
     // Port of TestOptimizeModelRecordsSkippedStep — a skipped step never runs.
     #[test]
     fn executor_records_skipped_step() {
-        let steps = vec![Step {
-            id: "apt",
-            desc: "apt",
-            run: Box::new(|_| panic!("skipped step must not run")),
-        }];
+        let steps = vec![Step::new(
+            "apt",
+            "apt",
+            "apt",
+            Box::new(|_| panic!("skipped step must not run")),
+        )];
         let mut out = Vec::new();
         let results = execute_steps(&steps, &["apt".to_string()], &mut out);
         assert_eq!(results[0].status, StepStatus::Skipped);
@@ -625,18 +1241,14 @@ mod tests {
         let deps = test_deps(&root, runner.clone());
         let opts = Options {
             auto_yes: true,
-            skip: vec![
-                "apt".to_string(),
-                "journal".to_string(),
-                "caches".to_string(),
-            ],
+            skip: step_ids().into_iter().map(String::from).collect(),
             ..Options::default()
         };
         let mut out = Vec::new();
         let summary = run_with(&opts, &deps, &mut out).expect("all-skipped run");
         assert_eq!(
             summary,
-            "Optimization complete — 0 succeeded, 0 failed, 3 skipped"
+            "Optimization complete — 0 succeeded, 0 failed, 13 skipped"
         );
         assert!(
             runner.invocations().is_empty(),
@@ -657,9 +1269,11 @@ mod tests {
             )))
         });
         let deps = test_deps(&root, runner.clone());
+        let mut skip_ids = step_ids();
+        skip_ids.retain(|&id| id != "caches");
         let opts = Options {
             auto_yes: true,
-            skip: vec!["apt".to_string(), "journal".to_string()],
+            skip: skip_ids.into_iter().map(String::from).collect(),
             ..Options::default()
         };
         let mut out = Vec::new();
@@ -784,7 +1398,7 @@ mod tests {
         assert_eq!(summary, "Dry run — nothing executed.");
         assert_eq!(
             String::from_utf8_lossy(&out),
-            "\n  Optimize plan\n  [run]   apt-get update && apt-get autoremove --purge\n  [skip]  journalctl --vacuum-size=500M\n  [run]   update icon/mime/font caches\n  Dry run — nothing executed.\n"
+            "\n  Optimize plan\n  [dry-run] sudo apt-get update && sudo apt-get autoremove --purge -y\n  [skip]  journal\n  [dry-run] sudo update-mime-database /usr/share/mime && fc-cache -f\n  [dry-run] resolvectl flush-caches\n  [dry-run] sudo dpkg --configure -a && sudo apt-get install -f -y\n  [dry-run] systemctl reset-failed && systemctl --user reset-failed\n  [dry-run] flatpak uninstall --unused -y\n  [dry-run] sqlite3 <db_path> \"VACUUM;\"\n  [dry-run] find ~/.local/state -type f -mtime +30 -delete\n  [dry-run] audit ~/.config/autostart/*.desktop for missing Exec binaries\n  [dry-run] audit broken symlinks in /etc/systemd/system and ~/.config/systemd/user\n  [dry-run] audit files in $HOME owned by root\n  [dry-run] smartctl --scan || journalctl -k --grep=EXT4-fs\n  Dry run — nothing executed.\n"
         );
         assert!(runner.invocations().is_empty());
         fs::remove_dir_all(&root).ok();
