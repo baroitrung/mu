@@ -16,7 +16,7 @@ updated: 2026-10-14
   - `make test` passes with zero regressions across all unit and integration suites (312+ baseline tests preserved).
   - Interactive Disk Analysis (Phase 1): `mu analyze` provides an interactive ncdu-like Ratatui disk usage explorer with `--json`, `--dry-run` immutability proof, and in-app safe trash deletion.
   - Clean & Uninstall enhancements (Phase 2): Snap/Flatpak browser caches detected, `system-trash` clean target reclaims space safely with size and item count preview via `gio trash --empty` (failing closed without `--yes` in headless mode), preview ledger exported to `$XDG_CONFIG_HOME/mu/clean-list.txt`, `mu uninstall <pkg>` executes non-interactively from CLI, `mu uninstall --list` outputs installed packages, and `--permanent` is explicitly rejected with a helpful safety error.
-  - Optimize & Clean extensions (Phase 3): `mu optimize` expands from 3 to 9 safe maintenance units (DNS cache flush, broken package config repair, failed systemd unit reset, unused Flatpak runtime cleanup, SQLite vacuum, stale state cleanup, broken autostart audit, broken services audit, and home permissions audit) with `--skip` support and exact shell command display in `--dry-run`; optional clean targets for developer CLI caches (`--include=dev-cache`), Podman (`--include=podman`), and orphaned system services (`--include=orphaned-services`). The dangerous route/neighbor table flush is dropped and marked N/A as it severs live SSH connections.
+  - Optimize & Clean extensions (Phase 3): `mu optimize` expands from 3 to 9 safe maintenance units (DNS cache flush, broken package config repair, failed systemd unit reset, unused Flatpak runtime cleanup, SQLite vacuum, stale state cleanup, broken autostart audit, broken services audit, and home permissions audit) with `--skip` support and exact shell command display in `--dry-run`; optional clean targets for developer CLI caches (`--include=dev-cache`), Podman (`--include=podman`), and orphaned user services (`--include=orphaned-services`). The dangerous route/neighbor table flush is dropped and marked N/A as it severs live SSH connections.
   - History, Purge & Installer (Phase 4): `mu history` inspects `$XDG_DATA_HOME/mu/operations.log` in table and `--json` format; `mu purge` safely cleans heavy project build artifacts (`node_modules`, `target`, `dist`, `.venv`) with `--paths`, `--dry-run`, and `--yes`; `mu installer` finds and cleans large package installers in `~/Downloads`.
   - Advanced Status Monitoring (Phase 5): `mu status` supports continuous NDJSON streaming via `--watch [--interval 1s]` and surfaces per-core CPU, disk I/O, battery, and top process stats.
   - Management & Biometrics (Phase 6): `mu sudo` provides PAM fingerprint configuration (`enable`, `disable`, `status`) mirroring `mo touchid`; `mu update` checks GitHub releases and self-updates verified binaries; `mu remove` safely uninstalls `mu`; `mu completion --install` auto-installs shell scripts.
@@ -103,11 +103,11 @@ The following table catalogs every user-facing feature from upstream Mole (`tw93
 | **Uninstall: Sensitive Data Review** | `lib/uninstall/review.sh:1-50` | **missing**: `src/uninstall/remove.rs` deletes all remnants together | In interactive TUI, provide a sub-item selection screen allowing user to uncheck user data/config directories while purging package binaries. |
 | **Uninstall: Steam Game Detection** | `lib/uninstall/steam.sh` | **missing**: no Steam handling in `src/uninstall/` | Detect Steam app manifests under `~/.local/share/Steam/steamapps/appmanifest_*.acf` and provide uninstallation delegation via `steam steam://uninstall/<id>`. |
 | **Optimize: Whitelist TUI Editor** | `bin/optimize.sh`, `lib/manage/whitelist.sh:32` | **missing**: `src/config.rs:49` reads `optimize_skip` from TOML | Provide interactive TUI screen to toggle `optimize_skip` steps in `~/.config/mu/config.toml`. |
-| **Optimize: Flush DNS Cache** | `lib/optimize/catalog.sh:29, 37` | **missing**: not in `src/optimize.rs:92-121` | Implement step `dns`: execute `resolvectl flush-caches` (or fallback `systemd-resolve --flush-caches`). |
+| **Optimize: Flush DNS Cache** | `lib/optimize/catalog.sh:29, 37` | **missing**: not in `src/optimize.rs:92-121` | Implement step `dns`: execute `sudo resolvectl flush-caches` (or fallback `sudo systemd-resolve --flush-caches`); `flush-caches` is polkit-gated, so the system step runs with sudo (Conflict 2). |
 | **Optimize: Network Stack Refresh** | `lib/optimize/catalog.sh:45` | **N/A on Linux**: unsafe on Ubuntu | **DROPPED:** Route cache is obsolete on Linux >= 3.6; neighbor table flush (`ip neigh flush all`) drops active SSH/network sessions. Moved to N/A section. |
 | **Optimize: Package Repair** | `lib/optimize/catalog.sh:35` | **missing**: not in `src/optimize.rs` | Implement step `packages`: execute `sudo dpkg --configure -a` and `sudo apt-get install -f -y`. |
 | **Optimize: SQLite Database VACUUM** | `lib/optimize/catalog.sh:39` | **missing**: not in `src/optimize.rs` | Implement step `sqlite`: scan Firefox/Chrome/Thunderbird profiles and run `sqlite3 <db> "VACUUM;"` when browser processes are not running. |
-| **Optimize: Systemd Failed Units** | Linux equivalent of launchd repair | **missing**: not in `src/optimize.rs` | Implement step `systemd`: execute `systemctl reset-failed` and `systemctl --user reset-failed`. |
+| **Optimize: Systemd Failed Units** | Linux equivalent of launchd repair | **missing**: not in `src/optimize.rs` | Implement step `systemd`: execute `sudo systemctl reset-failed` (system scope is polkit-gated) and `systemctl --user reset-failed` (Conflict 2). |
 | **Optimize: Flatpak Unused Runtimes** | Linux package orphan cleanup | **missing**: not in `src/optimize.rs` | Implement step `flatpak`: execute `flatpak uninstall --unused -y` if flatpak binary is present. |
 | **Optimize: Stale App Saved State** | `lib/optimize/catalog.sh:34` | **missing**: not in `src/optimize.rs` | Implement step `state`: clean files older than 30 days in `~/.local/state/` matching known transient state patterns. |
 | **Optimize: User Perms Repair** | `lib/optimize/catalog.sh:47` | **missing**: not in `src/optimize.rs` | Implement step `permissions`: audit files in `$HOME` owned by root or with broken permissions. |
@@ -273,9 +273,9 @@ graph TD
     - `apt`: `sudo apt-get update && sudo apt-get autoremove --purge -y`
     - `journal`: `sudo journalctl --vacuum-size=500M`
     - `caches`: `sudo update-mime-database /usr/share/mime && fc-cache -f`
-    - `dns`: Flush DNS cache via `resolvectl flush-caches` (fallback `systemd-resolve --flush-caches`).
+    - `dns`: Flush DNS cache via `sudo resolvectl flush-caches` (fallback `sudo systemd-resolve --flush-caches`).
     - `packages`: Repair interrupted package installs via `sudo dpkg --configure -a && sudo apt-get install -f -y`.
-    - `systemd`: Reset failed systemd units via `systemctl reset-failed && systemctl --user reset-failed`.
+    - `systemd`: Reset failed systemd units via `sudo systemctl reset-failed && systemctl --user reset-failed`.
     - `flatpak`: Clean unused Flatpak runtimes via `flatpak uninstall --unused -y` (skipped if Flatpak absent).
     - `sqlite`: Vacuum closed application databases (Firefox, Chrome, Thunderbird sqlite databases).
     - `state`: Clean stale files older than 30 days in `~/.local/state/`.
@@ -287,9 +287,9 @@ graph TD
     - `apt`: `[dry-run] sudo apt-get update && sudo apt-get autoremove --purge -y`
     - `journal`: `[dry-run] sudo journalctl --vacuum-size=500M`
     - `caches`: `[dry-run] sudo update-mime-database /usr/share/mime && fc-cache -f`
-    - `dns`: `[dry-run] resolvectl flush-caches`
+    - `dns`: `[dry-run] sudo resolvectl flush-caches`
     - `packages`: `[dry-run] sudo dpkg --configure -a && sudo apt-get install -f -y`
-    - `systemd`: `[dry-run] systemctl reset-failed && systemctl --user reset-failed`
+    - `systemd`: `[dry-run] sudo systemctl reset-failed && systemctl --user reset-failed`
     - `flatpak`: `[dry-run] flatpak uninstall --unused -y`
     - `sqlite`: `[dry-run] sqlite3 <db_path> "VACUUM;"`
     - `state`: `[dry-run] find ~/.local/state -type f -mtime +30 -delete`
@@ -298,7 +298,7 @@ graph TD
     - `dev-cache` (`--include=dev-cache`): clean `~/.cache/pip`, `~/.npm/_cacache`, `~/.cargo/registry/cache`, `~/.cache/go-build`.
     - `podman` (`--include=podman`): run `podman system prune -f` when Podman socket or binary is detected.
     - `orphaned-app-data` (`--include=orphaned-app-data`): scan `$XDG_DATA_HOME` and `$XDG_CONFIG_HOME` for uninstalled packages.
-    - `orphaned-services` (`--include=orphaned-services`): clean broken systemd user and system unit symlinks.
+    - `orphaned-services` (`--include=orphaned-services`): clean broken systemd **user** unit symlinks, recursing `*.wants/` enablement dirs; system-scope units are audit-only (`optimize services`) since they cannot go through SafeDelete.
 - **Files Likely Touched:**
   - `src/optimize.rs`
   - `src/clean/targets.rs`
@@ -312,7 +312,7 @@ graph TD
   - Network route/neighbor table flush is excluded.
 - **Concrete Acceptance Tests:**
   1. `cargo test optimize::` -> `test result: ok; 0 failed`
-  2. `cargo run --release -- optimize --dry-run` -> exit 0; output lists registered steps showing the exact shell command string for each step (e.g. `[dry-run] sudo journalctl --vacuum-size=500M`, `[dry-run] resolvectl flush-caches`).
+  2. `cargo run --release -- optimize --dry-run` -> exit 0; output lists registered steps showing the exact shell command string for each step (e.g. `[dry-run] sudo journalctl --vacuum-size=500M`, `[dry-run] sudo resolvectl flush-caches`).
   3. `cargo run --release -- optimize --dry-run --skip=apt,dns,packages` -> exit 0; output explicitly indicates `[skip]` for `apt`, `dns`, and `packages`.
   4. Sentinel immutability test:
      ```bash

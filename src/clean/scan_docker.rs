@@ -45,8 +45,9 @@ fn parse_docker_build_cache_size(json_lines: &str) -> i64 {
 
 /// `parseDockerSize` — Docker size strings like "1.2GB", "512MB", "0B" to
 /// bytes. Go's `fmt.Sscanf(s, "%f%s", ...)` result is used unconditionally —
-/// a failed scan leaves `0`/`""`, which no switch arm matches.
-fn parse_docker_size(s: &str) -> i64 {
+/// a failed scan leaves `0`/`""`, which no switch arm matches. Shared with the
+/// Podman target (`podman system df` reports the same size strings).
+pub(crate) fn parse_docker_size(s: &str) -> i64 {
     let s = s.trim();
     if s.is_empty() || s == "0B" {
         return 0;

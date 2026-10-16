@@ -80,9 +80,7 @@ impl Deps {
             config_home: xdg::config_home(),
             data_home: xdg::data_home(),
             home: xdg::home_dir(),
-            state_home: std::env::var_os("XDG_STATE_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| xdg::home_dir().join(".local/state")),
+            state_home: xdg::state_home(),
             trash_deps: Rc::new(trash::TrashDeps::real()),
             no_oplog: std::env::var_os("MU_NO_OPLOG").is_some_and(|v| v == "1"),
         }
@@ -157,7 +155,7 @@ fn all_steps(deps: &Deps) -> Vec<Step> {
         Step {
             id: "dns",
             desc: "flush DNS cache",
-            dry_run_cmd: "resolvectl flush-caches",
+            dry_run_cmd: "sudo resolvectl flush-caches",
             dry_run_lines: None,
             run: {
                 let runner = deps.runner.clone();
@@ -177,7 +175,7 @@ fn all_steps(deps: &Deps) -> Vec<Step> {
         Step {
             id: "systemd",
             desc: "reset failed systemd units",
-            dry_run_cmd: "systemctl reset-failed && systemctl --user reset-failed",
+            dry_run_cmd: "sudo systemctl reset-failed && systemctl --user reset-failed",
             dry_run_lines: None,
             run: {
                 let runner = deps.runner.clone();
@@ -624,22 +622,34 @@ fn update_caches(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
 }
 
 fn dns_flush(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
+    // `flush-caches` is polkit-gated (`org.freedesktop.resolve1.flush-caches`),
+    // so the system half must run elevated or every default run fails without
+    // a polkit agent (plan Conflict 2: root-level steps run with sudo).
     if runner.look_path("resolvectl").is_ok() {
-        let res = runner.run(&CommandSpec::new("resolvectl", ["flush-caches"]));
+        let res = runner.run(&CommandSpec::new("sudo", ["resolvectl", "flush-caches"]));
         write_captured(out, &res);
         if let Err(e) = res {
             if runner.look_path("systemd-resolve").is_ok() {
-                let res2 = runner.run(&CommandSpec::new("systemd-resolve", ["--flush-caches"]));
+                let res2 = runner.run(&CommandSpec::new(
+                    "sudo",
+                    ["systemd-resolve", "--flush-caches"],
+                ));
                 write_captured(out, &res2);
-                res2.map(|_| ()).map_err(|e2| Error::Msg(format!("systemd-resolve --flush-caches: {e2}")))?;
+                res2.map(|_| ()).map_err(|e2| {
+                    Error::Msg(format!("sudo systemd-resolve --flush-caches: {e2}"))
+                })?;
             } else {
-                return Err(Error::Msg(format!("resolvectl flush-caches: {e}")));
+                return Err(Error::Msg(format!("sudo resolvectl flush-caches: {e}")));
             }
         }
     } else if runner.look_path("systemd-resolve").is_ok() {
-        let res = runner.run(&CommandSpec::new("systemd-resolve", ["--flush-caches"]));
+        let res = runner.run(&CommandSpec::new(
+            "sudo",
+            ["systemd-resolve", "--flush-caches"],
+        ));
         write_captured(out, &res);
-        res.map(|_| ()).map_err(|e| Error::Msg(format!("systemd-resolve --flush-caches: {e}")))?;
+        res.map(|_| ())
+            .map_err(|e| Error::Msg(format!("sudo systemd-resolve --flush-caches: {e}")))?;
     } else {
         let _ = writeln!(out, "neither resolvectl nor systemd-resolve found; skipped");
     }
@@ -651,7 +661,10 @@ fn packages_repair(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
     write_captured(out, &res1);
     let err1 = res1.err();
 
-    let res2 = runner.run(&CommandSpec::new("sudo", ["apt-get", "install", "-f", "-y"]));
+    let res2 = runner.run(&CommandSpec::new(
+        "sudo",
+        ["apt-get", "install", "-f", "-y"],
+    ));
     write_captured(out, &res2);
     let err2 = res2.err();
 
@@ -665,7 +678,9 @@ fn packages_repair(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
 
 fn systemd_reset_failed(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
     let mut errs = Vec::new();
-    let res1 = runner.run(&CommandSpec::new("systemctl", ["reset-failed"]));
+    // The system scope needs root (polkit `manage-units` otherwise); the user
+    // scope runs unprivileged (plan Conflict 2).
+    let res1 = runner.run(&CommandSpec::new("sudo", ["systemctl", "reset-failed"]));
     write_captured(out, &res1);
     if let Err(e) = res1 {
         errs.push(e.to_string());
@@ -687,9 +702,13 @@ fn flatpak_clean_unused(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> 
         let _ = writeln!(out, "flatpak not found; skipped");
         return Ok(());
     }
-    let res = runner.run(&CommandSpec::new("flatpak", ["uninstall", "--unused", "-y"]));
+    let res = runner.run(&CommandSpec::new(
+        "flatpak",
+        ["uninstall", "--unused", "-y"],
+    ));
     write_captured(out, &res);
-    res.map(|_| ()).map_err(|e| Error::Msg(format!("flatpak uninstall --unused: {e}")))?;
+    res.map(|_| ())
+        .map_err(|e| Error::Msg(format!("flatpak uninstall --unused: {e}")))?;
     Ok(())
 }
 
@@ -807,7 +826,11 @@ fn sqlite_vacuum(runner: &dyn Runner, home: &Path, out: &mut dyn Write) -> Resul
     for db in candidates {
         let db_str = db.to_string_lossy();
         if firefox_running && db_str.contains(".mozilla") {
-            let _ = writeln!(out, "sqlite: skipping {} (firefox is running)", db.display());
+            let _ = writeln!(
+                out,
+                "sqlite: skipping {} (firefox is running)",
+                db.display()
+            );
             continue;
         }
         if chrome_running && (db_str.contains("google-chrome") || db_str.contains("chromium")) {
@@ -815,19 +838,24 @@ fn sqlite_vacuum(runner: &dyn Runner, home: &Path, out: &mut dyn Write) -> Resul
             continue;
         }
         if thunderbird_running && db_str.contains(".thunderbird") {
-            let _ = writeln!(out, "sqlite: skipping {} (thunderbird is running)", db.display());
+            let _ = writeln!(
+                out,
+                "sqlite: skipping {} (thunderbird is running)",
+                db.display()
+            );
             continue;
         }
         let wal = db.with_extension("sqlite-wal");
         let journal = db.with_extension("sqlite-journal");
         if wal.exists() || journal.exists() {
-            let _ = writeln!(out, "sqlite: skipping {} (active lock/journal)", db.display());
+            let _ = writeln!(
+                out,
+                "sqlite: skipping {} (active lock/journal)",
+                db.display()
+            );
             continue;
         }
-        let res = runner.run(&CommandSpec::new(
-            "sqlite3",
-            [db_str.as_ref(), "VACUUM;"],
-        ));
+        let res = runner.run(&CommandSpec::new("sqlite3", [db_str.as_ref(), "VACUUM;"]));
         if let Err(e) = res {
             let _ = writeln!(out, "sqlite: vacuum warning for {}: {}", db.display(), e);
         } else {
@@ -837,6 +865,12 @@ fn sqlite_vacuum(runner: &dyn Runner, home: &Path, out: &mut dyn Write) -> Resul
     let _ = writeln!(out, "sqlite: vacuumed {vacuumed} databases");
     Ok(())
 }
+
+/// Subtrees under `~/.local/state` that hold live user state rather than
+/// disposable transient data (undo/shada history, audio defaults, playback
+/// bookmarks). Deleting stale files inside them loses recoverable user work,
+/// so the stale-state step never touches them.
+const LIVE_STATE_DIRS: &[&str] = &["nvim", "wireplumber", "mpv"];
 
 fn state_clean(
     runner: &dyn Runner,
@@ -849,42 +883,92 @@ fn state_clean(
         let _ = writeln!(out, "state: state directory not found");
         return Ok(());
     }
+    // Fail closed: the state root must be an absolute, non-symlinked,
+    // non-protected directory before anything under it is deleted.
+    crate::paths::validate_cleanup_root(state_home)?;
     let now = std::time::SystemTime::now();
     let thirty_days = std::time::Duration::from_secs(30 * 86400);
+    let histfile = std::env::var_os("HISTFILE").map(PathBuf::from);
     let mut cleaned = 0;
-    clean_stale_recursive(runner, config_home, state_home, now, thirty_days, trash_deps, &mut cleaned)?;
-    let _ = writeln!(out, "state: cleaned {cleaned} stale files older than 30 days");
-    Ok(())
+    let mut errors: Vec<Error> = Vec::new();
+    clean_stale_recursive(
+        runner,
+        config_home,
+        state_home,
+        state_home,
+        now,
+        thirty_days,
+        histfile.as_deref(),
+        trash_deps,
+        &mut cleaned,
+        &mut errors,
+    )?;
+    let _ = writeln!(
+        out,
+        "state: cleaned {cleaned} stale files older than 30 days"
+    );
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Msg(
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ))
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn clean_stale_recursive(
     runner: &dyn Runner,
     config_home: &Path,
+    state_home: &Path,
     dir: &Path,
     now: std::time::SystemTime,
     max_age: std::time::Duration,
+    histfile: Option<&Path>,
     trash_deps: &trash::TrashDeps,
     cleaned: &mut usize,
+    errors: &mut Vec<Error>,
 ) -> Result<()> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(());
     };
     for entry in entries.flatten() {
         let p = entry.path();
+        if is_live_state(state_home, &p, histfile) {
+            continue;
+        }
         if let Ok(meta) = p.symlink_metadata() {
             if meta.is_dir() && !meta.file_type().is_symlink() {
-                clean_stale_recursive(runner, config_home, &p, now, max_age, trash_deps, cleaned)?;
+                clean_stale_recursive(
+                    runner,
+                    config_home,
+                    state_home,
+                    &p,
+                    now,
+                    max_age,
+                    histfile,
+                    trash_deps,
+                    cleaned,
+                    errors,
+                )?;
             } else if meta.is_file() {
                 if let Ok(mtime) = meta.modified() {
                     if let Ok(age) = now.duration_since(mtime) {
                         if age >= max_age {
-                            if trash::safe_delete_with(
-                                runner,
-                                config_home,
-                                trash_deps,
-                                &p,
-                                false,
-                            ).is_ok() {
+                            if let Err(e) = crate::paths::validate_cleanup_candidate(state_home, &p)
+                            {
+                                errors.push(e);
+                                continue;
+                            }
+                            if let Err(e) =
+                                trash::safe_delete_with(runner, config_home, trash_deps, &p, false)
+                            {
+                                errors.push(e);
+                            } else {
                                 *cleaned += 1;
                             }
                         }
@@ -894,6 +978,25 @@ fn clean_stale_recursive(
         }
     }
     Ok(())
+}
+
+/// True when `p` is live user state the stale-state step must never delete:
+/// anything inside a [`LIVE_STATE_DIRS`] subtree, or the file `$HISTFILE`
+/// points at.
+fn is_live_state(state_home: &Path, p: &Path, histfile: Option<&Path>) -> bool {
+    if let Some(hf) = histfile {
+        if hf == p {
+            return true;
+        }
+    }
+    if let Ok(rel) = p.strip_prefix(state_home) {
+        if let Some(std::path::Component::Normal(first)) = rel.components().next() {
+            return LIVE_STATE_DIRS
+                .iter()
+                .any(|d| first == std::ffi::OsStr::new(d));
+        }
+    }
+    false
 }
 
 fn autostart_audit(runner: &dyn Runner, config_home: &Path, out: &mut dyn Write) -> Result<()> {
@@ -969,7 +1072,11 @@ fn services_audit(config_home: &Path, out: &mut dyn Write) -> Result<()> {
     if broken.is_empty() {
         let _ = writeln!(out, "services: no broken unit symlinks found");
     } else {
-        let _ = writeln!(out, "services: found {} broken unit symlinks:", broken.len());
+        let _ = writeln!(
+            out,
+            "services: found {} broken unit symlinks:",
+            broken.len()
+        );
         for b in broken {
             let _ = writeln!(out, "  - {}", b);
         }
@@ -986,7 +1093,11 @@ fn permissions_audit(home: &Path, out: &mut dyn Write) -> Result<()> {
     if root_owned.is_empty() {
         let _ = writeln!(out, "permissions: no root-owned files found in $HOME");
     } else {
-        let _ = writeln!(out, "permissions: found {} root-owned files in $HOME:", root_owned.len());
+        let _ = writeln!(
+            out,
+            "permissions: found {} root-owned files in $HOME:",
+            root_owned.len()
+        );
         for r in root_owned.iter().take(10) {
             let _ = writeln!(out, "  - {}", r);
         }
@@ -1012,8 +1123,16 @@ fn audit_perms_dir(dir: &Path, depth: usize, max_depth: usize, root_owned: &mut 
                 root_owned.push(path.display().to_string());
             }
             if meta.is_dir() && !meta.file_type().is_symlink() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                if name == ".git" || name == "node_modules" || name == "target" || name == ".cargo" || name == ".rustup" {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if name == ".git"
+                    || name == "node_modules"
+                    || name == "target"
+                    || name == ".cargo"
+                    || name == ".rustup"
+                {
                     continue;
                 }
                 audit_perms_dir(&path, depth + 1, max_depth, root_owned);
@@ -1028,7 +1147,11 @@ fn disk_health_audit(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
         let res = runner.run(&CommandSpec::new("smartctl", ["--scan"]));
         if let Ok(output) = res {
             if !output.stdout.is_empty() {
-                let _ = writeln!(out, "SMART devices detected:\n{}", output.stdout_lossy().trim());
+                let _ = writeln!(
+                    out,
+                    "SMART devices detected:\n{}",
+                    output.stdout_lossy().trim()
+                );
                 probed = true;
             }
         }
@@ -1042,10 +1165,19 @@ fn disk_health_audit(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
             let text = output.stdout_lossy();
             let fs_errors: Vec<&str> = text
                 .lines()
-                .filter(|l| l.contains("EXT4-fs") || l.contains("BTRFS") || l.contains("XFS") || l.contains("I/O error"))
+                .filter(|l| {
+                    l.contains("EXT4-fs")
+                        || l.contains("BTRFS")
+                        || l.contains("XFS")
+                        || l.contains("I/O error")
+                })
                 .collect();
             if !fs_errors.is_empty() {
-                let _ = writeln!(out, "Filesystem alerts in kernel log:\n{}", fs_errors.join("\n"));
+                let _ = writeln!(
+                    out,
+                    "Filesystem alerts in kernel log:\n{}",
+                    fs_errors.join("\n")
+                );
                 probed = true;
             }
         }
@@ -1398,9 +1530,144 @@ mod tests {
         assert_eq!(summary, "Dry run — nothing executed.");
         assert_eq!(
             String::from_utf8_lossy(&out),
-            "\n  Optimize plan\n  [dry-run] sudo apt-get update && sudo apt-get autoremove --purge -y\n  [skip]  journal\n  [dry-run] sudo update-mime-database /usr/share/mime && fc-cache -f\n  [dry-run] resolvectl flush-caches\n  [dry-run] sudo dpkg --configure -a && sudo apt-get install -f -y\n  [dry-run] systemctl reset-failed && systemctl --user reset-failed\n  [dry-run] flatpak uninstall --unused -y\n  [dry-run] sqlite3 <db_path> \"VACUUM;\"\n  [dry-run] find ~/.local/state -type f -mtime +30 -delete\n  [dry-run] audit ~/.config/autostart/*.desktop for missing Exec binaries\n  [dry-run] audit broken symlinks in /etc/systemd/system and ~/.config/systemd/user\n  [dry-run] audit files in $HOME owned by root\n  [dry-run] smartctl --scan || journalctl -k --grep=EXT4-fs\n  Dry run — nothing executed.\n"
+            "\n  Optimize plan\n  [dry-run] sudo apt-get update && sudo apt-get autoremove --purge -y\n  [skip]  journal\n  [dry-run] sudo update-mime-database /usr/share/mime && fc-cache -f\n  [dry-run] sudo resolvectl flush-caches\n  [dry-run] sudo dpkg --configure -a && sudo apt-get install -f -y\n  [dry-run] sudo systemctl reset-failed && systemctl --user reset-failed\n  [dry-run] flatpak uninstall --unused -y\n  [dry-run] sqlite3 <db_path> \"VACUUM;\"\n  [dry-run] find ~/.local/state -type f -mtime +30 -delete\n  [dry-run] audit ~/.config/autostart/*.desktop for missing Exec binaries\n  [dry-run] audit broken symlinks in /etc/systemd/system and ~/.config/systemd/user\n  [dry-run] audit files in $HOME owned by root\n  [dry-run] smartctl --scan || journalctl -k --grep=EXT4-fs\n  Dry run — nothing executed.\n"
         );
         assert!(runner.invocations().is_empty());
         fs::remove_dir_all(&root).ok();
+    }
+
+    fn trash_deps_at(data_home: PathBuf) -> trash::TrashDeps {
+        trash::TrashDeps {
+            data_home: Box::new(move || {
+                if !data_home.exists() {
+                    std::fs::create_dir_all(&data_home)?;
+                }
+                Ok(data_home.clone())
+            }),
+            ..trash::TrashDeps::real()
+        }
+    }
+
+    fn set_mtime_secs_ago(p: &Path, secs: u64) {
+        let f = fs::File::options().write(true).open(p).unwrap();
+        f.set_times(
+            fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs)),
+        )
+        .unwrap();
+    }
+
+    // Finding 4 (review p3 f4): the state step trashes stale files through
+    // SafeDelete but never live user state, and surfaces trash failures.
+    #[test]
+    fn state_clean_trashes_stale_files_only() {
+        let root = tempdir("opt-state");
+        let config_home = root.join("config");
+        let state = root.join("state");
+        fs::create_dir_all(&config_home).unwrap();
+        fs::create_dir_all(state.join("nvim")).unwrap();
+
+        let stale = state.join("cache.log");
+        fs::write(&stale, "stale state").unwrap();
+        set_mtime_secs_ago(&stale, 40 * 86400);
+        let fresh = state.join("recent.log");
+        fs::write(&fresh, "fresh state").unwrap();
+        let live = state.join("nvim").join("undo.log");
+        fs::write(&live, "nvim undo history").unwrap();
+        set_mtime_secs_ago(&live, 40 * 86400);
+
+        let runner = FakeRunner::new();
+        let trash_deps = trash_deps_at(root.join("data-home"));
+        let mut out = Vec::new();
+        state_clean(&runner, &config_home, &state, &trash_deps, &mut out).expect("state clean");
+
+        assert!(!stale.exists(), "stale file must be trashed");
+        assert!(fresh.exists(), "fresh file must be kept");
+        assert!(live.exists(), "live nvim state must be kept");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("state: cleaned 1 stale files"),
+            "got {text:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // Finding 4 (review p3 f4): a symlinked state root is rejected (SafeDelete
+    // cleanup-root invariant).
+    #[test]
+    fn state_clean_rejects_symlinked_root() {
+        let root = tempdir("opt-state-symlink");
+        let config_home = root.join("config");
+        let real = root.join("real-state");
+        fs::create_dir_all(&config_home).unwrap();
+        fs::create_dir_all(&real).unwrap();
+        let link = root.join("link-state");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let runner = FakeRunner::new();
+        let trash_deps = trash_deps_at(root.join("data-home"));
+        let mut out = Vec::new();
+        let err = state_clean(&runner, &config_home, &link, &trash_deps, &mut out)
+            .expect_err("symlinked state root must be rejected");
+        assert!(err.to_string().contains("symlink"), "got {err}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // Finding 4 (review p3 f4): a SafeDelete failure is reported, not swallowed.
+    #[test]
+    fn state_clean_surfaces_trash_errors() {
+        let root = tempdir("opt-state-err");
+        let config_home = root.join("config");
+        let state = root.join("state");
+        fs::create_dir_all(&config_home).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let stale = state.join("cache.log");
+        fs::write(&stale, "stale state").unwrap();
+        set_mtime_secs_ago(&stale, 40 * 86400);
+
+        let runner = FakeRunner::new();
+        let bad_trash = trash::TrashDeps {
+            data_home: Box::new(|| Err(Error::Msg("no trash available".to_string()))),
+            ..trash::TrashDeps::real()
+        };
+        let mut out = Vec::new();
+        let err = state_clean(&runner, &config_home, &state, &bad_trash, &mut out)
+            .expect_err("trash failure must surface");
+        assert!(err.to_string().contains("trash"), "got {err}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // Finding 6 (review p3 f6): root-level commands run under sudo.
+    #[test]
+    fn root_scoped_steps_use_sudo() {
+        let runner = FakeRunner::new();
+        let mut out = Vec::new();
+        systemd_reset_failed(&runner, &mut out).expect("systemd step");
+        let inv = runner.invocations();
+        assert_eq!(inv[0].program.to_string_lossy(), "sudo");
+        assert_eq!(
+            inv[0].args,
+            vec![
+                std::ffi::OsString::from("systemctl"),
+                std::ffi::OsString::from("reset-failed")
+            ]
+        );
+        assert_eq!(inv[1].program.to_string_lossy(), "systemctl");
+        assert_eq!(
+            inv[1].args,
+            vec![
+                std::ffi::OsString::from("--user"),
+                std::ffi::OsString::from("reset-failed")
+            ]
+        );
+
+        let dns_runner = FakeRunner::new();
+        dns_runner.set_look_path("resolvectl", "/usr/bin/resolvectl");
+        let mut out = Vec::new();
+        dns_flush(&dns_runner, &mut out).expect("dns step");
+        let inv = dns_runner.invocations();
+        assert_eq!(inv[0].program.to_string_lossy(), "sudo");
+        assert_eq!(inv[0].args[0].to_string_lossy(), "resolvectl");
+        assert_eq!(inv[0].args[1].to_string_lossy(), "flush-caches");
     }
 }

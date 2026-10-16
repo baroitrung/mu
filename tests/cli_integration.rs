@@ -446,7 +446,7 @@ fn optimize_dry_run_exact_commands() {
         "missing exact journal command: {out}"
     );
     assert!(
-        out.contains("[dry-run] resolvectl flush-caches"),
+        out.contains("[dry-run] sudo resolvectl flush-caches"),
         "missing exact dns command: {out}"
     );
     assert!(
@@ -458,7 +458,7 @@ fn optimize_dry_run_exact_commands() {
         "missing exact packages command: {out}"
     );
     assert!(
-        out.contains("[dry-run] systemctl reset-failed && systemctl --user reset-failed"),
+        out.contains("[dry-run] sudo systemctl reset-failed && systemctl --user reset-failed"),
         "missing exact systemd command: {out}"
     );
 }
@@ -534,7 +534,7 @@ fn clean_dry_run_all_opt_in_targets() {
         "missing orphaned-app-data: {out}"
     );
     assert!(
-        out.contains("Orphaned System Services"),
+        out.contains("Orphaned User Services"),
         "missing orphaned-services: {out}"
     );
 }

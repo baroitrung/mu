@@ -913,8 +913,33 @@ fn dev_cache_root(home: &Path, p: &Path) -> PathBuf {
     p.parent().unwrap_or(home).to_path_buf()
 }
 
+/// One line of `podman system df --format '{{json .}}'`.
+#[derive(serde::Deserialize)]
+struct PodmanDfLine {
+    #[serde(default, rename = "Reclaimable")]
+    reclaimable: String,
+}
+
+/// `parsePodmanReclaimable` — sum the `Reclaimable` column across every
+/// `podman system df` row; non-JSON and unparseable rows are skipped.
+fn parse_podman_reclaimable(json_lines: &str) -> i64 {
+    let mut total = 0i64;
+    for line in json_lines.split('\n') {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<PodmanDfLine>(line) else {
+            continue;
+        };
+        total += super::scan_docker::parse_docker_size(&entry.reclaimable);
+    }
+    total
+}
+
 pub(crate) fn podman_target_in(deps: &Deps) -> CleanTarget {
-    let runner = Arc::clone(&deps.runner);
+    let scan_runner = Arc::clone(&deps.runner);
+    let preview_runner = Arc::clone(&deps.runner);
     let exec_runner = Arc::clone(&deps.runner);
 
     CleanTarget {
@@ -923,12 +948,61 @@ pub(crate) fn podman_target_in(deps: &Deps) -> CleanTarget {
         requires_sudo: false,
         opt_in: true,
         scan: Box::new(move || {
-            if runner.look_path("podman").is_err() {
+            if scan_runner.look_path("podman").is_err() {
                 return (0, None);
             }
-            (0, None)
+            match scan_runner.run(&CommandSpec::new(
+                "podman",
+                ["system", "df", "--format", "{{json .}}"],
+            )) {
+                Err(e) => (0, Some(Error::Msg(format!("podman system df: {e}")))),
+                Ok(out) => (parse_podman_reclaimable(&out.stdout_lossy()), None),
+            }
         }),
-        preview: None,
+        // `podman system prune -f` is irreversible and cannot route through
+        // SafeDelete, so list exactly what it would remove before confirming.
+        preview: Some(Box::new(move || {
+            if preview_runner.look_path("podman").is_err() {
+                return (Vec::new(), None);
+            }
+            let mut items = Vec::new();
+            if let Ok(out) = preview_runner.run(&CommandSpec::new(
+                "podman",
+                [
+                    "container",
+                    "ls",
+                    "-a",
+                    "--filter",
+                    "status=exited",
+                    "--format",
+                    "{{.Names}}",
+                ],
+            )) {
+                for name in out.stdout_lossy().lines().map(str::trim) {
+                    if !name.is_empty() {
+                        items.push(format!("stopped container: {name}"));
+                    }
+                }
+            }
+            if let Ok(out) = preview_runner.run(&CommandSpec::new(
+                "podman",
+                [
+                    "image",
+                    "ls",
+                    "--filter",
+                    "dangling=true",
+                    "--format",
+                    "{{.Repository}}:{{.Tag}}",
+                ],
+            )) {
+                for img in out.stdout_lossy().lines().map(str::trim) {
+                    if !img.is_empty() {
+                        items.push(format!("dangling image: {img}"));
+                    }
+                }
+            }
+            (items, None)
+        })),
         execute: Box::new(move |dry_run| {
             if exec_runner.look_path("podman").is_err() {
                 return Ok(());
@@ -937,8 +1011,16 @@ pub(crate) fn podman_target_in(deps: &Deps) -> CleanTarget {
                 oplog::log_outcome("podman", "system prune -f", "dry-run");
                 return Ok(());
             }
-            let res = exec_runner.run(&CommandSpec::new("podman", ["system", "prune", "-f"]));
-            res.map(|_| ()).map_err(|e| Error::Msg(format!("podman system prune: {e}")))
+            match exec_runner.run(&CommandSpec::new("podman", ["system", "prune", "-f"])) {
+                Ok(_) => {
+                    oplog::log_outcome("podman", "system prune -f", "success");
+                    Ok(())
+                }
+                Err(e) => {
+                    oplog::log_outcome("podman", "system prune -f", "failure");
+                    Err(Error::Msg(format!("podman system prune: {e}")))
+                }
+            }
         }),
         count_fn: None,
     }
@@ -949,6 +1031,11 @@ pub(crate) fn orphaned_app_data_target_in(deps: &Deps) -> CleanTarget {
     let scan_cfg = deps.config_home.clone();
     let scan_data = deps.data_home.clone();
     let scan_runner = Arc::clone(&deps.runner);
+
+    let preview_home = deps.home.clone();
+    let preview_cfg = deps.config_home.clone();
+    let preview_data = deps.data_home.clone();
+    let preview_runner = Arc::clone(&deps.runner);
 
     let exec_home = deps.home.clone();
     let exec_cfg = deps.config_home.clone();
@@ -961,18 +1048,46 @@ pub(crate) fn orphaned_app_data_target_in(deps: &Deps) -> CleanTarget {
         label: "Orphaned Application Data",
         requires_sudo: false,
         opt_in: true,
+        // Fail closed: a discovery error aborts the scan instead of treating
+        // the effective "installed" set as empty.
         scan: Box::new(move || {
-            let candidates = find_orphaned_apps(&scan_home, &scan_cfg, &scan_data, scan_runner.as_ref());
-            let mut total: i64 = 0;
-            for p in &candidates {
-                let (sz, _) = crate::size::dir_size(p);
-                total += sz as i64;
+            match find_orphaned_apps(&scan_home, &scan_cfg, &scan_data, scan_runner.as_ref()) {
+                Err(e) => (0, Some(e)),
+                Ok(candidates) => {
+                    let mut total: i64 = 0;
+                    for p in &candidates {
+                        let (sz, _) = size::dir_size(p);
+                        total += sz as i64;
+                    }
+                    (total, None)
+                }
             }
-            (total, None)
         }),
-        preview: None,
+        // Per-path preview: the heuristic can catch user data from non-apt
+        // installs, so the user must see each path (and its size) before --yes.
+        preview: Some(Box::new(move || {
+            match find_orphaned_apps(
+                &preview_home,
+                &preview_cfg,
+                &preview_data,
+                preview_runner.as_ref(),
+            ) {
+                Err(e) => (Vec::new(), Some(e)),
+                Ok(candidates) => {
+                    let items = candidates
+                        .iter()
+                        .map(|p| {
+                            let (sz, _) = size::dir_size(p);
+                            format!("{} ({})", p.display(), size::human_size(sz as i64))
+                        })
+                        .collect();
+                    (items, None)
+                }
+            }
+        })),
         execute: Box::new(move |dry_run| {
-            let candidates = find_orphaned_apps(&exec_home, &exec_cfg, &exec_data, exec_runner.as_ref());
+            let candidates =
+                find_orphaned_apps(&exec_home, &exec_cfg, &exec_data, exec_runner.as_ref())?;
             let mut delete_errors: Vec<Error> = Vec::new();
             for p in candidates {
                 let root = if p.starts_with(&exec_cfg) {
@@ -1005,50 +1120,89 @@ fn find_orphaned_apps(
     config_home: &Path,
     data_home: &Path,
     runner: &dyn Runner,
-) -> Vec<PathBuf> {
+) -> Result<Vec<PathBuf>> {
     if home.as_os_str().is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
+    // `PROTECTED_*` is a conservative guard: known user-data dirs that do not
+    // map cleanly to a package name and must never be treated as orphans.
     const PROTECTED_CONFIG: &[&str] = &[
-        "dconf", "pulse", "systemd", "autostart", "gtk-3.0", "gtk-4.0", "glib-2.0",
-        "fontconfig", "ibus", "gnome-session", "environment.d", "mu", "mimeapps.list",
-        "user-dirs.dirs", "user-dirs.locale", "gnome-control-center", "BraveSoftware",
-        "google-chrome", "chromium", "microsoft-edge", "mozilla",
+        "dconf",
+        "pulse",
+        "systemd",
+        "autostart",
+        "gtk-3.0",
+        "gtk-4.0",
+        "glib-2.0",
+        "fontconfig",
+        "ibus",
+        "gnome-session",
+        "environment.d",
+        "mu",
+        "mimeapps.list",
+        "user-dirs.dirs",
+        "user-dirs.locale",
+        "gnome-control-center",
+        "BraveSoftware",
+        "google-chrome",
+        "chromium",
+        "microsoft-edge",
+        "mozilla",
+        "JetBrains",
+        "atuin",
+        "containers",
+        "TelegramDesktop",
+        "Anki2",
     ];
     const PROTECTED_DATA: &[&str] = &[
-        "Trash", "applications", "icons", "themes", "fonts", "mime", "keyrings",
-        "systemd", "mu", "flatpak", "gvfs-metadata", "sounds", "desktop-directories",
+        "Trash",
+        "applications",
+        "icons",
+        "themes",
+        "fonts",
+        "mime",
+        "keyrings",
+        "systemd",
+        "mu",
+        "flatpak",
+        "gvfs-metadata",
+        "sounds",
+        "desktop-directories",
+        "JetBrains",
+        "atuin",
+        "containers",
+        "TelegramDesktop",
+        "Anki2",
     ];
 
     let mut installed = std::collections::HashSet::new();
-    if let Ok(apt_pkgs) = crate::uninstall::discover::discover_apt(runner) {
-        for p in apt_pkgs {
-            installed.insert(p.name.to_lowercase());
-            if let Some(alias) = crate::uninstall::remnants::known_alias(&p.name) {
-                installed.insert(alias.to_lowercase());
-            }
+    // Discovery failures abort (fail closed) — an empty set would otherwise
+    // make every package-owned dir look orphaned.
+    let apt_pkgs = crate::uninstall::discover::discover_apt(runner)
+        .map_err(|e| Error::Msg(format!("orphaned-app-data: discover apt: {e}")))?;
+    for p in apt_pkgs {
+        installed.insert(p.name.to_lowercase());
+        if let Some(alias) = crate::uninstall::remnants::known_alias(&p.name) {
+            installed.insert(alias.to_lowercase());
         }
     }
-    if let Ok(snap_pkgs) = crate::uninstall::discover::discover_snap(runner) {
-        for p in snap_pkgs {
-            installed.insert(p.name.to_lowercase());
-            if let Some(alias) = crate::uninstall::remnants::known_alias(&p.name) {
-                installed.insert(alias.to_lowercase());
-            }
+    let snap_pkgs = crate::uninstall::discover::discover_snap(runner)
+        .map_err(|e| Error::Msg(format!("orphaned-app-data: discover snap: {e}")))?;
+    for p in snap_pkgs {
+        installed.insert(p.name.to_lowercase());
+        if let Some(alias) = crate::uninstall::remnants::known_alias(&p.name) {
+            installed.insert(alias.to_lowercase());
         }
     }
-    if runner.look_path("flatpak").is_ok() {
-        if let Ok(out) = runner.run(&CommandSpec::new(
-            "flatpak",
-            ["list", "--app", "--columns=application"],
-        )) {
-            for line in out.stdout_lossy().lines() {
-                let id = line.trim();
-                installed.insert(id.to_lowercase());
-                if let Some(last) = id.split('.').last() {
-                    installed.insert(last.to_lowercase());
-                }
-            }
+    // `discover_flatpak` is empty when flatpak is absent and errors only on a
+    // real command failure.
+    let flatpak_pkgs = crate::uninstall::discover::discover_flatpak(runner)
+        .map_err(|e| Error::Msg(format!("orphaned-app-data: discover flatpak: {e}")))?;
+    for p in flatpak_pkgs {
+        let id = p.name.to_lowercase();
+        installed.insert(id.clone());
+        if let Some(last) = id.split('.').next_back() {
+            installed.insert(last.to_string());
         }
     }
 
@@ -1060,7 +1214,10 @@ fn find_orphaned_apps(
                 continue;
             }
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            if PROTECTED_CONFIG.iter().any(|&prot| prot.eq_ignore_ascii_case(name)) {
+            if PROTECTED_CONFIG
+                .iter()
+                .any(|&prot| prot.eq_ignore_ascii_case(name))
+            {
                 continue;
             }
             let lower = name.to_lowercase();
@@ -1080,7 +1237,10 @@ fn find_orphaned_apps(
                 continue;
             }
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            if PROTECTED_DATA.iter().any(|&prot| prot.eq_ignore_ascii_case(name)) {
+            if PROTECTED_DATA
+                .iter()
+                .any(|&prot| prot.eq_ignore_ascii_case(name))
+            {
                 continue;
             }
             let lower = name.to_lowercase();
@@ -1094,38 +1254,44 @@ fn find_orphaned_apps(
         }
     }
     candidates.sort();
-    candidates
+    Ok(candidates)
 }
 
 pub(crate) fn orphaned_services_target_in(deps: &Deps) -> CleanTarget {
-    let scan_home = deps.home.clone();
-    let exec_home = deps.home.clone();
+    let scan_cfg = deps.config_home.clone();
+    let preview_cfg = deps.config_home.clone();
     let exec_cfg = deps.config_home.clone();
     let exec_runner = Arc::clone(&deps.trash_runner);
     let exec_deps = deps.trash_deps.clone();
 
     CleanTarget {
         id: "orphaned-services",
-        label: "Orphaned System Services",
+        label: "Orphaned User Services",
         requires_sudo: false,
         opt_in: true,
+        // Broken enablement symlinks live in `<target>.wants/` subdirs, so the
+        // scan recurses the whole user unit tree rather than its top level.
         scan: Box::new(move || {
-            let broken = find_broken_service_symlinks(&scan_home);
-            let total = (broken.len() as i64) * 1024;
+            let broken = find_broken_service_symlinks(&scan_cfg);
+            let total = broken.iter().map(|p| symlink_len(p)).sum();
             (total, None)
         }),
-        preview: None,
+        preview: Some(Box::new(move || {
+            let broken = find_broken_service_symlinks(&preview_cfg);
+            let items = broken
+                .iter()
+                .map(|p| format!("{} (broken symlink)", p.display()))
+                .collect();
+            (items, None)
+        })),
         execute: Box::new(move |dry_run| {
-            let broken = find_broken_service_symlinks(&exec_home);
+            let broken = find_broken_service_symlinks(&exec_cfg);
             let mut delete_errors: Vec<Error> = Vec::new();
-            let user_dir = exec_home.join(".config/systemd/user");
             for p in broken {
-                if paths::path_contains(&user_dir, &p) {
-                    if let Err(e) =
-                        trash::safe_delete_with(&*exec_runner, &exec_cfg, &exec_deps, &p, dry_run)
-                    {
-                        delete_errors.push(e);
-                    }
+                if let Err(e) =
+                    trash::safe_delete_with(&*exec_runner, &exec_cfg, &exec_deps, &p, dry_run)
+                {
+                    delete_errors.push(e);
                 }
             }
             if delete_errors.is_empty() {
@@ -1138,21 +1304,39 @@ pub(crate) fn orphaned_services_target_in(deps: &Deps) -> CleanTarget {
     }
 }
 
-fn find_broken_service_symlinks(home: &Path) -> Vec<PathBuf> {
+/// Recursively collect dangling symlinks under `<config_home>/systemd/user`
+/// (including `*.wants/`), without following symlinked directories.
+fn find_broken_service_symlinks(config_home: &Path) -> Vec<PathBuf> {
     let mut broken = Vec::new();
-    let user_dir = home.join(".config/systemd/user");
-    if let Ok(entries) = std::fs::read_dir(user_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if let Ok(m) = p.symlink_metadata() {
-                if m.file_type().is_symlink() && std::fs::metadata(&p).is_err() {
-                    broken.push(p);
-                }
-            }
-        }
-    }
+    collect_broken_symlinks(&config_home.join("systemd/user"), &mut broken);
     broken.sort();
     broken
+}
+
+fn collect_broken_symlinks(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Ok(meta) = p.symlink_metadata() else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            if std::fs::metadata(&p).is_err() {
+                out.push(p);
+            }
+        } else if meta.is_dir() {
+            collect_broken_symlinks(&p, out);
+        }
+    }
+}
+
+/// `os.Lstat().Size()` — the byte length of the symlink target string.
+fn symlink_len(p: &Path) -> i64 {
+    std::fs::symlink_metadata(p)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1600,5 +1784,179 @@ mod tests {
             );
             fs::remove_dir_all(&tmp).ok();
         }
+    }
+
+    // Finding 1 (review p3 f1): a package-discovery failure must abort the
+    // orphan scan instead of treating the installed set as empty, and execute
+    // must delete nothing.
+    #[test]
+    fn orphaned_app_data_fails_closed_on_discovery_error() {
+        use crate::runner::RunError;
+        let tmp = tempdir("orphan-fail");
+        let cfg = tmp.join(".config");
+        let data = tmp.join("data-home");
+        fs::create_dir_all(cfg.join("ghostapp")).unwrap();
+        fs::write(cfg.join("ghostapp/x"), "user data").unwrap();
+        fs::create_dir_all(&data).unwrap();
+
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_handler(|spec| {
+            if spec.program.to_string_lossy() == "dpkg-query" {
+                return Err(RunError::Spawn(std::io::Error::other("dpkg lock held")));
+            }
+            Ok(Output::default())
+        });
+        // The execute path discovers through `trash_runner`; point it at the
+        // same failing runner so the fail-closed branch is exercised.
+        let mut deps = deps_for_test(&tmp, runner.clone() as Arc<dyn Runner>);
+        deps.trash_runner = runner.clone() as Arc<dyn Runner>;
+        let target = orphaned_app_data_target_in(&deps);
+
+        let (_sz, err) = (target.scan)();
+        assert!(err.is_some(), "scan must fail closed on discovery error");
+        let exec_err = (target.execute)(false).expect_err("execute must refuse");
+        assert!(
+            exec_err.to_string().contains("discover apt"),
+            "unexpected error: {exec_err}"
+        );
+        assert!(
+            cfg.join("ghostapp").exists(),
+            "fail-closed execute deleted user data"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Finding 2 (review p3 f2): preview lists every candidate path (not just a
+    // total) and protected user-data dirs are excluded.
+    #[test]
+    fn orphaned_app_data_preview_lists_paths_and_protects_user_data() {
+        let tmp = tempdir("orphan-preview");
+        let cfg = tmp.join(".config");
+        let data = tmp.join("data-home");
+        fs::create_dir_all(cfg.join("ghostapp")).unwrap();
+        fs::write(cfg.join("ghostapp/x"), "hello").unwrap();
+        fs::create_dir_all(data.join("ghostdata")).unwrap();
+        fs::write(data.join("ghostdata/y"), "world").unwrap();
+        // Protected data dir (podman images/volumes) — never a candidate.
+        fs::create_dir_all(data.join("containers")).unwrap();
+        fs::write(data.join("containers/z"), "podman images").unwrap();
+
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_handler(|spec| {
+            if spec.program.to_string_lossy() == "dpkg-query" {
+                return Ok(Output {
+                    stdout: b"install ok installed\t10\tfoo\t1.0\n".to_vec(),
+                    ..Default::default()
+                });
+            }
+            Ok(Output::default())
+        });
+        let deps = deps_for_test(&tmp, runner);
+        let target = orphaned_app_data_target_in(&deps);
+
+        let (items, err) = (target.preview.as_ref().expect("preview must exist"))();
+        assert!(err.is_none(), "preview error: {err:?}");
+        let joined = items.join("\n");
+        assert!(
+            joined.contains(&cfg.join("ghostapp").display().to_string()),
+            "missing config candidate in preview: {joined}"
+        );
+        assert!(
+            joined.contains(&data.join("ghostdata").display().to_string()),
+            "missing data candidate in preview: {joined}"
+        );
+        assert!(
+            !joined.contains("containers"),
+            "protected dir must not be listed: {joined}"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Finding 3 (review p3 f3): the Podman target reports a size from
+    // `podman system df` and lists what prune would remove.
+    #[test]
+    fn podman_reports_size_and_previews_targets() {
+        let tmp = tempdir("podman");
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_look_path("podman", "/usr/bin/podman");
+        runner.set_handler(|spec| {
+            let prog = spec.program.to_string_lossy();
+            let args: Vec<String> = spec
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let has = |needle: &str| args.iter().any(|a| a == needle);
+            if prog == "podman" && has("df") {
+                return Ok(Output {
+                    stdout: b"{\"Type\":\"Images\",\"Reclaimable\":\"1.5GB\"}\n\
+{\"Type\":\"Containers\",\"Reclaimable\":\"512MB\"}\n"
+                        .to_vec(),
+                    ..Default::default()
+                });
+            }
+            if prog == "podman" && has("container") {
+                return Ok(Output {
+                    stdout: b"oldctr\n".to_vec(),
+                    ..Default::default()
+                });
+            }
+            if prog == "podman" && has("image") {
+                return Ok(Output {
+                    stdout: b"<none>:<none>\n".to_vec(),
+                    ..Default::default()
+                });
+            }
+            Ok(Output::default())
+        });
+        let deps = deps_for_test(&tmp, runner.clone() as Arc<dyn Runner>);
+        let target = podman_target_in(&deps);
+
+        let (sz, err) = (target.scan)();
+        assert!(err.is_none(), "scan error: {err:?}");
+        let want = (1.5 * 1024.0 * 1024.0 * 1024.0) as i64 + 512 * 1024 * 1024;
+        assert_eq!(sz, want, "podman reclaimable size");
+
+        let (items, perr) = (target.preview.as_ref().expect("preview"))();
+        assert!(perr.is_none());
+        let joined = items.join("\n");
+        assert!(joined.contains("stopped container: oldctr"), "{joined}");
+        assert!(joined.contains("dangling image: <none>:<none>"), "{joined}");
+
+        (target.execute)(true).expect("dry-run execute");
+        assert!(
+            !runner
+                .invocations()
+                .iter()
+                .any(|s| s.args.iter().any(|a| a == "prune")),
+            "dry-run must not invoke podman prune"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Finding 5 (review p3 f5): the scan recurses `*.wants/`, honors the
+    // configured config home, and reports the real symlink size.
+    #[test]
+    fn orphaned_services_scans_wants_dirs_and_reports_real_size() {
+        let tmp = tempdir("svc");
+        let cfg = tmp.join(".config");
+        let wants = cfg.join("systemd/user/default.target.wants");
+        fs::create_dir_all(&wants).unwrap();
+        let target_path = "/nonexistent/ghost.service";
+        std::os::unix::fs::symlink(target_path, wants.join("ghost.service")).unwrap();
+        // A valid symlink and a plain file are not orphans.
+        std::os::unix::fs::symlink("/bin/true", cfg.join("systemd/user/real.service")).unwrap();
+        fs::write(cfg.join("systemd/user/plain.service"), "x").unwrap();
+
+        let deps = deps_for_test(&tmp, Arc::new(FakeRunner::new()));
+        let target = orphaned_services_target_in(&deps);
+        let (sz, err) = (target.scan)();
+        assert!(err.is_none());
+        assert_eq!(sz, target_path.len() as i64, "reported size={sz}");
+        let (items, perr) = (target.preview.as_ref().expect("preview"))();
+        assert!(perr.is_none());
+        assert_eq!(items.len(), 1, "items={items:?}");
+        assert!(items[0].contains("ghost.service"), "{items:?}");
+        fs::remove_dir_all(&tmp).ok();
     }
 }
