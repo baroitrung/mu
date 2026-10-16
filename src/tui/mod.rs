@@ -410,6 +410,7 @@ fn dispatch_subcommand(command: &str, debug: bool) -> anyhow::Result<Option<Stri
                 debug,
                 include: Vec::new(),
                 auto_yes: false,
+                external: None,
             };
             crate::clean::run_tui(&opts)
                 .map(Some)

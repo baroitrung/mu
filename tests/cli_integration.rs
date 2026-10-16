@@ -412,3 +412,25 @@ fn uninstall_help_matches_golden() {
     assert_eq!(o.status.code(), Some(0));
     assert_eq!(stdout(&o), include_str!("golden/help-uninstall.txt"));
 }
+
+/// Phase 2: `mu clean --external <PATH>` previews external-volume metadata and
+/// mutates nothing on a dry run.
+#[test]
+fn clean_external_dry_run_previews() {
+    let dir = std::env::temp_dir().join(format!("mu-external-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".Trash-1000")).unwrap();
+    std::fs::write(dir.join(".directory"), b"meta").unwrap();
+
+    let path = dir.to_string_lossy().into_owned();
+    let o = mu(&["clean", "--dry-run", "--external", &path]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("External Volume"), "{out}");
+    assert!(
+        dir.join(".directory").exists(),
+        "dry-run must not delete external metadata"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

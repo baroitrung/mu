@@ -58,7 +58,7 @@ pub(crate) fn find_remnants_in(deps: &Deps, name: &str) -> Vec<String> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
     for n in &names {
-        let mut candidates = vec![
+        let candidates = vec![
             deps.config_home.join(n),
             deps.data_home.join(n),
             deps.cache_home.join(n),
@@ -76,25 +76,6 @@ pub(crate) fn find_remnants_in(deps: &Deps, name: &str) -> Vec<String> {
                 .join("autostart")
                 .join(format!("{n}.desktop")),
         ];
-
-        // Steam app manifests in ~/.local/share/Steam/steamapps/appmanifest_*.acf
-        let steamapps = deps.data_home.join("Steam").join("steamapps");
-        if let Ok(entries) = std::fs::read_dir(&steamapps) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if let Some(fname) = p.file_name().and_then(|f| f.to_str())
-                    && fname.starts_with("appmanifest_")
-                    && fname.ends_with(".acf")
-                {
-                    // Check if file content references game matching n
-                    if let Ok(content) = std::fs::read_to_string(&p)
-                        && content.to_lowercase().contains(&n.to_lowercase())
-                    {
-                        candidates.push(p);
-                    }
-                }
-            }
-        }
 
         for p in candidates {
             if !seen.insert(p.clone()) {
@@ -123,6 +104,77 @@ pub fn remnant_size(paths: &[String]) -> i64 {
         }
     }
     total
+}
+
+/// One installed Steam application discovered from an `appmanifest_*.acf`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SteamGame {
+    pub appid: String,
+    pub name: String,
+}
+
+/// `acf_field` — value of `"key"\t\t"value"` in a Steam appmanifest.
+fn acf_field(content: &str, key: &str) -> Option<String> {
+    for line in content.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix('"') else {
+            continue;
+        };
+        let mut it = rest.splitn(2, '"');
+        let k = it.next()?;
+        if k != key {
+            continue;
+        }
+        let after = it.next()?.trim_start().strip_prefix('"')?;
+        let end = after.find('"')?;
+        return Some(after[..end].to_string());
+    }
+    None
+}
+
+/// `steamGames` — Steam apps installed under `$XDG_DATA_HOME/Steam/steamapps`.
+/// The manifests are read (never modified): uninstalling a game is delegated
+/// to Steam rather than trashing Steam's own database.
+pub(crate) fn steam_games_in(deps: &Deps) -> Vec<SteamGame> {
+    let mut games = Vec::new();
+    let steamapps = deps.data_home.join("Steam").join("steamapps");
+    let Ok(entries) = std::fs::read_dir(&steamapps) else {
+        return games;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.starts_with("appmanifest_") && f.ends_with(".acf"))
+        })
+        .collect();
+    files.sort();
+    for p in files {
+        let Ok(content) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Some(appid) = acf_field(&content, "appid") else {
+            continue;
+        };
+        let Some(name) = acf_field(&content, "name") else {
+            continue;
+        };
+        games.push(SteamGame { appid, name });
+    }
+    games
+}
+
+/// Games whose display name matches `pkg_name` exactly (case-insensitive).
+/// Substring matching is deliberately avoided: short package names (`git`,
+/// `ui`) would otherwise match unrelated manifests.
+pub(crate) fn steam_delegations(deps: &Deps, pkg_name: &str) -> Vec<SteamGame> {
+    let needle = pkg_name.to_lowercase();
+    steam_games_in(deps)
+        .into_iter()
+        .filter(|g| g.name.to_lowercase() == needle)
+        .collect()
 }
 
 #[cfg(test)]
@@ -168,5 +220,55 @@ mod tests {
         ];
         // /var/lib should be skipped, /tmp path doesn't exist so also 0.
         assert_eq!(remnant_size(&paths), 0);
+    }
+
+    // Finding 3: a Steam appmanifest whose *content* merely contains the
+    // package name as a substring (e.g. "digital" ~ "git") must never be
+    // treated as a removable remnant.
+    #[test]
+    fn steam_manifest_is_not_a_remnant() {
+        let tmp = tempdir("steam-remnant");
+        let deps = deps_for_test(&tmp, Arc::new(FakeRunner::new()));
+        let steamapps = deps.data_home.join("Steam").join("steamapps");
+        fs::create_dir_all(&steamapps).unwrap();
+        fs::write(
+            steamapps.join("appmanifest_1.acf"),
+            "\"appid\"\t\t\"220\"\n\"name\"\t\t\"Half-Life\"\n\"path\"\t\t\"digital\"\n",
+        )
+        .unwrap();
+        let remnants = find_remnants_in(&deps, "git");
+        assert!(
+            remnants.iter().all(|p| !p.ends_with(".acf")),
+            "Steam manifest leaked into remnants: {remnants:?}"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Finding 3: Steam games are discovered and matched exactly (never by
+    // substring) so uninstallation delegates to `steam steam://uninstall/<id>`.
+    #[test]
+    fn steam_games_match_exactly() {
+        let tmp = tempdir("steam-games");
+        let deps = deps_for_test(&tmp, Arc::new(FakeRunner::new()));
+        let steamapps = deps.data_home.join("Steam").join("steamapps");
+        fs::create_dir_all(&steamapps).unwrap();
+        fs::write(
+            steamapps.join("appmanifest_220.acf"),
+            "\"appid\"\t\t\"220\"\n\"name\"\t\t\"Half-Life\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            steam_games_in(&deps),
+            vec![SteamGame {
+                appid: "220".to_string(),
+                name: "Half-Life".to_string(),
+            }]
+        );
+        assert_eq!(steam_delegations(&deps, "half-life").len(), 1);
+        assert!(
+            steam_delegations(&deps, "half").is_empty(),
+            "substring matched"
+        );
+        fs::remove_dir_all(&tmp).ok();
     }
 }

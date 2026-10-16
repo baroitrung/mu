@@ -20,7 +20,7 @@ pub(crate) mod model;
 pub(crate) mod remnants;
 pub(crate) mod remove;
 
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -54,6 +54,8 @@ pub struct Options {
     pub permanent: bool,
     /// `Packages` — direct CLI package names to remove.
     pub packages: Vec<String>,
+    /// `Yes` — skip the confirmation gate for direct CLI removal.
+    pub auto_yes: bool,
 }
 
 /// Dependency bundle replacing the Go package vars. `runner` is
@@ -298,46 +300,87 @@ fn run_cli_uninstall(
     }
     let mut selected = Vec::new();
     for target in &opts.packages {
-        let found = all_installed
-            .iter()
-            .find(|p| p.name == *target || p.key() == *target);
-        match found {
-            Some(pkg) => {
-                let mut pkg = pkg.clone();
-                pkg.remnants_found = remnants::find_remnants_in(deps, &pkg.name);
-                pkg.remnants_kb = remnants::remnant_size(&pkg.remnants_found) / 1024;
-                selected.push(pkg);
-            }
-            None => {
+        // A source-qualified key (`apt:foo`, `snap:foo`) is unambiguous.
+        if let Some(pkg) = all_installed.iter().find(|p| p.key() == *target) {
+            selected.push(with_remnants(deps, pkg));
+            continue;
+        }
+        let by_name: Vec<&Package> = all_installed.iter().filter(|p| p.name == *target).collect();
+        match by_name.as_slice() {
+            [] => {
                 let _ = writeln!(err_out, "error: package '{target}' not found");
                 return 1;
+            }
+            [pkg] => selected.push(with_remnants(deps, pkg)),
+            many => {
+                // Fail closed instead of silently purging whichever source
+                // sorts first.
+                let keys: Vec<String> = many.iter().map(|p| p.key()).collect();
+                let _ = writeln!(
+                    err_out,
+                    "error: '{target}' is ambiguous; matches {} — specify a source prefix (e.g. {})",
+                    keys.join(", "),
+                    keys[0]
+                );
+                return 1;
+            }
+        }
+    }
+
+    // Always print the removal plan so the action is previewable before any
+    // package is touched.
+    for pkg in &selected {
+        let _ = writeln!(
+            out,
+            "Package to remove: {}:{} ({})",
+            pkg.source,
+            pkg.name,
+            crate::size::human_kb(pkg.installed_kb as u64)
+        );
+        if !pkg.remnants_found.is_empty() {
+            let _ = writeln!(out, "Remnants to remove:");
+            for r in &pkg.remnants_found {
+                let _ = writeln!(out, "  - {r}");
             }
         }
     }
 
     if opts.dry_run {
         let _ = writeln!(out, "Dry run: previewing package removal plan.");
-        for pkg in &selected {
-            let _ = writeln!(
-                out,
-                "Package to remove: {}:{} ({})",
-                pkg.source,
-                pkg.name,
-                crate::size::human_kb(pkg.installed_kb as u64)
-            );
-            if !pkg.remnants_found.is_empty() {
-                let _ = writeln!(out, "Remnants to remove:");
-                for r in &pkg.remnants_found {
-                    let _ = writeln!(out, "  - {r}");
-                }
-            }
-        }
         let results = remove_selected_in(deps, &selected, &all_installed, true, out, err_out);
         if let Some(e) = removal_errors(&results) {
             let _ = writeln!(err_out, "error: {e}");
             return 1;
         }
         return 0;
+    }
+
+    // Fail-closed confirmation gate (finding: unprompted `apt-get purge -y`).
+    if !opts.auto_yes {
+        if std::io::stdin().is_terminal() {
+            let _ = write!(
+                err_out,
+                "Proceed with removal of {} package(s)? [y/N] ",
+                selected.len()
+            );
+            let _ = err_out.flush();
+            let mut line = String::new();
+            let confirmed = std::io::stdin().lock().read_line(&mut line).is_ok_and(|_| {
+                let t = line.trim().to_ascii_lowercase();
+                t == "y" || t == "yes"
+            });
+            if !confirmed {
+                let _ = writeln!(out, "Aborted.");
+                return 0;
+            }
+        } else {
+            let _ = writeln!(
+                out,
+                "Non-interactive: pass --yes to confirm, or --dry-run to preview."
+            );
+            let _ = writeln!(out, "Aborted.");
+            return 0;
+        }
     }
 
     let results = remove_selected_in(deps, &selected, &all_installed, false, out, err_out);
@@ -347,6 +390,15 @@ fn run_cli_uninstall(
     }
     let _ = writeln!(out, "\nUninstall complete.");
     0
+}
+
+/// Clone a discovered package and attach its remnant scan (shared by every
+/// direct-CLI resolution branch).
+fn with_remnants(deps: &Deps, pkg: &Package) -> Package {
+    let mut pkg = pkg.clone();
+    pkg.remnants_found = remnants::find_remnants_in(deps, &pkg.name);
+    pkg.remnants_kb = remnants::remnant_size(&pkg.remnants_found) / 1024;
+    pkg
 }
 
 /// `defer utils.CloseLogger()` — closes on drop at every return path.
@@ -605,6 +657,139 @@ mod tests {
                 ..Default::default()
             },
             &deps,
+            &mut err_out,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn runner_with_pkg(pkgs: &'static str) -> Arc<FakeRunner> {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_look_path("dpkg-query", "/usr/bin/dpkg-query");
+        runner.set_handler(move |spec| {
+            if spec.program == "dpkg-query" {
+                return Ok(crate::runner::Output {
+                    stdout: pkgs.as_bytes().to_vec(),
+                    ..Default::default()
+                });
+            }
+            Ok(crate::runner::Output::default())
+        });
+        runner
+    }
+
+    fn purge_invoked(runner: &FakeRunner, name: &str) -> bool {
+        runner.invocations().iter().any(|s| {
+            s.program == "sudo"
+                && s.args == ["apt-get", "purge", "-y", name].map(std::ffi::OsString::from)
+        })
+    }
+
+    // Finding 1: direct CLI removal must not purge without `--yes`
+    // (fail-closed), mirroring clean's non-interactive gate.
+    #[test]
+    fn run_cli_uninstall_requires_yes_gate() {
+        let root = tempdir("gate");
+        let runner = runner_with_pkg("install ok installed\t1024\ttest-pkg\t1.0.0\n");
+        let deps = deps_for_test(&root, runner.clone());
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_cli_uninstall(
+            &Options {
+                packages: vec!["test-pkg".to_string()],
+                auto_yes: false,
+                ..Default::default()
+            },
+            &deps,
+            &mut out,
+            &mut err_out,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
+        assert!(
+            String::from_utf8_lossy(&out).contains("Aborted."),
+            "expected abort note, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            !purge_invoked(&runner, "test-pkg"),
+            "purge ran without --yes: {:?}",
+            runner.invocations()
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_cli_uninstall_with_yes_executes() {
+        let root = tempdir("yes");
+        let runner = runner_with_pkg("install ok installed\t1024\ttest-pkg\t1.0.0\n");
+        let deps = deps_for_test(&root, runner.clone());
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_cli_uninstall(
+            &Options {
+                packages: vec!["test-pkg".to_string()],
+                auto_yes: true,
+                ..Default::default()
+            },
+            &deps,
+            &mut out,
+            &mut err_out,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
+        assert!(purge_invoked(&runner, "test-pkg"), "expected purge call");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // Finding 7: a bare name matching several sources must fail closed.
+    #[test]
+    fn run_cli_uninstall_rejects_ambiguous_name() {
+        let root = tempdir("ambiguous");
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_look_path("dpkg-query", "/usr/bin/dpkg-query");
+        runner.set_look_path("snap", "/usr/bin/snap");
+        runner.set_handler(|spec| match spec.program.to_string_lossy().as_ref() {
+            "dpkg-query" => Ok(crate::runner::Output {
+                stdout: b"install ok installed\t1024\tfirefox\t1.0\n".to_vec(),
+                ..Default::default()
+            }),
+            "snap" => Ok(crate::runner::Output {
+                stdout:
+                    b"Name Version Rev Tracking Publisher Notes\nfirefox 124 1 stable mozilla -\n"
+                        .to_vec(),
+                ..Default::default()
+            }),
+            _ => Ok(crate::runner::Output::default()),
+        });
+        let deps = deps_for_test(&root, runner.clone());
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_cli_uninstall(
+            &Options {
+                dry_run: true,
+                packages: vec!["firefox".to_string()],
+                ..Default::default()
+            },
+            &deps,
+            &mut out,
+            &mut err_out,
+        );
+        assert_eq!(code, 1);
+        let text = String::from_utf8_lossy(&err_out);
+        assert!(
+            text.contains("ambiguous"),
+            "expected ambiguity error: {text}"
+        );
+        // A source prefix still resolves.
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_cli_uninstall(
+            &Options {
+                dry_run: true,
+                packages: vec!["snap:firefox".to_string()],
+                ..Default::default()
+            },
+            &deps,
+            &mut out,
             &mut err_out,
         );
         assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));

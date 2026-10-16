@@ -89,6 +89,9 @@ pub(crate) fn remove_selected_in(
                     &pkg.name,
                     if dry_run { "dry-run" } else { "success" },
                 );
+                // Steam games are uninstalled by delegating to Steam — never
+                // by trashing the appmanifest (Steam's own database).
+                delegate_steam_in(deps, pkg, dry_run, out);
             }
         }
         results.push(result);
@@ -174,6 +177,25 @@ pub(crate) fn remove_selected_in(
         }
     }
     results
+}
+
+/// `delegateSteam` — hand a matched Steam game to Steam's own uninstaller
+/// (`steam steam://uninstall/<appid>`) instead of trashing its appmanifest.
+fn delegate_steam_in(deps: &Deps, pkg: &Package, dry_run: bool, out: &mut dyn Write) {
+    for game in super::remnants::steam_delegations(deps, &pkg.name) {
+        if dry_run {
+            let _ = writeln!(
+                out,
+                "  [dry-run] would run: steam steam://uninstall/{}",
+                game.appid
+            );
+        } else {
+            let _ = deps.runner.run(&CommandSpec::new(
+                "steam",
+                [format!("steam://uninstall/{}", game.appid)],
+            ));
+        }
+    }
 }
 
 /// `removePackage` — `sudo apt-get purge -y <name>` or `sudo snap remove
@@ -462,6 +484,74 @@ mod tests {
         assert!(text.contains("[dry-run] would run: systemctl --user stop flat-app.service"));
         assert!(text.contains("[dry-run] would run: systemctl --user disable flat-app.service"));
 
+        fs::remove_dir_all(&home).ok();
+    }
+
+    // Finding 3: an exact Steam game name delegates to Steam's uninstaller
+    // and never trashes the appmanifest.
+    #[test]
+    fn steam_game_uninstall_delegates_to_steam() {
+        let home = tempdir("steam-delegate");
+        let runner = Arc::new(FakeRunner::new());
+        let deps = deps_for_test(&home, runner.clone());
+        let steamapps = deps.data_home.join("Steam").join("steamapps");
+        fs::create_dir_all(&steamapps).unwrap();
+        fs::write(
+            steamapps.join("appmanifest_220.acf"),
+            "\"appid\"\t\t\"220\"\n\"name\"\t\t\"Half-Life\"\n",
+        )
+        .unwrap();
+        let pkg = Package {
+            name: "Half-Life".to_string(),
+            source: "apt".to_string(),
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let results = remove_selected_in(
+            &deps,
+            std::slice::from_ref(&pkg),
+            std::slice::from_ref(&pkg),
+            true,
+            &mut out,
+            &mut err_out,
+        );
+        assert!(
+            removal_errors(&results).is_none(),
+            "errors: {:?}",
+            removal_errors(&results)
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("steam steam://uninstall/220"),
+            "missing dry-run delegation: {text}"
+        );
+        assert!(
+            steamapps.join("appmanifest_220.acf").exists(),
+            "manifest must never be trashed"
+        );
+
+        let runner2 = Arc::new(FakeRunner::new());
+        let deps2 = deps_for_test(&home, runner2.clone());
+        let mut out2 = Vec::new();
+        let mut err2 = Vec::new();
+        let results = remove_selected_in(
+            &deps2,
+            std::slice::from_ref(&pkg),
+            std::slice::from_ref(&pkg),
+            false,
+            &mut out2,
+            &mut err2,
+        );
+        assert!(removal_errors(&results).is_none());
+        let calls: Vec<Vec<String>> = runner2.invocations().iter().map(argv).collect();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &["steam", "steam://uninstall/220"].map(String::from)),
+            "steam not invoked: {calls:?}"
+        );
         fs::remove_dir_all(&home).ok();
     }
 }

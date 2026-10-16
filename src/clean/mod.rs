@@ -53,6 +53,20 @@ pub struct CleanTarget {
     /// while `runPlain` drops errored previews).
     pub preview: Option<PreviewFn>,
     pub execute: Box<dyn Fn(bool) -> Result<()>>,
+    /// Optional dynamic label (e.g. `System Trash (14 items)`) computed at
+    /// render time; `None` falls back to the static [`label`].
+    pub count_fn: Option<Box<dyn Fn() -> String>>,
+}
+
+impl CleanTarget {
+    /// The label shown in plain/TUI previews — [`count_fn`] when present
+    /// (fresh item count), otherwise the static [`label`].
+    pub fn display_label(&self) -> String {
+        match &self.count_fn {
+            Some(f) => f(),
+            None => self.label.to_string(),
+        }
+    }
 }
 
 /// Preview closure payload — Go's `([]string, error)` pair.
@@ -79,6 +93,8 @@ pub struct Options {
     pub include: Vec<String>,
     /// Skip the confirmation prompt.
     pub auto_yes: bool,
+    /// `--external <PATH>` — clean metadata on an external volume mount.
+    pub external: Option<PathBuf>,
 }
 
 /// Dependency bundle replacing the Go package vars. `runner` is
@@ -224,13 +240,21 @@ fn run_tui_in(opts: &Options, targets: Vec<CleanTarget>, deps: &Deps) -> Result<
 }
 
 /// The pre-fork half of `Run`: `LoadWhitelist` (fail closed on malformed
-/// config), `ValidateCleanupRoot(XDGCacheHome())`, `ResolveTargets`.
+/// config), `ValidateCleanupRoot(XDGCacheHome())`, `ResolveTargets`, then the
+/// `--external <PATH>` target when a mount path was given.
 fn prepare(opts: &Options, deps: &Deps) -> Result<Vec<CleanTarget>> {
     if let Err(e) = config::load_whitelist_from(&deps.config_home) {
         return Err(Error::Msg(format!("invalid mu configuration: {e}")));
     }
     paths::validate_cleanup_root(&deps.cache_home)?;
-    resolve_targets_in(deps, &opts.include)
+    let mut targets = resolve_targets_in(deps, &opts.include)?;
+    if let Some(mount) = &opts.external {
+        // Fail closed before the target is even built: the mount must be a
+        // safe cleanup root (absolute, not home/an ancestor, not protected).
+        paths::validate_cleanup_root(mount)?;
+        targets.push(targets::external_volume_target_in(deps, mount));
+    }
+    Ok(targets)
 }
 
 /// Injectable `runPlain` for tests: `deps` supplies the XDG roots and
@@ -299,15 +323,7 @@ fn run_plain(
     });
 
     for res in &results {
-        let label = if res.target.id == "system-trash" {
-            let count = targets::count_trash_items(&deps.data_home);
-            format!(
-                "System Trash ({count} item{})",
-                if count == 1 { "" } else { "s" }
-            )
-        } else {
-            res.target.label.to_string()
-        };
+        let label = res.target.display_label();
         r.line(format_args!("{:<40} {}", label, size::human_size(res.size)))?;
         for item in &res.items {
             r.line(format_args!("  - {item}"))?;
@@ -318,7 +334,7 @@ fn run_plain(
         "Potential space to free: {}",
         size::human_size(total)
     ))?;
-    export_preview_ledger(&results, total, &deps.config_home, &deps.data_home);
+    export_preview_ledger(&results, total, &deps.config_home);
     if !scan_errors.is_empty() {
         return Err(join_errors(&scan_errors));
     }
@@ -349,12 +365,7 @@ fn run_plain(
     Ok(format!("Freed {}", size::human_size(freed)))
 }
 
-fn export_preview_ledger(
-    results: &[ScanResult],
-    total: i64,
-    config_home: &std::path::Path,
-    data_home: &std::path::Path,
-) {
+fn export_preview_ledger(results: &[ScanResult], total: i64, config_home: &std::path::Path) {
     let mu_dir = config_home.join("mu");
     let _ = std::fs::create_dir_all(&mu_dir);
     let ledger_path = mu_dir.join("clean-list.txt");
@@ -370,15 +381,7 @@ fn export_preview_ledger(
     );
     let _ = writeln!(f, "--------------------------------------------------");
     for res in results {
-        let label = if res.target.id == "system-trash" {
-            let count = targets::count_trash_items(data_home);
-            format!(
-                "System Trash ({count} item{})",
-                if count == 1 { "" } else { "s" }
-            )
-        } else {
-            res.target.label.to_string()
-        };
+        let label = res.target.display_label();
         let _ = writeln!(f, "{:<40} {}", label, size::human_size(res.size));
         for item in &res.items {
             let _ = writeln!(f, "  - {item}");
@@ -621,6 +624,7 @@ mod tests {
             scan: Box::new(|| (0, None)),
             preview: None,
             execute: Box::new(execute),
+            count_fn: None,
         }
     }
 
@@ -846,7 +850,7 @@ mod tests {
             size: sz,
             items: vec!["item1.txt".into(), "item2.txt".into()],
         };
-        export_preview_ledger(&[res], sz, &deps.config_home, &deps.data_home);
+        export_preview_ledger(&[res], sz, &deps.config_home);
         let ledger = tmp.join(".config").join("mu").join("clean-list.txt");
         assert!(ledger.exists(), "clean-list.txt should be created");
         let content = fs::read_to_string(&ledger).unwrap();

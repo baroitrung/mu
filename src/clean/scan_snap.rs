@@ -126,6 +126,7 @@ pub(crate) fn snap_target_in(deps: &Deps) -> CleanTarget {
                 Err(join_errors(&remove_errors))
             }
         }),
+        count_fn: None,
     }
 }
 

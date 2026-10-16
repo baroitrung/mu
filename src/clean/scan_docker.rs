@@ -100,6 +100,7 @@ pub(crate) fn new_docker_target_in(deps: &Deps) -> CleanTarget {
                 }
             }
         }),
+        count_fn: None,
     }
 }
 

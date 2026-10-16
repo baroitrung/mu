@@ -129,6 +129,7 @@ Usage:
 
 Flags:
       --dry-run           Preview actions without making changes
+      --external string   Clean metadata on an external volume (mount path)
   -h, --help              help for clean
       --include strings   Opt-in categories (e.g. browser-cache)
   -y, --yes               Skip confirmation prompt
@@ -200,6 +201,7 @@ Flags:
   -h, --help        help for uninstall
       --list        List installed packages and exit
       --permanent   Bypass trash (rejected for safety)
+  -y, --yes         Skip confirmation prompt
 
 Global Flags:
       --debug   Enable verbose debug logging
@@ -435,6 +437,7 @@ enum Command {
         dry_run: bool,
         include: Vec<String>,
         yes: bool,
+        external: Option<std::path::PathBuf>,
     },
     Optimize {
         dry_run: bool,
@@ -452,6 +455,7 @@ enum Command {
         list: bool,
         permanent: bool,
         packages: Vec<String>,
+        yes: bool,
     },
 }
 
@@ -531,12 +535,14 @@ pub fn run() -> ! {
                     dry_run,
                     include,
                     yes,
+                    external,
                 } => {
                     let code = match clean::run(&clean::Options {
                         dry_run,
                         debug,
                         include,
                         auto_yes: yes,
+                        external,
                     }) {
                         Ok(_) => 0,
                         Err(e) => {
@@ -563,12 +569,14 @@ pub fn run() -> ! {
                     list,
                     permanent,
                     packages,
+                    yes,
                 } => std::process::exit(uninstall::run(&uninstall::Options {
                     dry_run,
                     debug,
                     list,
                     permanent,
                     packages,
+                    auto_yes: yes,
                 })),
             }
         }
@@ -702,6 +710,12 @@ const F_LIST: FlagSpec = FlagSpec {
     takes_value: false,
     display: "--list",
 };
+const F_EXTERNAL: FlagSpec = FlagSpec {
+    long: "external",
+    short: None,
+    takes_value: true,
+    display: "--external",
+};
 
 const ROOT_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_VERSION];
 const HELP_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP];
@@ -712,10 +726,10 @@ fn cmd_flagset(name: &str) -> &'static [FlagSpec] {
     match name {
         "analyze" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON],
         "status" => &[F_DEBUG, F_HELP, F_JSON],
-        "clean" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_INCLUDE],
+        "clean" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_INCLUDE, F_EXTERNAL],
         "optimize" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_SKIP],
         "audit" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON, F_REPORT, F_INCLUDE],
-        "uninstall" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_PERMANENT, F_LIST],
+        "uninstall" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_PERMANENT, F_LIST, F_YES],
         _ => &[],
     }
 }
@@ -1043,6 +1057,7 @@ fn exec_subcommand(name: &str, args: &[String]) -> Outcome {
             dry_run: p.get("dry-run"),
             include: p.vals("include"),
             yes: p.get("yes"),
+            external: p.vals("external").first().map(std::path::PathBuf::from),
         },
         "optimize" => Command::Optimize {
             dry_run: p.get("dry-run"),
@@ -1059,6 +1074,7 @@ fn exec_subcommand(name: &str, args: &[String]) -> Outcome {
             dry_run: p.get("dry-run"),
             list: p.get("list"),
             permanent: p.get("permanent"),
+            yes: p.get("yes"),
             packages: p.positionals,
         },
         _ => unreachable!(),
@@ -1819,6 +1835,33 @@ mod tests {
             Outcome::Run { cmd, .. } => match cmd {
                 Command::Clean { yes, .. } => assert!(yes),
                 _ => panic!("expected Clean"),
+            },
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn clean_external_flag_parses() {
+        match parse(&args(&["clean", "--external", "/mnt/usb"])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::Clean { external, .. } => {
+                    assert_eq!(external, Some(std::path::PathBuf::from("/mnt/usb")));
+                }
+                _ => panic!("expected Clean"),
+            },
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn uninstall_yes_flag_parses() {
+        match parse(&args(&["uninstall", "--yes", "bash"])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::Uninstall { yes, packages, .. } => {
+                    assert!(yes);
+                    assert_eq!(packages, vec!["bash"]);
+                }
+                _ => panic!("expected Uninstall"),
             },
             _ => panic!("expected Run"),
         }

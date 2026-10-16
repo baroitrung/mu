@@ -114,6 +114,7 @@ pub(crate) fn user_cache_target_in(deps: &Deps) -> CleanTarget {
                 Err(super::join_errors(&delete_errors))
             }
         }),
+        count_fn: None,
     }
 }
 
@@ -198,6 +199,7 @@ pub(crate) fn thumbnails_target_in(deps: &Deps) -> CleanTarget {
             paths::validate_cleanup_candidate(&exec_root, &exec_thumb)?;
             trash::safe_delete_with(&*exec_runner, &exec_cfg, &exec_deps, &exec_thumb, dry_run)
         }),
+        count_fn: None,
     }
 }
 
@@ -232,6 +234,7 @@ pub(crate) fn apt_cache_target_in(deps: &Deps) -> CleanTarget {
                 }
             }
         }),
+        count_fn: None,
     }
 }
 
@@ -271,6 +274,7 @@ pub(crate) fn journal_logs_target_in(deps: &Deps) -> CleanTarget {
                 }
             }
         }),
+        count_fn: None,
     }
 }
 
@@ -347,6 +351,7 @@ pub(crate) fn font_cache_target_in(deps: &Deps) -> CleanTarget {
                 }
             }
         }),
+        count_fn: None,
     }
 }
 
@@ -465,6 +470,7 @@ pub(crate) fn sandbox_font_cache_target_in(deps: &Deps) -> CleanTarget {
                 Err(super::join_errors(&delete_errors))
             }
         }),
+        count_fn: None,
     }
 }
 
@@ -524,6 +530,7 @@ pub(crate) fn system_trash_size(data_home: &Path) -> i64 {
 pub(crate) fn system_trash_target_in(deps: &Deps) -> CleanTarget {
     let scan_data = deps.data_home.clone();
     let exec_runner = Arc::clone(&deps.runner);
+    let count_data = deps.data_home.clone();
 
     CleanTarget {
         id: "system-trash",
@@ -539,14 +546,103 @@ pub(crate) fn system_trash_target_in(deps: &Deps) -> CleanTarget {
             if dry_run {
                 return Ok(());
             }
-            if exec_runner.look_path("gio").is_ok() {
-                exec_runner
-                    .run(&CommandSpec::new("gio", ["trash", "--empty"]))
-                    .map(|_| ())
-                    .map_err(|e| Error::Msg(format!("empty trash: {e}")))?;
+            // Fail closed: without `gio` the trash cannot be emptied, so this
+            // must be a failure — not a silent no-op that `execute` would
+            // still credit as freed space.
+            if exec_runner.look_path("gio").is_err() {
+                return Err(Error::Msg(
+                    "gio not found: cannot empty system trash".to_string(),
+                ));
             }
-            Ok(())
+            exec_runner
+                .run(&CommandSpec::new("gio", ["trash", "--empty"]))
+                .map(|_| ())
+                .map_err(|e| Error::Msg(format!("empty trash: {e}")))
         }),
+        count_fn: Some(Box::new(move || {
+            let count = count_trash_items(&count_data);
+            format!(
+                "System Trash ({count} item{})",
+                if count == 1 { "" } else { "s" }
+            )
+        })),
+    }
+}
+
+/// `externalVolumeCandidates` — removable metadata directly under an external
+/// mount: `.Trash-<uid>` directories and `.directory` files.
+pub(crate) fn external_volume_candidates(mount: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(mount) else {
+        return found;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".Trash-") || name == ".directory" {
+            found.push(e.path());
+        }
+    }
+    found
+}
+
+/// `externalVolumeTarget` — clean target added by `mu clean --external <PATH>`:
+/// removes `.Trash-*` and `.directory` metadata on an external volume mount,
+/// strictly through `SafeDelete` (never `rm`).
+pub(crate) fn external_volume_target_in(deps: &Deps, mount: &Path) -> CleanTarget {
+    let scan_mount = mount.to_path_buf();
+    let prev_mount = mount.to_path_buf();
+    let exec_mount = mount.to_path_buf();
+    let exec_cfg = deps.config_home.clone();
+    let exec_runner = Arc::clone(&deps.trash_runner);
+    let exec_deps = deps.trash_deps.clone();
+
+    CleanTarget {
+        id: "external-volume",
+        label: "External Volume Metadata",
+        requires_sudo: false,
+        // Only ever present when `--external` names the mount.
+        opt_in: true,
+        scan: Box::new(move || {
+            let mut total = 0i64;
+            for p in external_volume_candidates(&scan_mount) {
+                let (sz, _) = size::dir_size(&p);
+                total += sz as i64;
+            }
+            (total, None)
+        }),
+        preview: Some(Box::new(move || {
+            (
+                external_volume_candidates(&prev_mount)
+                    .into_iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+                None,
+            )
+        })),
+        execute: Box::new(move |dry_run| {
+            paths::validate_cleanup_root(&exec_mount)?;
+            let mut delete_errors: Vec<Error> = Vec::new();
+            for p in external_volume_candidates(&exec_mount) {
+                if let Err(e) = paths::validate_cleanup_candidate(&exec_mount, &p) {
+                    delete_errors.push(e);
+                    continue;
+                }
+                if let Err(e) =
+                    trash::safe_delete_with(&*exec_runner, &exec_cfg, &exec_deps, &p, dry_run)
+                {
+                    delete_errors.push(e);
+                }
+            }
+            if delete_errors.is_empty() {
+                Ok(())
+            } else {
+                Err(super::join_errors(&delete_errors))
+            }
+        }),
+        count_fn: None,
     }
 }
 
@@ -973,5 +1069,44 @@ mod tests {
             calls[0].args,
             ["LC_ALL=C", "journalctl", "--disk-usage"].map(std::ffi::OsString::from)
         );
+    }
+
+    // Finding 5: without `gio` the trash target must fail instead of reporting
+    // a silent no-op success that `execute` credits as freed space.
+    #[test]
+    fn system_trash_fails_closed_without_gio() {
+        let tmp = tempdir("trash-nogio");
+        let deps = deps_for_test(&tmp, Arc::new(FakeRunner::new())); // gio missing
+        let target = system_trash_target_in(&deps);
+        let err = (target.execute)(false).expect_err("expected gio-missing failure");
+        assert!(
+            err.to_string().contains("gio not found"),
+            "unexpected error: {err}"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Finding 2: `--external <PATH>` target trashes `.Trash-*`/`.directory`.
+    #[test]
+    fn external_volume_target_cleans_metadata() {
+        let tmp = tempdir("external");
+        let mount = tmp.join("mnt");
+        fs::create_dir_all(mount.join(".Trash-1000")).unwrap();
+        fs::write(mount.join(".Trash-1000").join("f"), "x").unwrap();
+        fs::write(mount.join(".directory"), "meta").unwrap();
+        let runner = Arc::new(FakeRunner::new());
+        let deps = deps_for_test(&tmp, runner);
+        let target = external_volume_target_in(&deps, &mount);
+        let (sz, err) = (target.scan)();
+        assert!(err.is_none(), "scan error: {err:?}");
+        assert!(sz > 0, "expected non-zero scan size, got {sz}");
+
+        (target.execute)(true).expect("dry-run execute");
+        assert!(mount.join(".directory").exists(), "dry-run deleted a file");
+
+        (target.execute)(false).expect("real execute");
+        assert!(!mount.join(".directory").exists(), ".directory not removed");
+        assert!(!mount.join(".Trash-1000").exists(), ".Trash-* not removed");
+        fs::remove_dir_all(&tmp).ok();
     }
 }

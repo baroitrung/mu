@@ -13,6 +13,7 @@ Flags:
   -h, --help        help for uninstall
       --list        List installed packages and exit
       --permanent   Bypass trash (rejected for safety)
+  -y, --yes         Skip confirmation prompt
 
 Global Flags:
       --debug   Enable verbose debug logging
