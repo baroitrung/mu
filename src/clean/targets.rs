@@ -610,17 +610,42 @@ pub(crate) fn external_volume_entries(mount: &Path) -> Vec<(PathBuf, ExternalCan
 }
 
 /// `emptyTrashDir` — permanently remove the entries under a FreeDesktop trash
-/// directory's `files/`, `info/`, and `expunged/` children. The trash
-/// directory itself is never removed. Symlinks are unlinked, not followed.
+/// directory's `files/`, `info/`, and `expunged/` children. The trash directory
+/// itself is never removed.
+///
+/// The volume is untrusted, so each subdirectory is lstat'd first: a symlinked
+/// (or non-directory) `files/`/`info/`/`expunged/` is refused, never traversed.
+/// `read_dir` would otherwise follow `<mount>/.Trash-<uid>/files -> $HOME` and
+/// permanently delete everything outside the volume. Entries *inside* a real
+/// subdir are unlinked individually (symlinks are removed, not followed).
 fn empty_trash_dir(trash_root: &Path) -> Result<()> {
     let mut errors: Vec<Error> = Vec::new();
     for sub in ["files", "info", "expunged"] {
         let dir = trash_root.join(sub);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_symlink() => {
+                errors.push(Error::Msg(format!(
+                    "refusing symlinked trash subdir {}",
+                    dir.display()
+                )));
+                continue;
+            }
+            // A non-directory where a subdir should be is not traversed.
+            Ok(m) if !m.is_dir() => continue,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                errors.push(Error::Msg(format!("inspect {}: {e}", dir.display())));
+                continue;
+            }
+        }
+        // `read_dir` on `dir` is now safe: `dir` is a real directory (lstat).
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for e in entries.flatten() {
             let p = e.path();
+            // DirEntry::file_type never follows symlinks.
             let res = match e.file_type() {
                 Ok(t) if t.is_dir() => std::fs::remove_dir_all(&p),
                 Ok(_) => std::fs::remove_file(&p),
@@ -1219,5 +1244,36 @@ mod tests {
             "trash info/ contents not emptied"
         );
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Finding 1 (review r2): a symlinked `files/`/`info/`/`expunged/` on an
+    // untrusted external volume must never be followed out of the mount.
+    #[test]
+    fn external_volume_refuses_symlinked_trash_subdir() {
+        for sub in ["files", "info", "expunged"] {
+            let tmp = tempdir("ext-symlink");
+            let mount = tmp.join("mnt");
+            let trash = mount.join(".Trash-1000");
+            fs::create_dir_all(&trash).unwrap();
+            // A directory OUTSIDE the mount that must never be touched.
+            let outside = tmp.join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(outside.join("victim"), "keep").unwrap();
+            // <mount>/.Trash-1000/<sub> -> ../outside (absolute symlink)
+            std::os::unix::fs::symlink(&outside, trash.join(sub)).unwrap();
+
+            let deps = deps_for_test(&tmp, Arc::new(FakeRunner::new()));
+            let target = external_volume_target_in(&deps, &mount);
+            let err = (target.execute)(false).expect_err("expected refusal");
+            assert!(
+                err.to_string().contains("symlinked trash subdir"),
+                "sub={sub} unexpected error: {err}"
+            );
+            assert!(
+                outside.join("victim").exists(),
+                "sub={sub}: file outside the mount was deleted"
+            );
+            fs::remove_dir_all(&tmp).ok();
+        }
     }
 }
