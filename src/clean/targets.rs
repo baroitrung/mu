@@ -960,48 +960,68 @@ pub(crate) fn podman_target_in(deps: &Deps) -> CleanTarget {
             }
         }),
         // `podman system prune -f` is irreversible and cannot route through
-        // SafeDelete, so list exactly what it would remove before confirming.
+        // SafeDelete. This lists the main prune classes (partial: pods,
+        // networks and build cache are not itemised) and surfaces any `ls`
+        // failure so `--yes` cannot confirm an unseen set.
         preview: Some(Box::new(move || {
             if preview_runner.look_path("podman").is_err() {
                 return (Vec::new(), None);
             }
             let mut items = Vec::new();
-            if let Ok(out) = preview_runner.run(&CommandSpec::new(
-                "podman",
-                [
-                    "container",
-                    "ls",
-                    "-a",
-                    "--filter",
-                    "status=exited",
-                    "--format",
-                    "{{.Names}}",
-                ],
-            )) {
-                for name in out.stdout_lossy().lines().map(str::trim) {
-                    if !name.is_empty() {
-                        items.push(format!("stopped container: {name}"));
+            let mut errs: Vec<Error> = Vec::new();
+            for (args, prefix) in [
+                (
+                    vec![
+                        "container",
+                        "ls",
+                        "-a",
+                        "--filter",
+                        "status=exited",
+                        "--format",
+                        "{{.Names}}",
+                    ],
+                    "stopped container",
+                ),
+                (
+                    vec![
+                        "container",
+                        "ls",
+                        "-a",
+                        "--filter",
+                        "status=created",
+                        "--format",
+                        "{{.Names}}",
+                    ],
+                    "created container",
+                ),
+                (
+                    vec![
+                        "image",
+                        "ls",
+                        "--filter",
+                        "dangling=true",
+                        "--format",
+                        "{{.Repository}}:{{.Tag}}",
+                    ],
+                    "dangling image",
+                ),
+            ] {
+                match preview_runner.run(&CommandSpec::new("podman", args)) {
+                    Err(e) => errs.push(Error::Msg(format!("podman {prefix} list: {e}"))),
+                    Ok(out) => {
+                        for v in out.stdout_lossy().lines().map(str::trim) {
+                            if !v.is_empty() {
+                                items.push(format!("{prefix}: {v}"));
+                            }
+                        }
                     }
                 }
             }
-            if let Ok(out) = preview_runner.run(&CommandSpec::new(
-                "podman",
-                [
-                    "image",
-                    "ls",
-                    "--filter",
-                    "dangling=true",
-                    "--format",
-                    "{{.Repository}}:{{.Tag}}",
-                ],
-            )) {
-                for img in out.stdout_lossy().lines().map(str::trim) {
-                    if !img.is_empty() {
-                        items.push(format!("dangling image: {img}"));
-                    }
-                }
+            if errs.is_empty() {
+                (items, None)
+            } else {
+                (items, Some(super::join_errors(&errs)))
             }
-            (items, None)
         })),
         execute: Box::new(move |dry_run| {
             if exec_runner.look_path("podman").is_err() {
@@ -1040,6 +1060,9 @@ pub(crate) fn orphaned_app_data_target_in(deps: &Deps) -> CleanTarget {
     let exec_home = deps.home.clone();
     let exec_cfg = deps.config_home.clone();
     let exec_data = deps.data_home.clone();
+    // Discovery at execute time uses the same runner as scan/preview; the
+    // trash runner is only for SafeDelete (gio/trash), never for discovery.
+    let exec_disc_runner = Arc::clone(&deps.runner);
     let exec_runner = Arc::clone(&deps.trash_runner);
     let exec_deps = deps.trash_deps.clone();
 
@@ -1087,7 +1110,7 @@ pub(crate) fn orphaned_app_data_target_in(deps: &Deps) -> CleanTarget {
         })),
         execute: Box::new(move |dry_run| {
             let candidates =
-                find_orphaned_apps(&exec_home, &exec_cfg, &exec_data, exec_runner.as_ref())?;
+                find_orphaned_apps(&exec_home, &exec_cfg, &exec_data, exec_disc_runner.as_ref())?;
             let mut delete_errors: Vec<Error> = Vec::new();
             for p in candidates {
                 let root = if p.starts_with(&exec_cfg) {
@@ -1806,10 +1829,9 @@ mod tests {
             }
             Ok(Output::default())
         });
-        // The execute path discovers through `trash_runner`; point it at the
-        // same failing runner so the fail-closed branch is exercised.
-        let mut deps = deps_for_test(&tmp, runner.clone() as Arc<dyn Runner>);
-        deps.trash_runner = runner.clone() as Arc<dyn Runner>;
+        // Execute discovers through the same runner as scan/preview (finding 3
+        // fix), so no repointing is needed here.
+        let deps = deps_for_test(&tmp, runner.clone() as Arc<dyn Runner>);
         let target = orphaned_app_data_target_in(&deps);
 
         let (_sz, err) = (target.scan)();
@@ -1921,6 +1943,7 @@ mod tests {
         assert!(perr.is_none());
         let joined = items.join("\n");
         assert!(joined.contains("stopped container: oldctr"), "{joined}");
+        assert!(joined.contains("created container: oldctr"), "{joined}");
         assert!(joined.contains("dangling image: <none>:<none>"), "{joined}");
 
         (target.execute)(true).expect("dry-run execute");
@@ -1931,6 +1954,34 @@ mod tests {
                 .any(|s| s.args.iter().any(|a| a == "prune")),
             "dry-run must not invoke podman prune"
         );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Review r1 f2: a failed `podman ls` surfaces as a preview error instead of
+    // silently showing nothing.
+    #[test]
+    fn podman_preview_surfaces_list_errors() {
+        use crate::runner::RunError;
+        let tmp = tempdir("podman-err");
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_look_path("podman", "/usr/bin/podman");
+        runner.set_handler(|spec| {
+            let args: Vec<String> = spec
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            if spec.program.to_string_lossy() == "podman" && args.iter().any(|a| a == "container") {
+                return Err(RunError::Spawn(std::io::Error::other("storage lock")));
+            }
+            Ok(Output::default())
+        });
+        let deps = deps_for_test(&tmp, runner.clone() as Arc<dyn Runner>);
+        let target = podman_target_in(&deps);
+
+        let (items, err) = (target.preview.as_ref().expect("preview"))();
+        assert!(items.is_empty(), "items={items:?}");
+        assert!(err.is_some(), "preview must propagate ls errors");
         fs::remove_dir_all(&tmp).ok();
     }
 

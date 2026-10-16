@@ -981,11 +981,20 @@ fn clean_stale_recursive(
 }
 
 /// True when `p` is live user state the stale-state step must never delete:
-/// anything inside a [`LIVE_STATE_DIRS`] subtree, or the file `$HISTFILE`
-/// points at.
+/// anything inside a [`LIVE_STATE_DIRS`] subtree, a known shell/live-state
+/// file name, or the file `$HISTFILE` points at.
+///
+/// `HISTFILE` is usually a shell variable (bash/zsh do not export it), so the
+/// env var alone is unreliable — the name-based guard is the real protection.
 fn is_live_state(state_home: &Path, p: &Path, histfile: Option<&Path>) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if name == "history" || name == "lesshst" || name.ends_with("_history") {
+        return true;
+    }
     if let Some(hf) = histfile {
-        if hf == p {
+        // Compare the raw path and the base name so an unexpanded or
+        // differently-rooted HISTFILE still protects the same file.
+        if hf == p || hf.file_name() == p.file_name() {
             return true;
         }
     }
@@ -1590,6 +1599,59 @@ mod tests {
             "got {text:?}"
         );
         fs::remove_dir_all(&root).ok();
+    }
+
+    // Review r1 f1: shell history files must be protected by name because
+    // HISTFILE is a shell variable (not exported) in practice.
+    #[test]
+    fn state_clean_skips_history_files_by_name() {
+        let root = tempdir("opt-state-hist");
+        let config_home = root.join("config");
+        let state = root.join("state");
+        fs::create_dir_all(&config_home).unwrap();
+        fs::create_dir_all(state.join("zsh")).unwrap();
+
+        for name in ["zsh/history", "zsh_history", "lesshst"] {
+            let p = state.join(name);
+            fs::write(&p, "history data").unwrap();
+            set_mtime_secs_ago(&p, 40 * 86400);
+        }
+        let stale = state.join("cache.log");
+        fs::write(&stale, "stale").unwrap();
+        set_mtime_secs_ago(&stale, 40 * 86400);
+
+        let runner = FakeRunner::new();
+        let trash_deps = trash_deps_at(root.join("data-home"));
+        let mut out = Vec::new();
+        state_clean(&runner, &config_home, &state, &trash_deps, &mut out).expect("state clean");
+
+        for name in ["zsh/history", "zsh_history", "lesshst"] {
+            assert!(state.join(name).exists(), "{name} must be kept");
+        }
+        assert!(!stale.exists(), "cache.log must be trashed");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // Review r1 f1: the HISTFILE path (when present) is honoured, and a
+    // non-history file with no HISTFILE match is eligible.
+    #[test]
+    fn is_live_state_honors_histfile_path() {
+        let state = Path::new("/h/.local/state");
+        let hist = Path::new("/h/.local/state/zsh/history");
+        assert!(is_live_state(state, hist, Some(hist)), "HISTFILE path");
+        // A differently-rooted HISTFILE still protects the same file name.
+        assert!(
+            is_live_state(
+                state,
+                Path::new("/h/.local/state/.myhist"),
+                Some(Path::new("/x/.myhist"))
+            ),
+            "same base name as HISTFILE"
+        );
+        assert!(
+            !is_live_state(state, Path::new("/h/.local/state/other"), None),
+            "unrelated file is eligible"
+        );
     }
 
     // Finding 4 (review p3 f4): a symlinked state root is rejected (SafeDelete
