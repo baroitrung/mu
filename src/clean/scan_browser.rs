@@ -212,9 +212,6 @@ pub(crate) fn browser_cache_target_in(deps: &Deps) -> CleanTarget {
             let mut scan_errors: Vec<Error> = Vec::new();
             for p in browser_cache_paths_in(&scan_home) {
                 for planned in browser_delete_plan(&p) {
-                    if is_protected_pwa_path(&planned) {
-                        continue;
-                    }
                     let (sz, err) = crate::size::dir_size(&planned);
                     match err {
                         None => total += sz as i64,
@@ -237,9 +234,6 @@ pub(crate) fn browser_cache_target_in(deps: &Deps) -> CleanTarget {
                 }
                 let root = browser_cleanup_root(&exec_home, &p);
                 for planned in browser_delete_plan(&p) {
-                    if is_protected_pwa_path(&planned) {
-                        continue;
-                    }
                     if let Err(e) = paths::validate_cleanup_candidate(&root, &planned) {
                         delete_errors.push(e);
                         continue;

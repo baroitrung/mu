@@ -569,9 +569,30 @@ pub(crate) fn system_trash_target_in(deps: &Deps) -> CleanTarget {
     }
 }
 
-/// `externalVolumeCandidates` — removable metadata directly under an external
+/// The kind of an external-volume candidate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ExternalCandidate {
+    /// `<mount>/.Trash-<uid>` — a per-volume trash directory. It cannot be
+    /// trashed into itself; its contents are emptied (FreeDesktop traversal,
+    /// the same permanent semantics as `gio trash --empty`).
+    TrashDir,
+    /// `.directory` — plain metadata, recoverable via `SafeDelete`.
+    Metadata,
+}
+
+fn classify_external(name: &str) -> Option<ExternalCandidate> {
+    if name.starts_with(".Trash-") {
+        Some(ExternalCandidate::TrashDir)
+    } else if name == ".directory" {
+        Some(ExternalCandidate::Metadata)
+    } else {
+        None
+    }
+}
+
+/// `externalVolumeEntries` — removable metadata directly under an external
 /// mount: `.Trash-<uid>` directories and `.directory` files.
-pub(crate) fn external_volume_candidates(mount: &Path) -> Vec<PathBuf> {
+pub(crate) fn external_volume_entries(mount: &Path) -> Vec<(PathBuf, ExternalCandidate)> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir(mount) else {
         return found;
@@ -581,16 +602,46 @@ pub(crate) fn external_volume_candidates(mount: &Path) -> Vec<PathBuf> {
     for e in entries {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(".Trash-") || name == ".directory" {
-            found.push(e.path());
+        if let Some(kind) = classify_external(&name) {
+            found.push((e.path(), kind));
         }
     }
     found
 }
 
+/// `emptyTrashDir` — permanently remove the entries under a FreeDesktop trash
+/// directory's `files/`, `info/`, and `expunged/` children. The trash
+/// directory itself is never removed. Symlinks are unlinked, not followed.
+fn empty_trash_dir(trash_root: &Path) -> Result<()> {
+    let mut errors: Vec<Error> = Vec::new();
+    for sub in ["files", "info", "expunged"] {
+        let dir = trash_root.join(sub);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let res = match e.file_type() {
+                Ok(t) if t.is_dir() => std::fs::remove_dir_all(&p),
+                Ok(_) => std::fs::remove_file(&p),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = res {
+                errors.push(Error::Msg(format!("empty {}: {err}", p.display())));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(super::join_errors(&errors))
+    }
+}
+
 /// `externalVolumeTarget` — clean target added by `mu clean --external <PATH>`:
-/// removes `.Trash-*` and `.directory` metadata on an external volume mount,
-/// strictly through `SafeDelete` (never `rm`).
+/// `.directory` metadata is trashed via `SafeDelete`; `.Trash-*` directories
+/// are emptied in place (their contents are permanently removed, never trashed
+/// into themselves).
 pub(crate) fn external_volume_target_in(deps: &Deps, mount: &Path) -> CleanTarget {
     let scan_mount = mount.to_path_buf();
     let prev_mount = mount.to_path_buf();
@@ -607,17 +658,32 @@ pub(crate) fn external_volume_target_in(deps: &Deps, mount: &Path) -> CleanTarge
         opt_in: true,
         scan: Box::new(move || {
             let mut total = 0i64;
-            for p in external_volume_candidates(&scan_mount) {
-                let (sz, _) = size::dir_size(&p);
-                total += sz as i64;
+            let mut scan_errors: Vec<Error> = Vec::new();
+            for (p, _) in external_volume_entries(&scan_mount) {
+                let (sz, err) = match std::fs::symlink_metadata(&p) {
+                    Ok(m) if m.is_dir() => {
+                        let (sz, err) = size::dir_size(&p);
+                        (sz as i64, err)
+                    }
+                    Ok(m) => (m.len() as i64, None),
+                    Err(e) => (0, Some(e.into())),
+                };
+                match err {
+                    None => total += sz,
+                    Some(e) => scan_errors.push(e),
+                }
             }
-            (total, None)
+            if scan_errors.is_empty() {
+                (total, None)
+            } else {
+                (total, Some(super::join_errors(&scan_errors)))
+            }
         }),
         preview: Some(Box::new(move || {
             (
-                external_volume_candidates(&prev_mount)
+                external_volume_entries(&prev_mount)
                     .into_iter()
-                    .map(|p| p.to_string_lossy().into_owned())
+                    .map(|(p, _)| p.to_string_lossy().into_owned())
                     .collect(),
                 None,
             )
@@ -625,15 +691,44 @@ pub(crate) fn external_volume_target_in(deps: &Deps, mount: &Path) -> CleanTarge
         execute: Box::new(move |dry_run| {
             paths::validate_cleanup_root(&exec_mount)?;
             let mut delete_errors: Vec<Error> = Vec::new();
-            for p in external_volume_candidates(&exec_mount) {
+            for (p, kind) in external_volume_entries(&exec_mount) {
                 if let Err(e) = paths::validate_cleanup_candidate(&exec_mount, &p) {
                     delete_errors.push(e);
                     continue;
                 }
-                if let Err(e) =
-                    trash::safe_delete_with(&*exec_runner, &exec_cfg, &exec_deps, &p, dry_run)
-                {
-                    delete_errors.push(e);
+                match kind {
+                    ExternalCandidate::Metadata => {
+                        if let Err(e) = trash::safe_delete_with(
+                            &*exec_runner,
+                            &exec_cfg,
+                            &exec_deps,
+                            &p,
+                            dry_run,
+                        ) {
+                            delete_errors.push(e);
+                        }
+                    }
+                    ExternalCandidate::TrashDir => {
+                        if dry_run {
+                            oplog::log_outcome("empty-trash", &p.to_string_lossy(), "dry-run");
+                        } else {
+                            match empty_trash_dir(&p) {
+                                Ok(()) => oplog::log_outcome(
+                                    "empty-trash",
+                                    &p.to_string_lossy(),
+                                    "success",
+                                ),
+                                Err(e) => {
+                                    oplog::log_outcome(
+                                        "empty-trash",
+                                        &p.to_string_lossy(),
+                                        "failure",
+                                    );
+                                    delete_errors.push(e);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             if delete_errors.is_empty() {
@@ -1086,13 +1181,17 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
-    // Finding 2: `--external <PATH>` target trashes `.Trash-*`/`.directory`.
+    // Finding 2 (review r1): `--external <PATH>` must empty `.Trash-*`
+    // in place (never trash the trash into itself) and SafeDelete `.directory`.
     #[test]
     fn external_volume_target_cleans_metadata() {
         let tmp = tempdir("external");
         let mount = tmp.join("mnt");
-        fs::create_dir_all(mount.join(".Trash-1000")).unwrap();
-        fs::write(mount.join(".Trash-1000").join("f"), "x").unwrap();
+        let trash = mount.join(".Trash-1000");
+        fs::create_dir_all(trash.join("files")).unwrap();
+        fs::create_dir_all(trash.join("info")).unwrap();
+        fs::write(trash.join("files").join("junk"), "x").unwrap();
+        fs::write(trash.join("info").join("junk.trashinfo"), "meta").unwrap();
         fs::write(mount.join(".directory"), "meta").unwrap();
         let runner = Arc::new(FakeRunner::new());
         let deps = deps_for_test(&tmp, runner);
@@ -1103,10 +1202,22 @@ mod tests {
 
         (target.execute)(true).expect("dry-run execute");
         assert!(mount.join(".directory").exists(), "dry-run deleted a file");
+        assert!(
+            trash.join("files").join("junk").exists(),
+            "dry-run emptied trash"
+        );
 
         (target.execute)(false).expect("real execute");
         assert!(!mount.join(".directory").exists(), ".directory not removed");
-        assert!(!mount.join(".Trash-1000").exists(), ".Trash-* not removed");
+        assert!(trash.exists(), "trash dir itself must be kept");
+        assert!(
+            !trash.join("files").join("junk").exists(),
+            "trash files/ contents not emptied"
+        );
+        assert!(
+            !trash.join("info").join("junk.trashinfo").exists(),
+            "trash info/ contents not emptied"
+        );
         fs::remove_dir_all(&tmp).ok();
     }
 }

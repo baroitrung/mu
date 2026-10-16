@@ -136,6 +136,9 @@ pub(crate) enum RunDispatch {
 pub(crate) struct FlowModel {
     opts: Options,
     targets: Vec<CleanTarget>,
+    /// Display labels captured once at construction (`count_fn` may read the
+    /// filesystem) so the render path is free of filesystem reads.
+    display_labels: Vec<String>,
     /// `state` — pub(crate) so the driver can cheaply test Scanning/Running.
     pub(crate) state: FlowState,
     /// Terminal width from `WindowSize`; default 80.
@@ -175,9 +178,13 @@ struct Scanned {
 impl FlowModel {
     /// `newFlowModel`.
     pub(crate) fn new(opts: Options, targets: Vec<CleanTarget>) -> Self {
+        // Compute the display labels once, not on every render tick (finding 7
+        // r1: `display_label` may read the filesystem for the trash count).
+        let display_labels = targets.iter().map(CleanTarget::display_label).collect();
         Self {
             opts,
             targets,
+            display_labels,
             state: FlowState::Scanning,
             width: 80,
             spinner_idx: 0,
@@ -464,8 +471,8 @@ impl FlowModel {
         let mut s = format!("  {} Scanning system", SPINNER_FRAMES[self.spinner_idx]);
         let done = self.results.len();
         if done > 0 {
-            let label = if done < self.targets.len() {
-                format!(": {}", self.targets[done].display_label())
+            let label = if done < self.display_labels.len() {
+                format!(": {}", self.display_labels[done])
             } else {
                 String::new()
             };
@@ -489,9 +496,9 @@ impl FlowModel {
             size_w = size_w.max(size::human_size(res.size).chars().count());
         }
         let mut label_w = self
-            .targets
+            .display_labels
             .iter()
-            .map(|t| t.display_label().chars().count())
+            .map(|l| l.chars().count())
             .max()
             .unwrap_or(0);
         let max = self.width.saturating_sub(size_w + 6);
@@ -514,7 +521,7 @@ impl FlowModel {
             ),
         ];
         for (i, res) in self.results.iter().enumerate() {
-            let label = truncate(&self.targets[i].display_label(), label_w as isize);
+            let label = truncate(&self.display_labels[i], label_w as isize);
             lines.push(Line::raw(format!(
                 "  {label}{}{:>size_w$}",
                 pad(&label),

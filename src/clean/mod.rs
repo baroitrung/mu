@@ -859,6 +859,32 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
+    // Finding 5 (r1): `--external` roots are validated fail-closed.
+    #[test]
+    fn external_volume_rejects_unsafe_roots() {
+        let tmp = tempdir("ext-bad");
+        let deps = deps_for_test(&tmp, Arc::new(FakeRunner::new()));
+        for bad in ["/", "/etc", "relative/path"] {
+            let mut out = Vec::new();
+            let err = run_in(
+                &Options {
+                    dry_run: true,
+                    external: Some(PathBuf::from(bad)),
+                    ..Options::default()
+                },
+                &deps,
+                &mut out,
+            )
+            .expect_err("expected external root rejection");
+            let text = err.to_string();
+            assert!(
+                text.contains("unsafe cleanup root") || text.contains("must be absolute"),
+                "bad={bad} err={text}"
+            );
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn downloads_large_files_hint_test() {
         let tmp = tempdir("dlhint");
