@@ -219,7 +219,7 @@ pub(crate) fn run_in(opts: &Options, deps: &Deps, err_out: &mut dyn Write) -> i3
     if !opts.packages.is_empty() {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        return run_cli_uninstall(opts, deps, &mut out, err_out);
+        return run_cli_uninstall(opts, deps, &mut out, err_out, &mut confirm_stdin);
     }
 
     // Go: `tea.NewProgram(m, tea.WithAltScreen()).Run()` is the only path.
@@ -286,11 +286,45 @@ pub(crate) fn finish(
     let _ = writeln!(out, "\nUninstall complete.");
     0
 }
+/// Outcome of the direct-CLI confirmation gate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ConfirmOutcome {
+    Confirmed,
+    Declined,
+    NonInteractive,
+}
+
+/// Confirmation source for the direct-CLI removal gate — injected so tests
+/// never read the real process stdin.
+pub(crate) type ConfirmFn<'a> = &'a mut dyn FnMut(usize) -> ConfirmOutcome;
+
+/// Production confirmation: prompt on a TTY, fail closed otherwise.
+fn confirm_stdin(count: usize) -> ConfirmOutcome {
+    if !std::io::stdin().is_terminal() {
+        return ConfirmOutcome::NonInteractive;
+    }
+    eprint!("Proceed with removal of {count} package(s)? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    match std::io::stdin().lock().read_line(&mut line) {
+        Ok(_) => {
+            let answer = line.trim().to_ascii_lowercase();
+            if answer == "y" || answer == "yes" {
+                ConfirmOutcome::Confirmed
+            } else {
+                ConfirmOutcome::Declined
+            }
+        }
+        Err(_) => ConfirmOutcome::Declined,
+    }
+}
+
 fn run_cli_uninstall(
     opts: &Options,
     deps: &Deps,
     out: &mut dyn Write,
     err_out: &mut dyn Write,
+    confirm: ConfirmFn,
 ) -> i32 {
     let (all_installed, err) = discover(&*deps.runner);
     if let Some(e) = err
@@ -308,8 +342,29 @@ fn run_cli_uninstall(
         let by_name: Vec<&Package> = all_installed.iter().filter(|p| p.name == *target).collect();
         match by_name.as_slice() {
             [] => {
-                let _ = writeln!(err_out, "error: package '{target}' not found");
-                return 1;
+                // No package by that name — a Steam game of the same name is a
+                // first-class candidate that delegates to Steam's uninstaller.
+                match remnants::steam_delegations(deps, target).as_slice() {
+                    [game] => selected.push(Package {
+                        name: target.clone(),
+                        version: game.name.clone(),
+                        source: "steam".to_string(),
+                        ..Default::default()
+                    }),
+                    [] => {
+                        let _ = writeln!(err_out, "error: package '{target}' not found");
+                        return 1;
+                    }
+                    many => {
+                        let names: Vec<&str> = many.iter().map(|g| g.name.as_str()).collect();
+                        let _ = writeln!(
+                            err_out,
+                            "error: '{target}' is ambiguous; matches {} Steam game(s)",
+                            names.join(", ")
+                        );
+                        return 1;
+                    }
+                }
             }
             [pkg] => selected.push(with_remnants(deps, pkg)),
             many => {
@@ -327,6 +382,10 @@ fn run_cli_uninstall(
         }
     }
 
+    // Dry-run header comes before the plan it introduces.
+    if opts.dry_run {
+        let _ = writeln!(out, "Dry run: previewing package removal plan.");
+    }
     // Always print the removal plan so the action is previewable before any
     // package is touched.
     for pkg in &selected {
@@ -346,7 +405,6 @@ fn run_cli_uninstall(
     }
 
     if opts.dry_run {
-        let _ = writeln!(out, "Dry run: previewing package removal plan.");
         let results = remove_selected_in(deps, &selected, &all_installed, true, out, err_out);
         if let Some(e) = removal_errors(&results) {
             let _ = writeln!(err_out, "error: {e}");
@@ -357,29 +415,20 @@ fn run_cli_uninstall(
 
     // Fail-closed confirmation gate (finding: unprompted `apt-get purge -y`).
     if !opts.auto_yes {
-        if std::io::stdin().is_terminal() {
-            let _ = write!(
-                err_out,
-                "Proceed with removal of {} package(s)? [y/N] ",
-                selected.len()
-            );
-            let _ = err_out.flush();
-            let mut line = String::new();
-            let confirmed = std::io::stdin().lock().read_line(&mut line).is_ok_and(|_| {
-                let t = line.trim().to_ascii_lowercase();
-                t == "y" || t == "yes"
-            });
-            if !confirmed {
+        match confirm(selected.len()) {
+            ConfirmOutcome::Confirmed => {}
+            ConfirmOutcome::Declined => {
                 let _ = writeln!(out, "Aborted.");
                 return 0;
             }
-        } else {
-            let _ = writeln!(
-                out,
-                "Non-interactive: pass --yes to confirm, or --dry-run to preview."
-            );
-            let _ = writeln!(out, "Aborted.");
-            return 0;
+            ConfirmOutcome::NonInteractive => {
+                let _ = writeln!(
+                    out,
+                    "Non-interactive: pass --yes to confirm, or --dry-run to preview."
+                );
+                let _ = writeln!(out, "Aborted.");
+                return 0;
+            }
         }
     }
 
@@ -685,8 +734,9 @@ mod tests {
         })
     }
 
-    // Finding 1: direct CLI removal must not purge without `--yes`
-    // (fail-closed), mirroring clean's non-interactive gate.
+    // Finding 1 (r1): direct CLI removal must not purge without `--yes`
+    // (fail-closed), and the gate's input is injected so tests never read the
+    // real process stdin.
     #[test]
     fn run_cli_uninstall_requires_yes_gate() {
         let root = tempdir("gate");
@@ -703,11 +753,12 @@ mod tests {
             &deps,
             &mut out,
             &mut err_out,
+            &mut |_| ConfirmOutcome::NonInteractive,
         );
         assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
         assert!(
-            String::from_utf8_lossy(&out).contains("Aborted."),
-            "expected abort note, got {:?}",
+            String::from_utf8_lossy(&out).contains("Non-interactive: pass --yes"),
+            "expected non-interactive note, got {:?}",
             String::from_utf8_lossy(&out)
         );
         assert!(
@@ -715,6 +766,32 @@ mod tests {
             "purge ran without --yes: {:?}",
             runner.invocations()
         );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // Finding 3 (r1): an explicit TTY "no" answer aborts without touching
+    // packages, and the input is injected.
+    #[test]
+    fn run_cli_uninstall_declined_gate_aborts() {
+        let root = tempdir("declined");
+        let runner = runner_with_pkg("install ok installed\t1024\ttest-pkg\t1.0.0\n");
+        let deps = deps_for_test(&root, runner.clone());
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_cli_uninstall(
+            &Options {
+                packages: vec!["test-pkg".to_string()],
+                auto_yes: false,
+                ..Default::default()
+            },
+            &deps,
+            &mut out,
+            &mut err_out,
+            &mut |_| ConfirmOutcome::Declined,
+        );
+        assert_eq!(code, 0);
+        assert!(String::from_utf8_lossy(&out).contains("Aborted."));
+        assert!(!purge_invoked(&runner, "test-pkg"));
         fs::remove_dir_all(&root).ok();
     }
 
@@ -734,6 +811,7 @@ mod tests {
             &deps,
             &mut out,
             &mut err_out,
+            &mut |_| ConfirmOutcome::NonInteractive,
         );
         assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
         assert!(purge_invoked(&runner, "test-pkg"), "expected purge call");
@@ -772,6 +850,7 @@ mod tests {
             &deps,
             &mut out,
             &mut err_out,
+            &mut |_| ConfirmOutcome::NonInteractive,
         );
         assert_eq!(code, 1);
         let text = String::from_utf8_lossy(&err_out);
@@ -791,8 +870,59 @@ mod tests {
             &deps,
             &mut out,
             &mut err_out,
+            &mut |_| ConfirmOutcome::NonInteractive,
         );
         assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // Finding 2 (r1): a Steam game is a first-class candidate reached by name;
+    // a non-Steam package of the same name must NOT trigger Steam.
+    #[test]
+    fn run_cli_uninstall_steam_candidate_is_explicit() {
+        let root = tempdir("steam-cand");
+        let runner = runner_with_pkg("install ok installed\t1024\tother-pkg\t1.0\n");
+        runner.set_look_path("steam", "/usr/bin/steam");
+        let deps = deps_for_test(&root, runner.clone());
+        let steamapps = deps.data_home.join("Steam").join("steamapps");
+        fs::create_dir_all(&steamapps).unwrap();
+        fs::write(
+            steamapps.join("appmanifest_220.acf"),
+            "\"appid\"\t\t\"220\"\n\"name\"\t\t\"Half-Life\"\n",
+        )
+        .unwrap();
+
+        // `mu uninstall "Half-Life"` resolves to the steam candidate, prints a
+        // plan line, and on --yes delegates to Steam.
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_cli_uninstall(
+            &Options {
+                packages: vec!["Half-Life".to_string()],
+                auto_yes: true,
+                ..Default::default()
+            },
+            &deps,
+            &mut out,
+            &mut err_out,
+            &mut |_| ConfirmOutcome::NonInteractive,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("steam:Half-Life"),
+            "steam candidate missing from plan: {text}"
+        );
+        let calls: Vec<_> = runner.invocations();
+        assert!(
+            calls.iter().any(|c| c.program == "steam"
+                && c.args == [std::ffi::OsString::from("steam://uninstall/220")]),
+            "steam not delegated: {calls:?}"
+        );
+        assert!(
+            !purge_invoked(&runner, "Half-Life"),
+            "steam candidate must not purge an apt package"
+        );
         fs::remove_dir_all(&root).ok();
     }
 }

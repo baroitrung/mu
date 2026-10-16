@@ -89,9 +89,6 @@ pub(crate) fn remove_selected_in(
                     &pkg.name,
                     if dry_run { "dry-run" } else { "success" },
                 );
-                // Steam games are uninstalled by delegating to Steam — never
-                // by trashing the appmanifest (Steam's own database).
-                delegate_steam_in(deps, pkg, dry_run, out);
             }
         }
         results.push(result);
@@ -179,28 +176,11 @@ pub(crate) fn remove_selected_in(
     results
 }
 
-/// `delegateSteam` — hand a matched Steam game to Steam's own uninstaller
-/// (`steam steam://uninstall/<appid>`) instead of trashing its appmanifest.
-fn delegate_steam_in(deps: &Deps, pkg: &Package, dry_run: bool, out: &mut dyn Write) {
-    for game in super::remnants::steam_delegations(deps, &pkg.name) {
-        if dry_run {
-            let _ = writeln!(
-                out,
-                "  [dry-run] would run: steam steam://uninstall/{}",
-                game.appid
-            );
-        } else {
-            let _ = deps.runner.run(&CommandSpec::new(
-                "steam",
-                [format!("steam://uninstall/{}", game.appid)],
-            ));
-        }
-    }
-}
-
 /// `removePackage` — `sudo apt-get purge -y <name>` or `sudo snap remove
 /// <name>`; the dry-run line is printed for `--dry-run` instead. Captured
 /// child output is relayed before the error is inspected, exactly like Go.
+/// A `steam` source delegates to Steam's own uninstaller rather than touching
+/// the appmanifest.
 pub(crate) fn remove_package(
     deps: &Deps,
     pkg: &Package,
@@ -208,6 +188,31 @@ pub(crate) fn remove_package(
     out: &mut dyn Write,
     err_out: &mut dyn Write,
 ) -> Result<()> {
+    if pkg.source == "steam" {
+        let games = super::remnants::steam_delegations(deps, &pkg.name);
+        let Some(game) = games.first() else {
+            return msg(format!("steam game '{}' not found", pkg.name));
+        };
+        if dry_run {
+            let _ = writeln!(
+                out,
+                "  [dry-run] would run: steam steam://uninstall/{}",
+                game.appid
+            );
+            return Ok(());
+        }
+        if deps.runner.look_path("steam").is_err() {
+            return msg("steam not found: cannot uninstall Steam games".to_string());
+        }
+        return deps
+            .runner
+            .run(&CommandSpec::new(
+                "steam",
+                [format!("steam://uninstall/{}", game.appid)],
+            ))
+            .map(|_| ())
+            .map_err(|e| Error::Msg(format!("steam uninstall {}: {e}", game.appid)));
+    }
     let (prog, args) = match pkg.source.as_str() {
         "apt" => ("sudo", vec!["apt-get", "purge", "-y", pkg.name.as_str()]),
         "snap" => ("sudo", vec!["snap", "remove", pkg.name.as_str()]),
@@ -487,7 +492,7 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
-    // Finding 3: an exact Steam game name delegates to Steam's uninstaller
+    // Finding 3 (r1): a real Steam source delegates to Steam's own uninstaller
     // and never trashes the appmanifest.
     #[test]
     fn steam_game_uninstall_delegates_to_steam() {
@@ -503,7 +508,7 @@ mod tests {
         .unwrap();
         let pkg = Package {
             name: "Half-Life".to_string(),
-            source: "apt".to_string(),
+            source: "steam".to_string(),
             ..Default::default()
         };
 
@@ -533,6 +538,7 @@ mod tests {
         );
 
         let runner2 = Arc::new(FakeRunner::new());
+        runner2.set_look_path("steam", "/usr/bin/steam");
         let deps2 = deps_for_test(&home, runner2.clone());
         let mut out2 = Vec::new();
         let mut err2 = Vec::new();
