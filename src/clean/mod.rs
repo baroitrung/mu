@@ -155,6 +155,10 @@ pub(crate) fn all_targets_in(deps: &Deps) -> Vec<CleanTarget> {
         scan_kernels::kernels_target_in(deps),
         scan_browser::browser_cache_target_in(deps),
         targets::system_trash_target_in(deps),
+        targets::dev_cache_target_in(deps),
+        targets::podman_target_in(deps),
+        targets::orphaned_app_data_target_in(deps),
+        targets::orphaned_services_target_in(deps),
     ];
     if let Some(docker) = scan_docker::docker_target_in(deps) {
         targets.push(docker);

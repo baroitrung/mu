@@ -434,3 +434,107 @@ fn clean_external_dry_run_previews() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Phase 3: `mu optimize --dry-run` output contains exact shell command strings.
+#[test]
+fn optimize_dry_run_exact_commands() {
+    let o = mu(&["optimize", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("[dry-run] sudo journalctl --vacuum-size=500M"),
+        "missing exact journal command: {out}"
+    );
+    assert!(
+        out.contains("[dry-run] resolvectl flush-caches"),
+        "missing exact dns command: {out}"
+    );
+    assert!(
+        out.contains("[dry-run] sudo apt-get update && sudo apt-get autoremove --purge -y"),
+        "missing exact apt command: {out}"
+    );
+    assert!(
+        out.contains("[dry-run] sudo dpkg --configure -a && sudo apt-get install -f -y"),
+        "missing exact packages command: {out}"
+    );
+    assert!(
+        out.contains("[dry-run] systemctl reset-failed && systemctl --user reset-failed"),
+        "missing exact systemd command: {out}"
+    );
+}
+
+/// Phase 3: `mu optimize --dry-run --skip=apt,dns,packages` marks skipped steps with [skip].
+#[test]
+fn optimize_dry_run_skip_steps() {
+    let o = mu(&["optimize", "--dry-run", "--skip=apt,dns,packages"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("[skip]  apt"), "missing [skip] apt: {out}");
+    assert!(out.contains("[skip]  dns"), "missing [skip] dns: {out}");
+    assert!(
+        out.contains("[skip]  packages"),
+        "missing [skip] packages: {out}"
+    );
+    assert!(
+        out.contains("[dry-run] sudo journalctl --vacuum-size=500M"),
+        "unskipped step should show dry-run: {out}"
+    );
+}
+
+/// Phase 3: Sentinel immutability test on ~/.local/state/sentinel-test/stale.log.
+#[test]
+fn optimize_dry_run_sentinel_immutability() {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let state_dir = home.join(".local/state/sentinel-test");
+    let _ = std::fs::create_dir_all(&state_dir);
+    let sentinel_file = state_dir.join("stale.log");
+    std::fs::write(&sentinel_file, "sentinel stale state data").unwrap();
+
+    let o = mu(&["optimize", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    assert!(
+        sentinel_file.exists(),
+        "sentinel file was deleted during dry-run!"
+    );
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// Phase 3: `mu clean --dry-run --include=dev-cache` output includes "Developer CLI Caches".
+#[test]
+fn clean_dry_run_include_dev_cache() {
+    let o = mu(&["clean", "--dry-run", "--include=dev-cache"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("Developer CLI Caches"),
+        "missing 'Developer CLI Caches' in output: {out}"
+    );
+}
+
+/// Phase 3: `mu clean --dry-run` with all 4 opt-in targets.
+#[test]
+fn clean_dry_run_all_opt_in_targets() {
+    let o = mu(&[
+        "clean",
+        "--dry-run",
+        "--include=dev-cache,podman,orphaned-app-data,orphaned-services",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("Developer CLI Caches"),
+        "missing dev-cache: {out}"
+    );
+    assert!(out.contains("Podman System Cache"), "missing podman: {out}");
+    assert!(
+        out.contains("Orphaned Application Data"),
+        "missing orphaned-app-data: {out}"
+    );
+    assert!(
+        out.contains("Orphaned System Services"),
+        "missing orphaned-services: {out}"
+    );
+}

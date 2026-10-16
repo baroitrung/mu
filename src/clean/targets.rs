@@ -830,6 +830,331 @@ fn parse_journal_disk_usage(out: &str) -> std::result::Result<(f64, String), Str
     }
 }
 
+pub(crate) fn dev_cache_target_in(deps: &Deps) -> CleanTarget {
+    let scan_home = deps.home.clone();
+    let exec_home = deps.home.clone();
+    let exec_cfg = deps.config_home.clone();
+    let exec_runner = Arc::clone(&deps.trash_runner);
+    let exec_deps = deps.trash_deps.clone();
+
+    CleanTarget {
+        id: "dev-cache",
+        label: "Developer CLI Caches",
+        requires_sudo: false,
+        opt_in: true,
+        scan: Box::new(move || {
+            let mut total: i64 = 0;
+            let mut scan_errors: Vec<Error> = Vec::new();
+            for p in dev_cache_paths(&scan_home) {
+                if paths::path_exists(&p) {
+                    let (sz, err) = crate::size::dir_size(&p);
+                    match err {
+                        None => total += sz as i64,
+                        Some(e) => scan_errors.push(e),
+                    }
+                }
+            }
+            if scan_errors.is_empty() {
+                (total, None)
+            } else {
+                (total, Some(super::join_errors(&scan_errors)))
+            }
+        }),
+        preview: None,
+        execute: Box::new(move |dry_run| {
+            let mut delete_errors: Vec<Error> = Vec::new();
+            for p in dev_cache_paths(&exec_home) {
+                if !paths::path_exists(&p) {
+                    continue;
+                }
+                let root = dev_cache_root(&exec_home, &p);
+                if let Err(e) = paths::validate_cleanup_candidate(&root, &p) {
+                    delete_errors.push(e);
+                    continue;
+                }
+                if let Err(e) =
+                    trash::safe_delete_with(&*exec_runner, &exec_cfg, &exec_deps, &p, dry_run)
+                {
+                    delete_errors.push(e);
+                }
+            }
+            if delete_errors.is_empty() {
+                Ok(())
+            } else {
+                Err(super::join_errors(&delete_errors))
+            }
+        }),
+        count_fn: None,
+    }
+}
+
+fn dev_cache_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".cache/pip"),
+        home.join(".npm/_cacache"),
+        home.join(".cargo/registry/cache"),
+        home.join(".cache/go-build"),
+    ]
+}
+
+fn dev_cache_root(home: &Path, p: &Path) -> PathBuf {
+    let cache = home.join(".cache");
+    if p.starts_with(&cache) {
+        return cache;
+    }
+    let npm = home.join(".npm");
+    if p.starts_with(&npm) {
+        return npm;
+    }
+    let cargo = home.join(".cargo");
+    if p.starts_with(&cargo) {
+        return cargo;
+    }
+    p.parent().unwrap_or(home).to_path_buf()
+}
+
+pub(crate) fn podman_target_in(deps: &Deps) -> CleanTarget {
+    let runner = Arc::clone(&deps.runner);
+    let exec_runner = Arc::clone(&deps.runner);
+
+    CleanTarget {
+        id: "podman",
+        label: "Podman System Cache",
+        requires_sudo: false,
+        opt_in: true,
+        scan: Box::new(move || {
+            if runner.look_path("podman").is_err() {
+                return (0, None);
+            }
+            (0, None)
+        }),
+        preview: None,
+        execute: Box::new(move |dry_run| {
+            if exec_runner.look_path("podman").is_err() {
+                return Ok(());
+            }
+            if dry_run {
+                oplog::log_outcome("podman", "system prune -f", "dry-run");
+                return Ok(());
+            }
+            let res = exec_runner.run(&CommandSpec::new("podman", ["system", "prune", "-f"]));
+            res.map(|_| ()).map_err(|e| Error::Msg(format!("podman system prune: {e}")))
+        }),
+        count_fn: None,
+    }
+}
+
+pub(crate) fn orphaned_app_data_target_in(deps: &Deps) -> CleanTarget {
+    let scan_home = deps.home.clone();
+    let scan_cfg = deps.config_home.clone();
+    let scan_data = deps.data_home.clone();
+    let scan_runner = Arc::clone(&deps.runner);
+
+    let exec_home = deps.home.clone();
+    let exec_cfg = deps.config_home.clone();
+    let exec_data = deps.data_home.clone();
+    let exec_runner = Arc::clone(&deps.trash_runner);
+    let exec_deps = deps.trash_deps.clone();
+
+    CleanTarget {
+        id: "orphaned-app-data",
+        label: "Orphaned Application Data",
+        requires_sudo: false,
+        opt_in: true,
+        scan: Box::new(move || {
+            let candidates = find_orphaned_apps(&scan_home, &scan_cfg, &scan_data, scan_runner.as_ref());
+            let mut total: i64 = 0;
+            for p in &candidates {
+                let (sz, _) = crate::size::dir_size(p);
+                total += sz as i64;
+            }
+            (total, None)
+        }),
+        preview: None,
+        execute: Box::new(move |dry_run| {
+            let candidates = find_orphaned_apps(&exec_home, &exec_cfg, &exec_data, exec_runner.as_ref());
+            let mut delete_errors: Vec<Error> = Vec::new();
+            for p in candidates {
+                let root = if p.starts_with(&exec_cfg) {
+                    &exec_cfg
+                } else {
+                    &exec_data
+                };
+                if let Err(e) = paths::validate_cleanup_candidate(root, &p) {
+                    delete_errors.push(e);
+                    continue;
+                }
+                if let Err(e) =
+                    trash::safe_delete_with(&*exec_runner, &exec_cfg, &exec_deps, &p, dry_run)
+                {
+                    delete_errors.push(e);
+                }
+            }
+            if delete_errors.is_empty() {
+                Ok(())
+            } else {
+                Err(super::join_errors(&delete_errors))
+            }
+        }),
+        count_fn: None,
+    }
+}
+
+fn find_orphaned_apps(
+    home: &Path,
+    config_home: &Path,
+    data_home: &Path,
+    runner: &dyn Runner,
+) -> Vec<PathBuf> {
+    if home.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    const PROTECTED_CONFIG: &[&str] = &[
+        "dconf", "pulse", "systemd", "autostart", "gtk-3.0", "gtk-4.0", "glib-2.0",
+        "fontconfig", "ibus", "gnome-session", "environment.d", "mu", "mimeapps.list",
+        "user-dirs.dirs", "user-dirs.locale", "gnome-control-center", "BraveSoftware",
+        "google-chrome", "chromium", "microsoft-edge", "mozilla",
+    ];
+    const PROTECTED_DATA: &[&str] = &[
+        "Trash", "applications", "icons", "themes", "fonts", "mime", "keyrings",
+        "systemd", "mu", "flatpak", "gvfs-metadata", "sounds", "desktop-directories",
+    ];
+
+    let mut installed = std::collections::HashSet::new();
+    if let Ok(apt_pkgs) = crate::uninstall::discover::discover_apt(runner) {
+        for p in apt_pkgs {
+            installed.insert(p.name.to_lowercase());
+            if let Some(alias) = crate::uninstall::remnants::known_alias(&p.name) {
+                installed.insert(alias.to_lowercase());
+            }
+        }
+    }
+    if let Ok(snap_pkgs) = crate::uninstall::discover::discover_snap(runner) {
+        for p in snap_pkgs {
+            installed.insert(p.name.to_lowercase());
+            if let Some(alias) = crate::uninstall::remnants::known_alias(&p.name) {
+                installed.insert(alias.to_lowercase());
+            }
+        }
+    }
+    if runner.look_path("flatpak").is_ok() {
+        if let Ok(out) = runner.run(&CommandSpec::new(
+            "flatpak",
+            ["list", "--app", "--columns=application"],
+        )) {
+            for line in out.stdout_lossy().lines() {
+                let id = line.trim();
+                installed.insert(id.to_lowercase());
+                if let Some(last) = id.split('.').last() {
+                    installed.insert(last.to_lowercase());
+                }
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(config_home) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if PROTECTED_CONFIG.iter().any(|&prot| prot.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            let lower = name.to_lowercase();
+            if installed.contains(&lower) {
+                continue;
+            }
+            if runner.look_path(name).is_ok() || runner.look_path(&lower).is_ok() {
+                continue;
+            }
+            candidates.push(p);
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(data_home) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if PROTECTED_DATA.iter().any(|&prot| prot.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            let lower = name.to_lowercase();
+            if installed.contains(&lower) {
+                continue;
+            }
+            if runner.look_path(name).is_ok() || runner.look_path(&lower).is_ok() {
+                continue;
+            }
+            candidates.push(p);
+        }
+    }
+    candidates.sort();
+    candidates
+}
+
+pub(crate) fn orphaned_services_target_in(deps: &Deps) -> CleanTarget {
+    let scan_home = deps.home.clone();
+    let exec_home = deps.home.clone();
+    let exec_cfg = deps.config_home.clone();
+    let exec_runner = Arc::clone(&deps.trash_runner);
+    let exec_deps = deps.trash_deps.clone();
+
+    CleanTarget {
+        id: "orphaned-services",
+        label: "Orphaned System Services",
+        requires_sudo: false,
+        opt_in: true,
+        scan: Box::new(move || {
+            let broken = find_broken_service_symlinks(&scan_home);
+            let total = (broken.len() as i64) * 1024;
+            (total, None)
+        }),
+        preview: None,
+        execute: Box::new(move |dry_run| {
+            let broken = find_broken_service_symlinks(&exec_home);
+            let mut delete_errors: Vec<Error> = Vec::new();
+            let user_dir = exec_home.join(".config/systemd/user");
+            for p in broken {
+                if paths::path_contains(&user_dir, &p) {
+                    if let Err(e) =
+                        trash::safe_delete_with(&*exec_runner, &exec_cfg, &exec_deps, &p, dry_run)
+                    {
+                        delete_errors.push(e);
+                    }
+                }
+            }
+            if delete_errors.is_empty() {
+                Ok(())
+            } else {
+                Err(super::join_errors(&delete_errors))
+            }
+        }),
+        count_fn: None,
+    }
+}
+
+fn find_broken_service_symlinks(home: &Path) -> Vec<PathBuf> {
+    let mut broken = Vec::new();
+    let user_dir = home.join(".config/systemd/user");
+    if let Ok(entries) = std::fs::read_dir(user_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Ok(m) = p.symlink_metadata() {
+                if m.file_type().is_symlink() && std::fs::metadata(&p).is_err() {
+                    broken.push(p);
+                }
+            }
+        }
+    }
+    broken.sort();
+    broken
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
