@@ -115,6 +115,32 @@ pub(crate) fn remove_selected_in(
                 continue;
             }
             processed_remnants.insert(remnant.clone());
+
+            // If remnant is a systemd user unit, stop and disable it before trashing
+            if remnant.ends_with(".service") {
+                let unit = Path::new(&remnant)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if !unit.is_empty() {
+                    if dry_run {
+                        let _ =
+                            writeln!(out, "  [dry-run] would run: systemctl --user stop {unit}");
+                        let _ = writeln!(
+                            out,
+                            "  [dry-run] would run: systemctl --user disable {unit}"
+                        );
+                    } else {
+                        let _ = deps
+                            .runner
+                            .run(&CommandSpec::new("systemctl", ["--user", "stop", unit]));
+                        let _ = deps
+                            .runner
+                            .run(&CommandSpec::new("systemctl", ["--user", "disable", unit]));
+                    }
+                }
+            }
+
             // `err = remnantRoot(...); if err == nil { ValidateCleanupCandidate };
             //  if err == nil { SafeDelete }` — the first failing step wins.
             let attempt = remnant_root(deps, &remnant)
@@ -153,6 +179,8 @@ pub(crate) fn remove_selected_in(
 /// `removePackage` — `sudo apt-get purge -y <name>` or `sudo snap remove
 /// <name>`; the dry-run line is printed for `--dry-run` instead. Captured
 /// child output is relayed before the error is inspected, exactly like Go.
+/// A `steam` source delegates to Steam's own uninstaller rather than touching
+/// the appmanifest.
 pub(crate) fn remove_package(
     deps: &Deps,
     pkg: &Package,
@@ -160,9 +188,35 @@ pub(crate) fn remove_package(
     out: &mut dyn Write,
     err_out: &mut dyn Write,
 ) -> Result<()> {
-    let args: Vec<&str> = match pkg.source.as_str() {
-        "apt" => vec!["apt-get", "purge", "-y", pkg.name.as_str()],
-        "snap" => vec!["snap", "remove", pkg.name.as_str()],
+    if pkg.source == "steam" {
+        let games = super::remnants::steam_delegations(deps, &pkg.name);
+        let Some(game) = games.first() else {
+            return msg(format!("steam game '{}' not found", pkg.name));
+        };
+        if dry_run {
+            let _ = writeln!(
+                out,
+                "  [dry-run] would run: steam steam://uninstall/{}",
+                game.appid
+            );
+            return Ok(());
+        }
+        if deps.runner.look_path("steam").is_err() {
+            return msg("steam not found: cannot uninstall Steam games".to_string());
+        }
+        return deps
+            .runner
+            .run(&CommandSpec::new(
+                "steam",
+                [format!("steam://uninstall/{}", game.appid)],
+            ))
+            .map(|_| ())
+            .map_err(|e| Error::Msg(format!("steam uninstall {}: {e}", game.appid)));
+    }
+    let (prog, args) = match pkg.source.as_str() {
+        "apt" => ("sudo", vec!["apt-get", "purge", "-y", pkg.name.as_str()]),
+        "snap" => ("sudo", vec!["snap", "remove", pkg.name.as_str()]),
+        "flatpak" => ("flatpak", vec!["uninstall", "-y", pkg.name.as_str()]),
         _ => {
             return msg(format!(
                 "unsupported package source {:?} for {}",
@@ -171,10 +225,15 @@ pub(crate) fn remove_package(
         }
     };
     if dry_run {
-        let _ = writeln!(out, "  [dry-run] would run: sudo {}", args.join(" "));
+        let cmd_str = if prog == "sudo" {
+            format!("sudo {}", args.join(" "))
+        } else {
+            format!("{prog} {}", args.join(" "))
+        };
+        let _ = writeln!(out, "  [dry-run] would run: {cmd_str}");
         return Ok(());
     }
-    let res = deps.runner.run(&CommandSpec::new("sudo", &args));
+    let res = deps.runner.run(&CommandSpec::new(prog, &args));
     // Go writes result.Stdout→os.Stdout and result.Stderr→os.Stderr
     // unconditionally; RunError keeps the partial output for the same cases.
     let output = match &res {
@@ -386,6 +445,118 @@ mod tests {
         assert!(
             remove_package(&deps, &bad, false, &mut out, &mut err_out).is_err(),
             "expected unknown source error"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn flatpak_remove_and_systemd_unit_termination() {
+        let home = tempdir("flatpak-systemd");
+        let runner = Arc::new(FakeRunner::new());
+        let deps = deps_for_test(&home, runner.clone());
+        let unit_remnant = deps
+            .config_home
+            .join("systemd")
+            .join("user")
+            .join("flat-app.service");
+        fs::create_dir_all(unit_remnant.parent().unwrap()).unwrap();
+        fs::write(&unit_remnant, b"[Unit]\nDescription=Test\n").unwrap();
+
+        let pkg = Package {
+            name: "org.example.App".to_string(),
+            source: "flatpak".to_string(),
+            remnants_found: vec![unit_remnant.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let results = remove_selected_in(
+            &deps,
+            std::slice::from_ref(&pkg),
+            std::slice::from_ref(&pkg),
+            true,
+            &mut out,
+            &mut err_out,
+        );
+        assert!(
+            removal_errors(&results).is_none(),
+            "errors: {:?}",
+            removal_errors(&results)
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("[dry-run] would run: flatpak uninstall -y org.example.App"));
+        assert!(text.contains("[dry-run] would run: systemctl --user stop flat-app.service"));
+        assert!(text.contains("[dry-run] would run: systemctl --user disable flat-app.service"));
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    // Finding 3 (r1): a real Steam source delegates to Steam's own uninstaller
+    // and never trashes the appmanifest.
+    #[test]
+    fn steam_game_uninstall_delegates_to_steam() {
+        let home = tempdir("steam-delegate");
+        let runner = Arc::new(FakeRunner::new());
+        let deps = deps_for_test(&home, runner.clone());
+        let steamapps = deps.data_home.join("Steam").join("steamapps");
+        fs::create_dir_all(&steamapps).unwrap();
+        fs::write(
+            steamapps.join("appmanifest_220.acf"),
+            "\"appid\"\t\t\"220\"\n\"name\"\t\t\"Half-Life\"\n",
+        )
+        .unwrap();
+        let pkg = Package {
+            name: "Half-Life".to_string(),
+            source: "steam".to_string(),
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let results = remove_selected_in(
+            &deps,
+            std::slice::from_ref(&pkg),
+            std::slice::from_ref(&pkg),
+            true,
+            &mut out,
+            &mut err_out,
+        );
+        assert!(
+            removal_errors(&results).is_none(),
+            "errors: {:?}",
+            removal_errors(&results)
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("steam steam://uninstall/220"),
+            "missing dry-run delegation: {text}"
+        );
+        assert!(
+            steamapps.join("appmanifest_220.acf").exists(),
+            "manifest must never be trashed"
+        );
+
+        let runner2 = Arc::new(FakeRunner::new());
+        runner2.set_look_path("steam", "/usr/bin/steam");
+        let deps2 = deps_for_test(&home, runner2.clone());
+        let mut out2 = Vec::new();
+        let mut err2 = Vec::new();
+        let results = remove_selected_in(
+            &deps2,
+            std::slice::from_ref(&pkg),
+            std::slice::from_ref(&pkg),
+            false,
+            &mut out2,
+            &mut err2,
+        );
+        assert!(removal_errors(&results).is_none());
+        let calls: Vec<Vec<String>> = runner2.invocations().iter().map(argv).collect();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &["steam", "steam://uninstall/220"].map(String::from)),
+            "steam not invoked: {calls:?}"
         );
         fs::remove_dir_all(&home).ok();
     }

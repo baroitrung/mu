@@ -25,7 +25,8 @@ pub struct MenuItem {
     pub command: &'static str,
 }
 
-/// The six menu items — exact order from Go's `menuItems`.
+/// The menu items — order from Go's `menuItems`, extended with the Phase 4
+/// `purge`/`installer` commands before Quit.
 pub const MENU_ITEMS: &[MenuItem] = &[
     MenuItem {
         label: "Audit",
@@ -51,6 +52,16 @@ pub const MENU_ITEMS: &[MenuItem] = &[
         label: "Status",
         desc: "Live system dashboard",
         command: "status",
+    },
+    MenuItem {
+        label: "Purge",
+        desc: "Clean heavy project build artifacts (node_modules, target)",
+        command: "purge",
+    },
+    MenuItem {
+        label: "Installer",
+        desc: "Find and remove downloaded installer packages",
+        command: "installer",
     },
     MenuItem {
         label: "Quit",
@@ -91,6 +102,7 @@ pub struct MainMenu {
 impl MainMenu {
     /// Create a new menu with the given persisted cursor and snapshot.
     pub fn new(cursor: usize, snapshot: Option<HealthSnapshot>) -> Self {
+        crate::update::check_background_update_silently();
         Self {
             cursor,
             snapshot,
@@ -168,7 +180,7 @@ impl MainMenu {
                 }
                 false
             }
-            KeyCode::Char(c @ '1'..='6') => {
+            KeyCode::Char(c @ '1'..='8') => {
                 let idx = (c as u8 - b'1') as usize;
                 if idx < MENU_ITEMS.len() {
                     self.chosen = Some(MENU_ITEMS[idx].command);
@@ -231,6 +243,33 @@ impl MainMenu {
             "  Mole Ubuntu — safe system cleaner",
             styles::bold_primary(),
         ));
+
+        // Biometric hint
+        let sudo_status = crate::sudo::get_status(&crate::sudo::resolve_pam_path(None));
+        if sudo_status.enabled {
+            lines.push(Line::styled(
+                "  [Biometrics: Enabled (pam_fprintd)]",
+                styles::faint(),
+            ));
+        } else if sudo_status.module_installed {
+            lines.push(Line::styled(
+                "  [Biometrics: Available (run 'mu sudo enable')]",
+                styles::faint(),
+            ));
+        }
+
+        // Update notice if cached check shows newer version
+        let cache_check = crate::xdg::cache_home().join("mu/last_version_check.json");
+        if let Ok(content) = std::fs::read_to_string(&cache_check)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Some(latest) = v.get("latest").and_then(|s| s.as_str())
+            && crate::update::is_newer_version(latest, crate::update::current_version())
+        {
+            lines.push(Line::styled(
+                format!("  ★ Update available: {latest} (run 'mu update')"),
+                styles::bold_primary(),
+            ));
+        }
 
         // Banner (transient done/error summary)
         if !self.banner.is_empty() {
@@ -307,9 +346,11 @@ mod tests {
 
     #[test]
     fn menu_items_order() {
-        assert_eq!(MENU_ITEMS.len(), 6);
+        assert_eq!(MENU_ITEMS.len(), 8);
         assert_eq!(MENU_ITEMS[0].command, "audit");
-        assert_eq!(MENU_ITEMS[5].command, "quit");
+        assert_eq!(MENU_ITEMS[5].command, "purge");
+        assert_eq!(MENU_ITEMS[6].command, "installer");
+        assert_eq!(MENU_ITEMS[7].command, "quit");
     }
 
     #[test]

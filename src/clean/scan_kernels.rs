@@ -256,6 +256,7 @@ pub(crate) fn kernels_target_in(deps: &Deps) -> CleanTarget {
             )
         })),
         execute: Box::new(move |dry_run| run_autoremove(&*runner, dry_run)),
+        count_fn: None,
     }
 }
 

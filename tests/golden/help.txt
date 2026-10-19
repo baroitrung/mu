@@ -13,9 +13,15 @@ Available Commands:
   clean       Free disk space by removing caches, logs, and old packages
   completion  Generate the autocompletion script for the specified shell
   help        Help about any command
+  history     View recent operations and deletion log
+  installer   Find and remove downloaded installer packages (.deb, .AppImage, .iso)
   optimize    Run system maintenance: apt autoremove, journal vacuum, cache refresh
+  purge       Safely clean heavy project build artifacts (node_modules, target, .venv)
+  remove      Safely uninstall mu and remove configuration, logs, and cache
   status      Live system dashboard: CPU, RAM, disk, network, health score
+  sudo        Configure fingerprint authentication for sudo (pam_fprintd)
   uninstall   Remove apps and all their config, cache, and data remnants
+  update      Check for updates and self-update to the latest release
 
 Flags:
       --debug     Enable verbose debug logging

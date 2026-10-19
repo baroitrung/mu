@@ -70,6 +70,15 @@ pub fn data_home() -> PathBuf {
     )
 }
 
+/// `$XDG_STATE_HOME` or `~/.local/state`. Relative values are ignored like
+/// the other XDG roots (fail closed).
+pub fn state_home() -> PathBuf {
+    resolve(
+        env::var_os("XDG_STATE_HOME").as_deref(),
+        home_dir().join(".local").join("state"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +103,11 @@ mod tests {
             resolve(rel, home.join(".local").join("share")),
             home.join(".local").join("share"),
             "relative XDG_DATA_HOME must be ignored"
+        );
+        assert_eq!(
+            resolve(rel, home.join(".local").join("state")),
+            home.join(".local").join("state"),
+            "relative XDG_STATE_HOME must be ignored"
         );
     }
 

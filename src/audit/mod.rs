@@ -312,6 +312,9 @@ pub(crate) mod test_support {
                 confirm: Arc::new(|_| panic!("confirm must not be reached")),
                 config_home: root.to_path_buf(),
                 data_home: root.join("data"),
+                home: root.to_path_buf(),
+                state_home: root.join("state"),
+                trash_deps: std::rc::Rc::new(crate::trash::TrashDeps::real()),
                 no_oplog: true,
             },
         }

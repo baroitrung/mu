@@ -63,6 +63,74 @@ fn status_json_flag() {
     serde_json::from_str::<serde_json::Value>(&stdout(&o)).expect("status --json parse");
 }
 
+/// `mu status --json` emits extended fields `cpu_cores` and `disk_io`.
+#[test]
+fn status_json_extended_fields() {
+    let o = mu(&["status", "--json"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).expect("status --json parse");
+    for key in [
+        "cpu_percent",
+        "memory",
+        "disks",
+        "network",
+        "health",
+        "cpu_cores",
+        "disk_io",
+    ] {
+        assert!(v.get(key).is_some(), "missing {key} in {v}");
+    }
+}
+
+/// `mu status --watch` streams valid NDJSON lines containing required metrics.
+#[test]
+fn status_watch_ndjson_streaming() {
+    let mu_bin = env!("CARGO_BIN_EXE_mu");
+    let mut child = Command::new(mu_bin)
+        .args(["status", "--watch", "--interval", "100ms"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mu status --watch");
+
+    let stdout_pipe = child.stdout.take().expect("stdout pipe");
+    let reader = std::io::BufReader::new(stdout_pipe);
+    let mut lines = Vec::new();
+    for line in std::io::BufRead::lines(reader).take(2) {
+        let line = line.expect("read line from watch");
+        let v: serde_json::Value = serde_json::from_str(&line).expect("parse NDJSON line");
+        for key in ["cpu_percent", "memory", "disks", "network", "health"] {
+            assert!(v.get(key).is_some(), "missing {key} in {line}");
+        }
+        lines.push(v);
+    }
+    assert_eq!(lines.len(), 2);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `mu status --help` renders usage matching golden fixture.
+#[test]
+fn status_help_output() {
+    let o = mu(&["status", "--help"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), include_str!("golden/help-status.txt"));
+}
+
+/// `mu status --interval 0s` and `infs` are rejected with exit code 1.
+#[test]
+fn status_interval_invalid_rejected() {
+    for arg in ["0s", "0ms", "0", "infs", "1e300s", "1e-10s", "1e-12m"] {
+        let o = mu(&["status", "--interval", arg]);
+        assert_eq!(o.status.code(), Some(1), "for {arg}");
+        assert!(
+            stderr(&o).contains(&format!("invalid duration \"{arg}\"")),
+            "for {arg}: {}",
+            stderr(&o)
+        );
+    }
+}
+
 /// `mu audit` piped → human report on stdout (Go falls back to report
 /// mode), exit code is the severity-driven 0/1/2 — never the old stub's 2+
 /// or an arg error.
@@ -169,6 +237,12 @@ fn help_lists_subcommands() {
         "status",
         "uninstall",
         "completion",
+        "history",
+        "installer",
+        "purge",
+        "remove",
+        "sudo",
+        "update",
     ] {
         assert!(out.contains(cmd), "missing {cmd} in help");
     }
@@ -302,6 +376,513 @@ fn analyze_relative_path_dry_run_reports_absolute_target() {
         out.contains(&format!("Target: {}", test_dir.display())),
         "target should be absolute: {out}"
     );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// Phase 2: `mu clean --dry-run` creates preview ledger at $XDG_CONFIG_HOME/mu/clean-list.txt.
+#[test]
+fn clean_dry_run_creates_preview_ledger() {
+    let o = mu(&["clean", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(out.contains("Potential space to free:"), "{out}");
+    assert!(out.contains("DRY RUN"), "{out}");
+
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
+                .unwrap()
+        });
+    let ledger = config_home.join("mu").join("clean-list.txt");
+    assert!(
+        ledger.exists(),
+        "clean-list.txt must exist at {}",
+        ledger.display()
+    );
+    let content = std::fs::read_to_string(&ledger).unwrap();
+    assert!(content.contains("# mu clean preview ledger"));
+}
+
+/// Phase 2: `mu clean --dry-run --include=system-trash` previews item count and size.
+#[test]
+fn clean_dry_run_system_trash_previews_count_and_size() {
+    let o = mu(&["clean", "--dry-run", "--include=system-trash"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(out.contains("System Trash"), "{out}");
+    assert!(out.contains("item"), "{out}");
+}
+
+/// Phase 2: `mu clean --include=system-trash < /dev/null` fails closed without --yes.
+#[test]
+fn clean_include_system_trash_aborts_without_yes() {
+    let o = mu(&["clean", "--include=system-trash"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(out.contains("Non-interactive: pass --yes"), "{out}");
+    assert!(out.contains("Aborted."), "{out}");
+}
+
+/// Phase 2: Sentinel immutability test for `clean --dry-run`.
+#[test]
+fn clean_dry_run_sentinel_immutability() {
+    let test_dir = std::env::temp_dir().join(format!("mu-clean-sentinel-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&test_dir);
+    let sentinel = test_dir.join("keep.txt");
+    std::fs::write(&sentinel, b"preserve me").unwrap();
+
+    let o = mu(&["clean", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(
+        sentinel.exists(),
+        "sentinel keep.txt must not be deleted during clean --dry-run"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// `mu history --limit 5` -> renders tabular log of recent operations, exit 0.
+#[test]
+fn history_limit_tabular() {
+    let o = mu(&["history", "--limit", "5"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    // Either header or no operations message
+    assert!(
+        out.contains("TIMESTAMP") || out.contains("No recent operations recorded"),
+        "unexpected output: {out}"
+    );
+}
+
+/// `mu history --json` -> valid JSON array with fields timestamp, action, outcome, target.
+#[test]
+fn history_json_array() {
+    let o = mu(&["history", "--json"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).expect("history JSON parse");
+    assert!(v.is_array(), "expected JSON array: {v}");
+    if let Some(first) = v.as_array().and_then(|arr| arr.first()) {
+        for key in ["timestamp", "action", "outcome", "target"] {
+            assert!(first.get(key).is_some(), "missing {key} in entry: {first}");
+        }
+    }
+}
+
+/// `mu history --help` -> renders usage matching golden fixture, exit 0.
+#[test]
+fn history_help_output() {
+    let o = mu(&["history", "--help"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), include_str!("golden/help-history.txt"));
+}
+
+/// `mu purge --dry-run` -> scans search paths and exits 0.
+#[test]
+fn purge_dry_run_scans() {
+    let o = mu(&["purge", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("project build artifact")
+            || out.contains("No project build artifacts found")
+            || out.contains("No project directories found"),
+        "unexpected purge dry run output: {out}"
+    );
+}
+
+/// Sentinel immutability test (purge):
+/// `mu purge --dry-run --paths=/tmp/mu-purge-test` leaves sentinel.js intact.
+#[test]
+fn purge_sentinel_immutability() {
+    let test_dir = std::env::temp_dir().join(format!("mu-purge-test-{}", std::process::id()));
+    let nm = test_dir.join("node_modules");
+    std::fs::create_dir_all(&nm).unwrap();
+    let sentinel = nm.join("sentinel.js");
+    std::fs::write(&sentinel, b"console.log('sentinel');").unwrap();
+
+    let o = mu(&[
+        "purge",
+        "--dry-run",
+        &format!("--paths={}", test_dir.display()),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    assert!(
+        sentinel.exists(),
+        "purge --dry-run must leave sentinel.js intact"
+    );
+
+    let out = stdout(&o);
+    assert!(
+        out.contains("DRY RUN"),
+        "output should mention DRY RUN: {out}"
+    );
+    assert!(
+        out.contains("node_modules"),
+        "output should list node_modules: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// Phase 2: `mu uninstall --list` lists installed packages with source prefix.
+#[test]
+fn uninstall_list_outputs_packages() {
+    let o = mu(&["uninstall", "--list"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(
+        out.contains("apt:") || out.contains("snap:") || out.contains("flatpak:"),
+        "output should list packages with source prefix: {out}"
+    );
+}
+
+/// Phase 2: `mu uninstall --dry-run bash` previews removal plan without executing apt.
+#[test]
+fn uninstall_dry_run_bash_previews_plan() {
+    let o = mu(&["uninstall", "--dry-run", "bash"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(out.contains("Package to remove:"), "{out}");
+    assert!(out.contains("bash"), "{out}");
+    assert!(out.contains("[dry-run]"), "{out}");
+}
+
+/// Phase 2: `mu uninstall --permanent bash` rejected with exit 1 and safety error.
+#[test]
+fn uninstall_rejects_permanent_flag() {
+    let o = mu(&["uninstall", "--permanent", "bash"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = stderr(&o);
+    assert!(
+        err.contains("error: --permanent is rejected: mu enforces SafeDelete via trash only"),
+        "unexpected stderr: {err}"
+    );
+}
+
+/// Phase 2: `mu uninstall --help` renders updated help matching golden fixture.
+#[test]
+fn uninstall_help_matches_golden() {
+    let o = mu(&["uninstall", "--help"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), include_str!("golden/help-uninstall.txt"));
+}
+
+/// Phase 2: `mu clean --external <PATH>` previews external-volume metadata and
+/// mutates nothing on a dry run.
+#[test]
+fn clean_external_dry_run_previews() {
+    let dir = std::env::temp_dir().join(format!("mu-external-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".Trash-1000")).unwrap();
+    std::fs::write(dir.join(".directory"), b"meta").unwrap();
+
+    let path = dir.to_string_lossy().into_owned();
+    let o = mu(&["clean", "--dry-run", "--external", &path]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("External Volume"), "{out}");
+    assert!(
+        dir.join(".directory").exists(),
+        "dry-run must not delete external metadata"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Phase 3: `mu optimize --dry-run` output contains exact shell command strings.
+#[test]
+fn optimize_dry_run_exact_commands() {
+    let o = mu(&["optimize", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("[dry-run] sudo journalctl --vacuum-size=500M"),
+        "missing exact journal command: {out}"
+    );
+    assert!(
+        out.contains("[dry-run] sudo resolvectl flush-caches"),
+        "missing exact dns command: {out}"
+    );
+    assert!(
+        out.contains("[dry-run] sudo apt-get update && sudo apt-get autoremove --purge -y"),
+        "missing exact apt command: {out}"
+    );
+    assert!(
+        out.contains("[dry-run] sudo dpkg --configure -a && sudo apt-get install -f -y"),
+        "missing exact packages command: {out}"
+    );
+    assert!(
+        out.contains("[dry-run] sudo systemctl reset-failed && systemctl --user reset-failed"),
+        "missing exact systemd command: {out}"
+    );
+}
+
+/// Phase 3: `mu optimize --dry-run --skip=apt,dns,packages` marks skipped steps with [skip].
+#[test]
+fn optimize_dry_run_skip_steps() {
+    let o = mu(&["optimize", "--dry-run", "--skip=apt,dns,packages"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("[skip]  apt"), "missing [skip] apt: {out}");
+    assert!(out.contains("[skip]  dns"), "missing [skip] dns: {out}");
+    assert!(
+        out.contains("[skip]  packages"),
+        "missing [skip] packages: {out}"
+    );
+    assert!(
+        out.contains("[dry-run] sudo journalctl --vacuum-size=500M"),
+        "unskipped step should show dry-run: {out}"
+    );
+}
+
+/// Phase 3: Sentinel immutability test on ~/.local/state/sentinel-test/stale.log.
+#[test]
+fn optimize_dry_run_sentinel_immutability() {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let state_dir = home.join(".local/state/sentinel-test");
+    let _ = std::fs::create_dir_all(&state_dir);
+    let sentinel_file = state_dir.join("stale.log");
+    std::fs::write(&sentinel_file, "sentinel stale state data").unwrap();
+
+    let o = mu(&["optimize", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    assert!(
+        sentinel_file.exists(),
+        "sentinel file was deleted during dry-run!"
+    );
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+/// Phase 3: `mu clean --dry-run --include=dev-cache` output includes "Developer CLI Caches".
+#[test]
+fn clean_dry_run_include_dev_cache() {
+    let o = mu(&["clean", "--dry-run", "--include=dev-cache"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("Developer CLI Caches"),
+        "missing 'Developer CLI Caches' in output: {out}"
+    );
+}
+
+/// Phase 3: `mu clean --dry-run` with all 4 opt-in targets.
+#[test]
+fn clean_dry_run_all_opt_in_targets() {
+    let o = mu(&[
+        "clean",
+        "--dry-run",
+        "--include=dev-cache,podman,orphaned-app-data,orphaned-services",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("Developer CLI Caches"),
+        "missing dev-cache: {out}"
+    );
+    assert!(out.contains("Podman System Cache"), "missing podman: {out}");
+    assert!(
+        out.contains("Orphaned Application Data"),
+        "missing orphaned-app-data: {out}"
+    );
+    assert!(
+        out.contains("Orphaned User Services"),
+        "missing orphaned-services: {out}"
+    );
+}
+
+/// Sentinel immutability test (installer):
+/// `mu installer --dry-run --paths=/tmp/mu-installer-test` leaves dummy.deb intact.
+#[test]
+fn installer_sentinel_immutability() {
+    let test_dir = std::env::temp_dir().join(format!("mu-installer-test-{}", std::process::id()));
+    std::fs::create_dir_all(&test_dir).unwrap();
+    let dummy = test_dir.join("dummy.deb");
+    std::fs::write(&dummy, b"dummy deb package content").unwrap();
+
+    let o = mu(&[
+        "installer",
+        "--dry-run",
+        &format!("--paths={}", test_dir.display()),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    assert!(
+        dummy.exists(),
+        "installer --dry-run must leave dummy.deb intact"
+    );
+
+    let out = stdout(&o);
+    assert!(
+        out.contains("DRY RUN"),
+        "output should mention DRY RUN: {out}"
+    );
+    assert!(
+        out.contains("dummy.deb"),
+        "output should list dummy.deb: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// `mu purge --help` -> renders usage matching golden fixture, exit 0.
+#[test]
+fn purge_help_output() {
+    let o = mu(&["purge", "--help"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), include_str!("golden/help-purge.txt"));
+}
+
+/// `mu installer --help` -> renders usage matching golden fixture, exit 0.
+#[test]
+fn installer_help_output() {
+    let o = mu(&["installer", "--help"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), include_str!("golden/help-installer.txt"));
+}
+
+/// `mu sudo status` -> reports PAM fingerprint status, exit 0.
+#[test]
+fn sudo_status_output() {
+    let o = mu(&["sudo", "status"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(
+        out.contains("Fingerprint authentication for sudo:"),
+        "unexpected output: {out}"
+    );
+}
+
+/// `mu sudo --dry-run enable` -> previews changes without modifying files, exit 0.
+#[test]
+fn sudo_dry_run_enable() {
+    let o = mu(&["sudo", "--dry-run", "enable"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(
+        out.contains("[dry-run] Would enable fingerprint authentication for sudo"),
+        "unexpected output: {out}"
+    );
+}
+
+/// `mu update --dry-run` -> reports local version and status, exit 0.
+#[test]
+fn update_dry_run() {
+    let tmp = std::env::temp_dir().join(format!("mu-update-dry-cli-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let release_json = tmp.join("release.json");
+    let json_content = serde_json::json!({
+        "tag_name": "v0.3.0",
+        "name": "v0.3.0",
+        "assets": []
+    });
+    std::fs::write(&release_json, json_content.to_string()).unwrap();
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["update", "--dry-run"]);
+    cmd.env(
+        "MU_UPDATE_URL",
+        format!("file://{}", release_json.display()),
+    );
+    let o = cmd.output().expect("run mu update --dry-run");
+
+    assert_eq!(o.status.code(), Some(0));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("Checking for updates") || out.contains("up-to-date"),
+        "unexpected output: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// `mu remove --dry-run` sentinel immutability test -> exit 0, sentinel untouched.
+#[test]
+fn remove_dry_run_sentinel() {
+    let test_dir = std::env::temp_dir().join(format!("mu-remove-sentinel-{}", std::process::id()));
+    let config_dir = test_dir.join(".config/mu");
+    let _ = std::fs::create_dir_all(&config_dir);
+    let sentinel = config_dir.join("config.toml");
+    std::fs::write(&sentinel, b"# sentinel config").unwrap();
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["remove", "--dry-run"]);
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_CONFIG_HOME", test_dir.join(".config"));
+    cmd.env("XDG_CACHE_HOME", test_dir.join(".cache"));
+    cmd.env("XDG_DATA_HOME", test_dir.join(".local/share"));
+    let output = cmd.output().expect("failed to run mu remove --dry-run");
+
+    assert_eq!(output.status.code(), Some(0));
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("[dry-run]"), "expected dry run notice: {out}");
+    assert!(
+        sentinel.exists(),
+        "sentinel config.toml must not be deleted during --dry-run"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// `mu completion --install bash` -> writes completion script, exit 0.
+#[test]
+fn completion_install_bash() {
+    let test_dir = std::env::temp_dir().join(format!("mu-comp-install-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&test_dir);
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["completion", "--install", "bash"]);
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_DATA_HOME", test_dir.join(".local/share"));
+    let output = cmd
+        .output()
+        .expect("failed to run mu completion --install bash");
+
+    assert_eq!(output.status.code(), Some(0));
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("Installed completion for bash"),
+        "expected install confirmation in output: {out}"
+    );
+
+    let expected_file = test_dir.join(".local/share/bash-completion/completions/mu");
+    assert!(
+        expected_file.exists(),
+        "installed completion file must exist at {}",
+        expected_file.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// `mu completion --install desktop` -> writes desktop entry, exit 0.
+#[test]
+fn completion_install_desktop() {
+    let test_dir = std::env::temp_dir().join(format!("mu-comp-desktop-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&test_dir);
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["completion", "--install", "desktop"]);
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_DATA_HOME", test_dir.join(".local/share"));
+    let output = cmd
+        .output()
+        .expect("failed to run mu completion --install desktop");
+
+    assert_eq!(output.status.code(), Some(0));
+    let expected_file = test_dir.join(".local/share/applications/mu.desktop");
+    assert!(
+        expected_file.exists(),
+        "installed desktop file must exist at {}",
+        expected_file.display()
+    );
+    let content = std::fs::read_to_string(&expected_file).unwrap();
+    assert!(content.contains("[Desktop Entry]"));
+    assert!(content.contains("Name=mu"));
 
     let _ = std::fs::remove_dir_all(&test_dir);
 }

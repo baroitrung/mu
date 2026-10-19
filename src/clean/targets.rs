@@ -114,6 +114,7 @@ pub(crate) fn user_cache_target_in(deps: &Deps) -> CleanTarget {
                 Err(super::join_errors(&delete_errors))
             }
         }),
+        count_fn: None,
     }
 }
 
@@ -198,6 +199,7 @@ pub(crate) fn thumbnails_target_in(deps: &Deps) -> CleanTarget {
             paths::validate_cleanup_candidate(&exec_root, &exec_thumb)?;
             trash::safe_delete_with(&*exec_runner, &exec_cfg, &exec_deps, &exec_thumb, dry_run)
         }),
+        count_fn: None,
     }
 }
 
@@ -232,6 +234,7 @@ pub(crate) fn apt_cache_target_in(deps: &Deps) -> CleanTarget {
                 }
             }
         }),
+        count_fn: None,
     }
 }
 
@@ -271,6 +274,7 @@ pub(crate) fn journal_logs_target_in(deps: &Deps) -> CleanTarget {
                 }
             }
         }),
+        count_fn: None,
     }
 }
 
@@ -347,6 +351,7 @@ pub(crate) fn font_cache_target_in(deps: &Deps) -> CleanTarget {
                 }
             }
         }),
+        count_fn: None,
     }
 }
 
@@ -465,6 +470,7 @@ pub(crate) fn sandbox_font_cache_target_in(deps: &Deps) -> CleanTarget {
                 Err(super::join_errors(&delete_errors))
             }
         }),
+        count_fn: None,
     }
 }
 
@@ -498,6 +504,266 @@ pub(crate) fn sandbox_font_cache_dirs_in(home: &Path) -> Vec<(PathBuf, PathBuf)>
         }
     }
     found
+}
+
+/// `count_trash_items` — counts entries in `$XDG_DATA_HOME/Trash/files`.
+pub(crate) fn count_trash_items(data_home: &Path) -> usize {
+    let files_dir = data_home.join("Trash").join("files");
+    let Ok(entries) = std::fs::read_dir(&files_dir) else {
+        return 0;
+    };
+    entries.flatten().count()
+}
+
+/// `system_trash_size` — total bytes in `$XDG_DATA_HOME/Trash`.
+pub(crate) fn system_trash_size(data_home: &Path) -> i64 {
+    let trash_dir = data_home.join("Trash");
+    if !trash_dir.exists() {
+        return 0;
+    }
+    let (sz, _) = size::dir_size(&trash_dir);
+    sz as i64
+}
+
+/// `systemTrashTarget` — CleanTarget for system trash (opt-in).
+/// Previews item count and size; executes strictly via `gio trash --empty`.
+pub(crate) fn system_trash_target_in(deps: &Deps) -> CleanTarget {
+    let scan_data = deps.data_home.clone();
+    let exec_runner = Arc::clone(&deps.runner);
+    let count_data = deps.data_home.clone();
+
+    CleanTarget {
+        id: "system-trash",
+        label: "System Trash",
+        requires_sudo: false,
+        opt_in: true,
+        scan: Box::new(move || {
+            let sz = system_trash_size(&scan_data);
+            (sz, None)
+        }),
+        preview: None,
+        execute: Box::new(move |dry_run| {
+            if dry_run {
+                return Ok(());
+            }
+            // Fail closed: without `gio` the trash cannot be emptied, so this
+            // must be a failure — not a silent no-op that `execute` would
+            // still credit as freed space.
+            if exec_runner.look_path("gio").is_err() {
+                return Err(Error::Msg(
+                    "gio not found: cannot empty system trash".to_string(),
+                ));
+            }
+            exec_runner
+                .run(&CommandSpec::new("gio", ["trash", "--empty"]))
+                .map(|_| ())
+                .map_err(|e| Error::Msg(format!("empty trash: {e}")))
+        }),
+        count_fn: Some(Box::new(move || {
+            let count = count_trash_items(&count_data);
+            format!(
+                "System Trash ({count} item{})",
+                if count == 1 { "" } else { "s" }
+            )
+        })),
+    }
+}
+
+/// The kind of an external-volume candidate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ExternalCandidate {
+    /// `<mount>/.Trash-<uid>` — a per-volume trash directory. It cannot be
+    /// trashed into itself; its contents are emptied (FreeDesktop traversal,
+    /// the same permanent semantics as `gio trash --empty`).
+    TrashDir,
+    /// `.directory` — plain metadata, recoverable via `SafeDelete`.
+    Metadata,
+}
+
+fn classify_external(name: &str) -> Option<ExternalCandidate> {
+    if name.starts_with(".Trash-") {
+        Some(ExternalCandidate::TrashDir)
+    } else if name == ".directory" {
+        Some(ExternalCandidate::Metadata)
+    } else {
+        None
+    }
+}
+
+/// `externalVolumeEntries` — removable metadata directly under an external
+/// mount: `.Trash-<uid>` directories and `.directory` files.
+pub(crate) fn external_volume_entries(mount: &Path) -> Vec<(PathBuf, ExternalCandidate)> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(mount) else {
+        return found;
+    };
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if let Some(kind) = classify_external(&name) {
+            found.push((e.path(), kind));
+        }
+    }
+    found
+}
+
+/// `emptyTrashDir` — permanently remove the entries under a FreeDesktop trash
+/// directory's `files/`, `info/`, and `expunged/` children. The trash directory
+/// itself is never removed.
+///
+/// The volume is untrusted, so each subdirectory is lstat'd first: a symlinked
+/// (or non-directory) `files/`/`info/`/`expunged/` is refused, never traversed.
+/// `read_dir` would otherwise follow `<mount>/.Trash-<uid>/files -> $HOME` and
+/// permanently delete everything outside the volume. Entries *inside* a real
+/// subdir are unlinked individually (symlinks are removed, not followed).
+fn empty_trash_dir(trash_root: &Path) -> Result<()> {
+    let mut errors: Vec<Error> = Vec::new();
+    for sub in ["files", "info", "expunged"] {
+        let dir = trash_root.join(sub);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_symlink() => {
+                errors.push(Error::Msg(format!(
+                    "refusing symlinked trash subdir {}",
+                    dir.display()
+                )));
+                continue;
+            }
+            // A non-directory where a subdir should be is not traversed.
+            Ok(m) if !m.is_dir() => continue,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                errors.push(Error::Msg(format!("inspect {}: {e}", dir.display())));
+                continue;
+            }
+        }
+        // `read_dir` on `dir` is now safe: `dir` is a real directory (lstat).
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            // DirEntry::file_type never follows symlinks.
+            let res = match e.file_type() {
+                Ok(t) if t.is_dir() => std::fs::remove_dir_all(&p),
+                Ok(_) => std::fs::remove_file(&p),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = res {
+                errors.push(Error::Msg(format!("empty {}: {err}", p.display())));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(super::join_errors(&errors))
+    }
+}
+
+/// `externalVolumeTarget` — clean target added by `mu clean --external <PATH>`:
+/// `.directory` metadata is trashed via `SafeDelete`; `.Trash-*` directories
+/// are emptied in place (their contents are permanently removed, never trashed
+/// into themselves).
+pub(crate) fn external_volume_target_in(deps: &Deps, mount: &Path) -> CleanTarget {
+    let scan_mount = mount.to_path_buf();
+    let prev_mount = mount.to_path_buf();
+    let exec_mount = mount.to_path_buf();
+    let exec_cfg = deps.config_home.clone();
+    let exec_runner = Arc::clone(&deps.trash_runner);
+    let exec_deps = deps.trash_deps.clone();
+
+    CleanTarget {
+        id: "external-volume",
+        label: "External Volume Metadata",
+        requires_sudo: false,
+        // Only ever present when `--external` names the mount.
+        opt_in: true,
+        scan: Box::new(move || {
+            let mut total = 0i64;
+            let mut scan_errors: Vec<Error> = Vec::new();
+            for (p, _) in external_volume_entries(&scan_mount) {
+                let (sz, err) = match std::fs::symlink_metadata(&p) {
+                    Ok(m) if m.is_dir() => {
+                        let (sz, err) = size::dir_size(&p);
+                        (sz as i64, err)
+                    }
+                    Ok(m) => (m.len() as i64, None),
+                    Err(e) => (0, Some(e.into())),
+                };
+                match err {
+                    None => total += sz,
+                    Some(e) => scan_errors.push(e),
+                }
+            }
+            if scan_errors.is_empty() {
+                (total, None)
+            } else {
+                (total, Some(super::join_errors(&scan_errors)))
+            }
+        }),
+        preview: Some(Box::new(move || {
+            (
+                external_volume_entries(&prev_mount)
+                    .into_iter()
+                    .map(|(p, _)| p.to_string_lossy().into_owned())
+                    .collect(),
+                None,
+            )
+        })),
+        execute: Box::new(move |dry_run| {
+            paths::validate_cleanup_root(&exec_mount)?;
+            let mut delete_errors: Vec<Error> = Vec::new();
+            for (p, kind) in external_volume_entries(&exec_mount) {
+                if let Err(e) = paths::validate_cleanup_candidate(&exec_mount, &p) {
+                    delete_errors.push(e);
+                    continue;
+                }
+                match kind {
+                    ExternalCandidate::Metadata => {
+                        if let Err(e) = trash::safe_delete_with(
+                            &*exec_runner,
+                            &exec_cfg,
+                            &exec_deps,
+                            &p,
+                            dry_run,
+                        ) {
+                            delete_errors.push(e);
+                        }
+                    }
+                    ExternalCandidate::TrashDir => {
+                        if dry_run {
+                            oplog::log_outcome("empty-trash", &p.to_string_lossy(), "dry-run");
+                        } else {
+                            match empty_trash_dir(&p) {
+                                Ok(()) => oplog::log_outcome(
+                                    "empty-trash",
+                                    &p.to_string_lossy(),
+                                    "success",
+                                ),
+                                Err(e) => {
+                                    oplog::log_outcome(
+                                        "empty-trash",
+                                        &p.to_string_lossy(),
+                                        "failure",
+                                    );
+                                    delete_errors.push(e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if delete_errors.is_empty() {
+                Ok(())
+            } else {
+                Err(super::join_errors(&delete_errors))
+            }
+        }),
+        count_fn: None,
+    }
 }
 
 /// `JournalSize` — parses `journalctl --disk-usage` to get journal size in
@@ -562,6 +828,538 @@ fn parse_journal_disk_usage(out: &str) -> std::result::Result<(f64, String), Str
         1 => Err("EOF".to_string()),
         _ => Ok((val, unit)),
     }
+}
+
+pub(crate) fn dev_cache_target_in(deps: &Deps) -> CleanTarget {
+    let scan_home = deps.home.clone();
+    let exec_home = deps.home.clone();
+    let exec_cfg = deps.config_home.clone();
+    let exec_runner = Arc::clone(&deps.trash_runner);
+    let exec_deps = deps.trash_deps.clone();
+
+    CleanTarget {
+        id: "dev-cache",
+        label: "Developer CLI Caches",
+        requires_sudo: false,
+        opt_in: true,
+        scan: Box::new(move || {
+            let mut total: i64 = 0;
+            let mut scan_errors: Vec<Error> = Vec::new();
+            for p in dev_cache_paths(&scan_home) {
+                if paths::path_exists(&p) {
+                    let (sz, err) = crate::size::dir_size(&p);
+                    match err {
+                        None => total += sz as i64,
+                        Some(e) => scan_errors.push(e),
+                    }
+                }
+            }
+            if scan_errors.is_empty() {
+                (total, None)
+            } else {
+                (total, Some(super::join_errors(&scan_errors)))
+            }
+        }),
+        preview: None,
+        execute: Box::new(move |dry_run| {
+            let mut delete_errors: Vec<Error> = Vec::new();
+            for p in dev_cache_paths(&exec_home) {
+                if !paths::path_exists(&p) {
+                    continue;
+                }
+                let root = dev_cache_root(&exec_home, &p);
+                if let Err(e) = paths::validate_cleanup_candidate(&root, &p) {
+                    delete_errors.push(e);
+                    continue;
+                }
+                if let Err(e) =
+                    trash::safe_delete_with(&*exec_runner, &exec_cfg, &exec_deps, &p, dry_run)
+                {
+                    delete_errors.push(e);
+                }
+            }
+            if delete_errors.is_empty() {
+                Ok(())
+            } else {
+                Err(super::join_errors(&delete_errors))
+            }
+        }),
+        count_fn: None,
+    }
+}
+
+fn dev_cache_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".cache/pip"),
+        home.join(".npm/_cacache"),
+        home.join(".cargo/registry/cache"),
+        home.join(".cache/go-build"),
+    ]
+}
+
+fn dev_cache_root(home: &Path, p: &Path) -> PathBuf {
+    let cache = home.join(".cache");
+    if p.starts_with(&cache) {
+        return cache;
+    }
+    let npm = home.join(".npm");
+    if p.starts_with(&npm) {
+        return npm;
+    }
+    let cargo = home.join(".cargo");
+    if p.starts_with(&cargo) {
+        return cargo;
+    }
+    p.parent().unwrap_or(home).to_path_buf()
+}
+
+/// One line of `podman system df --format '{{json .}}'`.
+#[derive(serde::Deserialize)]
+struct PodmanDfLine {
+    #[serde(default, rename = "Reclaimable")]
+    reclaimable: String,
+}
+
+/// `parsePodmanReclaimable` — sum the `Reclaimable` column across every
+/// `podman system df` row; non-JSON and unparseable rows are skipped.
+fn parse_podman_reclaimable(json_lines: &str) -> i64 {
+    let mut total = 0i64;
+    for line in json_lines.split('\n') {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<PodmanDfLine>(line) else {
+            continue;
+        };
+        total += super::scan_docker::parse_docker_size(&entry.reclaimable);
+    }
+    total
+}
+
+pub(crate) fn podman_target_in(deps: &Deps) -> CleanTarget {
+    let scan_runner = Arc::clone(&deps.runner);
+    let preview_runner = Arc::clone(&deps.runner);
+    let exec_runner = Arc::clone(&deps.runner);
+
+    CleanTarget {
+        id: "podman",
+        label: "Podman System Cache",
+        requires_sudo: false,
+        opt_in: true,
+        scan: Box::new(move || {
+            if scan_runner.look_path("podman").is_err() {
+                return (0, None);
+            }
+            match scan_runner.run(&CommandSpec::new(
+                "podman",
+                ["system", "df", "--format", "{{json .}}"],
+            )) {
+                Err(e) => (0, Some(Error::Msg(format!("podman system df: {e}")))),
+                Ok(out) => (parse_podman_reclaimable(&out.stdout_lossy()), None),
+            }
+        }),
+        // `podman system prune -f` is irreversible and cannot route through
+        // SafeDelete. This lists the main prune classes (partial: pods,
+        // networks and build cache are not itemised) and surfaces any `ls`
+        // failure so `--yes` cannot confirm an unseen set.
+        preview: Some(Box::new(move || {
+            if preview_runner.look_path("podman").is_err() {
+                return (Vec::new(), None);
+            }
+            let mut items = Vec::new();
+            let mut errs: Vec<Error> = Vec::new();
+            for (args, prefix) in [
+                (
+                    vec![
+                        "container",
+                        "ls",
+                        "-a",
+                        "--filter",
+                        "status=exited",
+                        "--format",
+                        "{{.Names}}",
+                    ],
+                    "stopped container",
+                ),
+                (
+                    vec![
+                        "container",
+                        "ls",
+                        "-a",
+                        "--filter",
+                        "status=created",
+                        "--format",
+                        "{{.Names}}",
+                    ],
+                    "created container",
+                ),
+                (
+                    vec![
+                        "image",
+                        "ls",
+                        "--filter",
+                        "dangling=true",
+                        "--format",
+                        "{{.Repository}}:{{.Tag}}",
+                    ],
+                    "dangling image",
+                ),
+            ] {
+                match preview_runner.run(&CommandSpec::new("podman", args)) {
+                    Err(e) => errs.push(Error::Msg(format!("podman {prefix} list: {e}"))),
+                    Ok(out) => {
+                        for v in out.stdout_lossy().lines().map(str::trim) {
+                            if !v.is_empty() {
+                                items.push(format!("{prefix}: {v}"));
+                            }
+                        }
+                    }
+                }
+            }
+            if errs.is_empty() {
+                (items, None)
+            } else {
+                (items, Some(super::join_errors(&errs)))
+            }
+        })),
+        execute: Box::new(move |dry_run| {
+            if exec_runner.look_path("podman").is_err() {
+                return Ok(());
+            }
+            if dry_run {
+                oplog::log_outcome("podman", "system prune -f", "dry-run");
+                return Ok(());
+            }
+            match exec_runner.run(&CommandSpec::new("podman", ["system", "prune", "-f"])) {
+                Ok(_) => {
+                    oplog::log_outcome("podman", "system prune -f", "success");
+                    Ok(())
+                }
+                Err(e) => {
+                    oplog::log_outcome("podman", "system prune -f", "failure");
+                    Err(Error::Msg(format!("podman system prune: {e}")))
+                }
+            }
+        }),
+        count_fn: None,
+    }
+}
+
+pub(crate) fn orphaned_app_data_target_in(deps: &Deps) -> CleanTarget {
+    let scan_home = deps.home.clone();
+    let scan_cfg = deps.config_home.clone();
+    let scan_data = deps.data_home.clone();
+    let scan_runner = Arc::clone(&deps.runner);
+
+    let preview_home = deps.home.clone();
+    let preview_cfg = deps.config_home.clone();
+    let preview_data = deps.data_home.clone();
+    let preview_runner = Arc::clone(&deps.runner);
+
+    let exec_home = deps.home.clone();
+    let exec_cfg = deps.config_home.clone();
+    let exec_data = deps.data_home.clone();
+    // Discovery at execute time uses the same runner as scan/preview; the
+    // trash runner is only for SafeDelete (gio/trash), never for discovery.
+    let exec_disc_runner = Arc::clone(&deps.runner);
+    let exec_runner = Arc::clone(&deps.trash_runner);
+    let exec_deps = deps.trash_deps.clone();
+
+    CleanTarget {
+        id: "orphaned-app-data",
+        label: "Orphaned Application Data",
+        requires_sudo: false,
+        opt_in: true,
+        // Fail closed: a discovery error aborts the scan instead of treating
+        // the effective "installed" set as empty.
+        scan: Box::new(move || {
+            match find_orphaned_apps(&scan_home, &scan_cfg, &scan_data, scan_runner.as_ref()) {
+                Err(e) => (0, Some(e)),
+                Ok(candidates) => {
+                    let mut total: i64 = 0;
+                    for p in &candidates {
+                        let (sz, _) = size::dir_size(p);
+                        total += sz as i64;
+                    }
+                    (total, None)
+                }
+            }
+        }),
+        // Per-path preview: the heuristic can catch user data from non-apt
+        // installs, so the user must see each path (and its size) before --yes.
+        preview: Some(Box::new(move || {
+            match find_orphaned_apps(
+                &preview_home,
+                &preview_cfg,
+                &preview_data,
+                preview_runner.as_ref(),
+            ) {
+                Err(e) => (Vec::new(), Some(e)),
+                Ok(candidates) => {
+                    let items = candidates
+                        .iter()
+                        .map(|p| {
+                            let (sz, _) = size::dir_size(p);
+                            format!("{} ({})", p.display(), size::human_size(sz as i64))
+                        })
+                        .collect();
+                    (items, None)
+                }
+            }
+        })),
+        execute: Box::new(move |dry_run| {
+            let candidates =
+                find_orphaned_apps(&exec_home, &exec_cfg, &exec_data, exec_disc_runner.as_ref())?;
+            let mut delete_errors: Vec<Error> = Vec::new();
+            for p in candidates {
+                let root = if p.starts_with(&exec_cfg) {
+                    &exec_cfg
+                } else {
+                    &exec_data
+                };
+                if let Err(e) = paths::validate_cleanup_candidate(root, &p) {
+                    delete_errors.push(e);
+                    continue;
+                }
+                if let Err(e) =
+                    trash::safe_delete_with(&*exec_runner, &exec_cfg, &exec_deps, &p, dry_run)
+                {
+                    delete_errors.push(e);
+                }
+            }
+            if delete_errors.is_empty() {
+                Ok(())
+            } else {
+                Err(super::join_errors(&delete_errors))
+            }
+        }),
+        count_fn: None,
+    }
+}
+
+fn find_orphaned_apps(
+    home: &Path,
+    config_home: &Path,
+    data_home: &Path,
+    runner: &dyn Runner,
+) -> Result<Vec<PathBuf>> {
+    if home.as_os_str().is_empty() {
+        return Ok(Vec::new());
+    }
+    // `PROTECTED_*` is a conservative guard: known user-data dirs that do not
+    // map cleanly to a package name and must never be treated as orphans.
+    const PROTECTED_CONFIG: &[&str] = &[
+        "dconf",
+        "pulse",
+        "systemd",
+        "autostart",
+        "gtk-3.0",
+        "gtk-4.0",
+        "glib-2.0",
+        "fontconfig",
+        "ibus",
+        "gnome-session",
+        "environment.d",
+        "mu",
+        "mimeapps.list",
+        "user-dirs.dirs",
+        "user-dirs.locale",
+        "gnome-control-center",
+        "BraveSoftware",
+        "google-chrome",
+        "chromium",
+        "microsoft-edge",
+        "mozilla",
+        "JetBrains",
+        "atuin",
+        "containers",
+        "TelegramDesktop",
+        "Anki2",
+    ];
+    const PROTECTED_DATA: &[&str] = &[
+        "Trash",
+        "applications",
+        "icons",
+        "themes",
+        "fonts",
+        "mime",
+        "keyrings",
+        "systemd",
+        "mu",
+        "flatpak",
+        "gvfs-metadata",
+        "sounds",
+        "desktop-directories",
+        "JetBrains",
+        "atuin",
+        "containers",
+        "TelegramDesktop",
+        "Anki2",
+    ];
+
+    let mut installed = std::collections::HashSet::new();
+    // Discovery failures abort (fail closed) — an empty set would otherwise
+    // make every package-owned dir look orphaned.
+    let apt_pkgs = crate::uninstall::discover::discover_apt(runner)
+        .map_err(|e| Error::Msg(format!("orphaned-app-data: discover apt: {e}")))?;
+    for p in apt_pkgs {
+        installed.insert(p.name.to_lowercase());
+        if let Some(alias) = crate::uninstall::remnants::known_alias(&p.name) {
+            installed.insert(alias.to_lowercase());
+        }
+    }
+    let snap_pkgs = crate::uninstall::discover::discover_snap(runner)
+        .map_err(|e| Error::Msg(format!("orphaned-app-data: discover snap: {e}")))?;
+    for p in snap_pkgs {
+        installed.insert(p.name.to_lowercase());
+        if let Some(alias) = crate::uninstall::remnants::known_alias(&p.name) {
+            installed.insert(alias.to_lowercase());
+        }
+    }
+    // `discover_flatpak` is empty when flatpak is absent and errors only on a
+    // real command failure.
+    let flatpak_pkgs = crate::uninstall::discover::discover_flatpak(runner)
+        .map_err(|e| Error::Msg(format!("orphaned-app-data: discover flatpak: {e}")))?;
+    for p in flatpak_pkgs {
+        let id = p.name.to_lowercase();
+        installed.insert(id.clone());
+        if let Some(last) = id.split('.').next_back() {
+            installed.insert(last.to_string());
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(config_home) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if PROTECTED_CONFIG
+                .iter()
+                .any(|&prot| prot.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            let lower = name.to_lowercase();
+            if installed.contains(&lower) {
+                continue;
+            }
+            if runner.look_path(name).is_ok() || runner.look_path(&lower).is_ok() {
+                continue;
+            }
+            candidates.push(p);
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(data_home) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if PROTECTED_DATA
+                .iter()
+                .any(|&prot| prot.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            let lower = name.to_lowercase();
+            if installed.contains(&lower) {
+                continue;
+            }
+            if runner.look_path(name).is_ok() || runner.look_path(&lower).is_ok() {
+                continue;
+            }
+            candidates.push(p);
+        }
+    }
+    candidates.sort();
+    Ok(candidates)
+}
+
+pub(crate) fn orphaned_services_target_in(deps: &Deps) -> CleanTarget {
+    let scan_cfg = deps.config_home.clone();
+    let preview_cfg = deps.config_home.clone();
+    let exec_cfg = deps.config_home.clone();
+    let exec_runner = Arc::clone(&deps.trash_runner);
+    let exec_deps = deps.trash_deps.clone();
+
+    CleanTarget {
+        id: "orphaned-services",
+        label: "Orphaned User Services",
+        requires_sudo: false,
+        opt_in: true,
+        // Broken enablement symlinks live in `<target>.wants/` subdirs, so the
+        // scan recurses the whole user unit tree rather than its top level.
+        scan: Box::new(move || {
+            let broken = find_broken_service_symlinks(&scan_cfg);
+            let total = broken.iter().map(|p| symlink_len(p)).sum();
+            (total, None)
+        }),
+        preview: Some(Box::new(move || {
+            let broken = find_broken_service_symlinks(&preview_cfg);
+            let items = broken
+                .iter()
+                .map(|p| format!("{} (broken symlink)", p.display()))
+                .collect();
+            (items, None)
+        })),
+        execute: Box::new(move |dry_run| {
+            let broken = find_broken_service_symlinks(&exec_cfg);
+            let mut delete_errors: Vec<Error> = Vec::new();
+            for p in broken {
+                if let Err(e) =
+                    trash::safe_delete_with(&*exec_runner, &exec_cfg, &exec_deps, &p, dry_run)
+                {
+                    delete_errors.push(e);
+                }
+            }
+            if delete_errors.is_empty() {
+                Ok(())
+            } else {
+                Err(super::join_errors(&delete_errors))
+            }
+        }),
+        count_fn: None,
+    }
+}
+
+/// Recursively collect dangling symlinks under `<config_home>/systemd/user`
+/// (including `*.wants/`), without following symlinked directories.
+fn find_broken_service_symlinks(config_home: &Path) -> Vec<PathBuf> {
+    let mut broken = Vec::new();
+    collect_broken_symlinks(&config_home.join("systemd/user"), &mut broken);
+    broken.sort();
+    broken
+}
+
+fn collect_broken_symlinks(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Ok(meta) = p.symlink_metadata() else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            if std::fs::metadata(&p).is_err() {
+                out.push(p);
+            }
+        } else if meta.is_dir() {
+            collect_broken_symlinks(&p, out);
+        }
+    }
+}
+
+/// `os.Lstat().Size()` — the byte length of the symlink target string.
+fn symlink_len(p: &Path) -> i64 {
+    std::fs::symlink_metadata(p)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -923,5 +1721,293 @@ mod tests {
             calls[0].args,
             ["LC_ALL=C", "journalctl", "--disk-usage"].map(std::ffi::OsString::from)
         );
+    }
+
+    // Finding 5: without `gio` the trash target must fail instead of reporting
+    // a silent no-op success that `execute` credits as freed space.
+    #[test]
+    fn system_trash_fails_closed_without_gio() {
+        let tmp = tempdir("trash-nogio");
+        let deps = deps_for_test(&tmp, Arc::new(FakeRunner::new())); // gio missing
+        let target = system_trash_target_in(&deps);
+        let err = (target.execute)(false).expect_err("expected gio-missing failure");
+        assert!(
+            err.to_string().contains("gio not found"),
+            "unexpected error: {err}"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Finding 2 (review r1): `--external <PATH>` must empty `.Trash-*`
+    // in place (never trash the trash into itself) and SafeDelete `.directory`.
+    #[test]
+    fn external_volume_target_cleans_metadata() {
+        let tmp = tempdir("external");
+        let mount = tmp.join("mnt");
+        let trash = mount.join(".Trash-1000");
+        fs::create_dir_all(trash.join("files")).unwrap();
+        fs::create_dir_all(trash.join("info")).unwrap();
+        fs::write(trash.join("files").join("junk"), "x").unwrap();
+        fs::write(trash.join("info").join("junk.trashinfo"), "meta").unwrap();
+        fs::write(mount.join(".directory"), "meta").unwrap();
+        let runner = Arc::new(FakeRunner::new());
+        let deps = deps_for_test(&tmp, runner);
+        let target = external_volume_target_in(&deps, &mount);
+        let (sz, err) = (target.scan)();
+        assert!(err.is_none(), "scan error: {err:?}");
+        assert!(sz > 0, "expected non-zero scan size, got {sz}");
+
+        (target.execute)(true).expect("dry-run execute");
+        assert!(mount.join(".directory").exists(), "dry-run deleted a file");
+        assert!(
+            trash.join("files").join("junk").exists(),
+            "dry-run emptied trash"
+        );
+
+        (target.execute)(false).expect("real execute");
+        assert!(!mount.join(".directory").exists(), ".directory not removed");
+        assert!(trash.exists(), "trash dir itself must be kept");
+        assert!(
+            !trash.join("files").join("junk").exists(),
+            "trash files/ contents not emptied"
+        );
+        assert!(
+            !trash.join("info").join("junk.trashinfo").exists(),
+            "trash info/ contents not emptied"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Finding 1 (review r2): a symlinked `files/`/`info/`/`expunged/` on an
+    // untrusted external volume must never be followed out of the mount.
+    #[test]
+    fn external_volume_refuses_symlinked_trash_subdir() {
+        for sub in ["files", "info", "expunged"] {
+            let tmp = tempdir("ext-symlink");
+            let mount = tmp.join("mnt");
+            let trash = mount.join(".Trash-1000");
+            fs::create_dir_all(&trash).unwrap();
+            // A directory OUTSIDE the mount that must never be touched.
+            let outside = tmp.join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(outside.join("victim"), "keep").unwrap();
+            // <mount>/.Trash-1000/<sub> -> ../outside (absolute symlink)
+            std::os::unix::fs::symlink(&outside, trash.join(sub)).unwrap();
+
+            let deps = deps_for_test(&tmp, Arc::new(FakeRunner::new()));
+            let target = external_volume_target_in(&deps, &mount);
+            let err = (target.execute)(false).expect_err("expected refusal");
+            assert!(
+                err.to_string().contains("symlinked trash subdir"),
+                "sub={sub} unexpected error: {err}"
+            );
+            assert!(
+                outside.join("victim").exists(),
+                "sub={sub}: file outside the mount was deleted"
+            );
+            fs::remove_dir_all(&tmp).ok();
+        }
+    }
+
+    // Finding 1 (review p3 f1): a package-discovery failure must abort the
+    // orphan scan instead of treating the installed set as empty, and execute
+    // must delete nothing.
+    #[test]
+    fn orphaned_app_data_fails_closed_on_discovery_error() {
+        use crate::runner::RunError;
+        let tmp = tempdir("orphan-fail");
+        let cfg = tmp.join(".config");
+        let data = tmp.join("data-home");
+        fs::create_dir_all(cfg.join("ghostapp")).unwrap();
+        fs::write(cfg.join("ghostapp/x"), "user data").unwrap();
+        fs::create_dir_all(&data).unwrap();
+
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_handler(|spec| {
+            if spec.program.to_string_lossy() == "dpkg-query" {
+                return Err(RunError::Spawn(std::io::Error::other("dpkg lock held")));
+            }
+            Ok(Output::default())
+        });
+        // Execute discovers through the same runner as scan/preview (finding 3
+        // fix), so no repointing is needed here.
+        let deps = deps_for_test(&tmp, runner.clone() as Arc<dyn Runner>);
+        let target = orphaned_app_data_target_in(&deps);
+
+        let (_sz, err) = (target.scan)();
+        assert!(err.is_some(), "scan must fail closed on discovery error");
+        let exec_err = (target.execute)(false).expect_err("execute must refuse");
+        assert!(
+            exec_err.to_string().contains("discover apt"),
+            "unexpected error: {exec_err}"
+        );
+        assert!(
+            cfg.join("ghostapp").exists(),
+            "fail-closed execute deleted user data"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Finding 2 (review p3 f2): preview lists every candidate path (not just a
+    // total) and protected user-data dirs are excluded.
+    #[test]
+    fn orphaned_app_data_preview_lists_paths_and_protects_user_data() {
+        let tmp = tempdir("orphan-preview");
+        let cfg = tmp.join(".config");
+        let data = tmp.join("data-home");
+        fs::create_dir_all(cfg.join("ghostapp")).unwrap();
+        fs::write(cfg.join("ghostapp/x"), "hello").unwrap();
+        fs::create_dir_all(data.join("ghostdata")).unwrap();
+        fs::write(data.join("ghostdata/y"), "world").unwrap();
+        // Protected data dir (podman images/volumes) — never a candidate.
+        fs::create_dir_all(data.join("containers")).unwrap();
+        fs::write(data.join("containers/z"), "podman images").unwrap();
+
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_handler(|spec| {
+            if spec.program.to_string_lossy() == "dpkg-query" {
+                return Ok(Output {
+                    stdout: b"install ok installed\t10\tfoo\t1.0\n".to_vec(),
+                    ..Default::default()
+                });
+            }
+            Ok(Output::default())
+        });
+        let deps = deps_for_test(&tmp, runner);
+        let target = orphaned_app_data_target_in(&deps);
+
+        let (items, err) = (target.preview.as_ref().expect("preview must exist"))();
+        assert!(err.is_none(), "preview error: {err:?}");
+        let joined = items.join("\n");
+        assert!(
+            joined.contains(&cfg.join("ghostapp").display().to_string()),
+            "missing config candidate in preview: {joined}"
+        );
+        assert!(
+            joined.contains(&data.join("ghostdata").display().to_string()),
+            "missing data candidate in preview: {joined}"
+        );
+        assert!(
+            !joined.contains("containers"),
+            "protected dir must not be listed: {joined}"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Finding 3 (review p3 f3): the Podman target reports a size from
+    // `podman system df` and lists what prune would remove.
+    #[test]
+    fn podman_reports_size_and_previews_targets() {
+        let tmp = tempdir("podman");
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_look_path("podman", "/usr/bin/podman");
+        runner.set_handler(|spec| {
+            let prog = spec.program.to_string_lossy();
+            let args: Vec<String> = spec
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let has = |needle: &str| args.iter().any(|a| a == needle);
+            if prog == "podman" && has("df") {
+                return Ok(Output {
+                    stdout: b"{\"Type\":\"Images\",\"Reclaimable\":\"1.5GB\"}\n\
+{\"Type\":\"Containers\",\"Reclaimable\":\"512MB\"}\n"
+                        .to_vec(),
+                    ..Default::default()
+                });
+            }
+            if prog == "podman" && has("container") {
+                return Ok(Output {
+                    stdout: b"oldctr\n".to_vec(),
+                    ..Default::default()
+                });
+            }
+            if prog == "podman" && has("image") {
+                return Ok(Output {
+                    stdout: b"<none>:<none>\n".to_vec(),
+                    ..Default::default()
+                });
+            }
+            Ok(Output::default())
+        });
+        let deps = deps_for_test(&tmp, runner.clone() as Arc<dyn Runner>);
+        let target = podman_target_in(&deps);
+
+        let (sz, err) = (target.scan)();
+        assert!(err.is_none(), "scan error: {err:?}");
+        let want = (1.5 * 1024.0 * 1024.0 * 1024.0) as i64 + 512 * 1024 * 1024;
+        assert_eq!(sz, want, "podman reclaimable size");
+
+        let (items, perr) = (target.preview.as_ref().expect("preview"))();
+        assert!(perr.is_none());
+        let joined = items.join("\n");
+        assert!(joined.contains("stopped container: oldctr"), "{joined}");
+        assert!(joined.contains("created container: oldctr"), "{joined}");
+        assert!(joined.contains("dangling image: <none>:<none>"), "{joined}");
+
+        (target.execute)(true).expect("dry-run execute");
+        assert!(
+            !runner
+                .invocations()
+                .iter()
+                .any(|s| s.args.iter().any(|a| a == "prune")),
+            "dry-run must not invoke podman prune"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Review r1 f2: a failed `podman ls` surfaces as a preview error instead of
+    // silently showing nothing.
+    #[test]
+    fn podman_preview_surfaces_list_errors() {
+        use crate::runner::RunError;
+        let tmp = tempdir("podman-err");
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_look_path("podman", "/usr/bin/podman");
+        runner.set_handler(|spec| {
+            let args: Vec<String> = spec
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            if spec.program.to_string_lossy() == "podman" && args.iter().any(|a| a == "container") {
+                return Err(RunError::Spawn(std::io::Error::other("storage lock")));
+            }
+            Ok(Output::default())
+        });
+        let deps = deps_for_test(&tmp, runner.clone() as Arc<dyn Runner>);
+        let target = podman_target_in(&deps);
+
+        let (items, err) = (target.preview.as_ref().expect("preview"))();
+        assert!(items.is_empty(), "items={items:?}");
+        assert!(err.is_some(), "preview must propagate ls errors");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Finding 5 (review p3 f5): the scan recurses `*.wants/`, honors the
+    // configured config home, and reports the real symlink size.
+    #[test]
+    fn orphaned_services_scans_wants_dirs_and_reports_real_size() {
+        let tmp = tempdir("svc");
+        let cfg = tmp.join(".config");
+        let wants = cfg.join("systemd/user/default.target.wants");
+        fs::create_dir_all(&wants).unwrap();
+        let target_path = "/nonexistent/ghost.service";
+        std::os::unix::fs::symlink(target_path, wants.join("ghost.service")).unwrap();
+        // A valid symlink and a plain file are not orphans.
+        std::os::unix::fs::symlink("/bin/true", cfg.join("systemd/user/real.service")).unwrap();
+        fs::write(cfg.join("systemd/user/plain.service"), "x").unwrap();
+
+        let deps = deps_for_test(&tmp, Arc::new(FakeRunner::new()));
+        let target = orphaned_services_target_in(&deps);
+        let (sz, err) = (target.scan)();
+        assert!(err.is_none());
+        assert_eq!(sz, target_path.len() as i64, "reported size={sz}");
+        let (items, perr) = (target.preview.as_ref().expect("preview"))();
+        assert!(perr.is_none());
+        assert_eq!(items.len(), 1, "items={items:?}");
+        assert!(items[0].contains("ghost.service"), "{items:?}");
+        fs::remove_dir_all(&tmp).ok();
     }
 }

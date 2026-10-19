@@ -136,6 +136,9 @@ pub(crate) enum RunDispatch {
 pub(crate) struct FlowModel {
     opts: Options,
     targets: Vec<CleanTarget>,
+    /// Display labels captured once at construction (`count_fn` may read the
+    /// filesystem) so the render path is free of filesystem reads.
+    display_labels: Vec<String>,
     /// `state` — pub(crate) so the driver can cheaply test Scanning/Running.
     pub(crate) state: FlowState,
     /// Terminal width from `WindowSize`; default 80.
@@ -175,9 +178,13 @@ struct Scanned {
 impl FlowModel {
     /// `newFlowModel`.
     pub(crate) fn new(opts: Options, targets: Vec<CleanTarget>) -> Self {
+        // Compute the display labels once, not on every render tick (finding 7
+        // r1: `display_label` may read the filesystem for the trash count).
+        let display_labels = targets.iter().map(CleanTarget::display_label).collect();
         Self {
             opts,
             targets,
+            display_labels,
             state: FlowState::Scanning,
             width: 80,
             spinner_idx: 0,
@@ -464,8 +471,8 @@ impl FlowModel {
         let mut s = format!("  {} Scanning system", SPINNER_FRAMES[self.spinner_idx]);
         let done = self.results.len();
         if done > 0 {
-            let label = if done < self.targets.len() {
-                format!(": {}", self.targets[done].label)
+            let label = if done < self.display_labels.len() {
+                format!(": {}", self.display_labels[done])
             } else {
                 String::new()
             };
@@ -489,9 +496,9 @@ impl FlowModel {
             size_w = size_w.max(size::human_size(res.size).chars().count());
         }
         let mut label_w = self
-            .targets
+            .display_labels
             .iter()
-            .map(|t| t.label.chars().count())
+            .map(|l| l.chars().count())
             .max()
             .unwrap_or(0);
         let max = self.width.saturating_sub(size_w + 6);
@@ -514,7 +521,7 @@ impl FlowModel {
             ),
         ];
         for (i, res) in self.results.iter().enumerate() {
-            let label = truncate(self.targets[i].label, label_w as isize);
+            let label = truncate(&self.display_labels[i], label_w as isize);
             lines.push(Line::raw(format!(
                 "  {label}{}{:>size_w$}",
                 pad(&label),
@@ -802,6 +809,7 @@ mod tests {
                             Ok(())
                         }
                     }),
+                    count_fn: None,
                 }
             })
             .collect()
@@ -1047,6 +1055,7 @@ mod tests {
                 )
             })),
             execute: Box::new(|_| Ok(())),
+            count_fn: None,
         };
         let m = FlowModel::new(Options::default(), vec![target]);
         let Msg::ScanTarget(sm) = m.scan_cmd(0) else {
@@ -1143,6 +1152,7 @@ mod tests {
                 scan: Box::new(|| (0, None)),
                 preview: None,
                 execute: Box::new(|_| Ok(())),
+                count_fn: None,
             }
         }
         fn plain_target() -> CleanTarget {
@@ -1154,6 +1164,7 @@ mod tests {
                 scan: Box::new(|| (0, None)),
                 preview: None,
                 execute: Box::new(|_| Ok(())),
+                count_fn: None,
             }
         }
 
@@ -1198,5 +1209,43 @@ mod tests {
             panic!("dry-run sudo target run_cmd = want ItemDone msg")
         };
         assert!(done.err.is_none());
+    }
+
+    // Finding 6: the interactive summary must render the dynamic
+    // system-trash item count (`display_label`), not the static label.
+    #[test]
+    fn summary_shows_system_trash_item_count() {
+        let target = CleanTarget {
+            id: "system-trash",
+            label: "System Trash",
+            requires_sudo: false,
+            opt_in: true,
+            scan: Box::new(|| (SIZE_A, None)),
+            preview: None,
+            execute: Box::new(|_| Ok(())),
+            count_fn: Some(Box::new(|| "System Trash (2 items)".to_string())),
+        };
+        let mut m = FlowModel::new(Options::default(), vec![target]);
+        m.results = vec![Scanned {
+            size: SIZE_A,
+            items: Vec::new(),
+        }];
+        m.total = SIZE_A;
+        m.state = FlowState::Summary;
+        let text: String = m
+            .view_lines()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("System Trash (2 items)"),
+            "summary missing dynamic count label: {text:?}"
+        );
     }
 }

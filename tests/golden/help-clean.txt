@@ -17,6 +17,7 @@ Usage:
 
 Flags:
       --dry-run           Preview actions without making changes
+      --external string   Clean metadata on an external volume (mount path)
   -h, --help              help for clean
       --include strings   Opt-in categories (e.g. browser-cache)
   -y, --yes               Skip confirmation prompt

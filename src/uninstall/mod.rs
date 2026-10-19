@@ -20,7 +20,7 @@ pub(crate) mod model;
 pub(crate) mod remnants;
 pub(crate) mod remove;
 
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -42,12 +42,20 @@ pub(crate) use model::{Phase, UninstallModel};
 pub(crate) use remove::remove_selected_in;
 
 /// `uninstall.Options` — controls uninstall behavior.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Options {
     /// `DryRun` — preview actions without making changes.
     pub dry_run: bool,
     /// `Debug` — verbose logging (warn when the ops log cannot open).
     pub debug: bool,
+    /// `List` — list installed packages and exit.
+    pub list: bool,
+    /// `Permanent` — bypass trash (rejected for safety).
+    pub permanent: bool,
+    /// `Packages` — direct CLI package names to remove.
+    pub packages: Vec<String>,
+    /// `Yes` — skip the confirmation gate for direct CLI removal.
+    pub auto_yes: bool,
 }
 
 /// Dependency bundle replacing the Go package vars. `runner` is
@@ -153,7 +161,7 @@ fn finish_with_items(
     out: &mut dyn Write,
     err_out: &mut dyn Write,
 ) -> i32 {
-    let mut model = crate::uninstall::model::new_model(*opts);
+    let mut model = crate::uninstall::model::new_model(opts.clone());
     model.phase = Phase::Done;
     for it in items.iter().filter(|it| it.selected) {
         model.selected.insert(it.pkg.key(), true);
@@ -181,6 +189,39 @@ pub(crate) fn run_in(opts: &Options, deps: &Deps, err_out: &mut dyn Write) -> i3
     }
     let _log = CloseLoggerGuard;
 
+    // Reject --permanent with exit code 1 and explanatory safety error
+    if opts.permanent {
+        let _ = writeln!(
+            err_out,
+            "error: --permanent is rejected: mu enforces SafeDelete via trash only to guarantee recoverability. To free space after uninstalling, review and empty trash via 'gio trash --empty' or 'mu clean --include=system-trash'."
+        );
+        return 1;
+    }
+
+    // Handle --list
+    if opts.list {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let (pkgs, err) = discover(&*deps.runner);
+        if let Some(e) = err
+            && opts.debug
+        {
+            let _ = writeln!(err_out, "warn: discovery errors: {e}");
+        }
+        for pkg in pkgs {
+            let sz = crate::size::human_kb(pkg.installed_kb as u64);
+            let _ = writeln!(out, "{}:{} ({})", pkg.source, pkg.name, sz);
+        }
+        return 0;
+    }
+
+    // Handle direct CLI package uninstall
+    if !opts.packages.is_empty() {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        return run_cli_uninstall(opts, deps, &mut out, err_out, &mut confirm_stdin);
+    }
+
     // Go: `tea.NewProgram(m, tea.WithAltScreen()).Run()` is the only path.
     // A headless run fails inside tea's program init with
     // `could not open a new TTY: open /dev/tty: no such device or address`,
@@ -192,7 +233,6 @@ pub(crate) fn run_in(opts: &Options, deps: &Deps, err_out: &mut dyn Write) -> i3
         );
         return 1;
     }
-
     // TTY: the interactive TUI returns its full item list with selected
     // flags (None when they quit/abort — Go's `final.phase != phaseDone` →
     // nil → exit 0).
@@ -245,6 +285,169 @@ pub(crate) fn finish(
     }
     let _ = writeln!(out, "\nUninstall complete.");
     0
+}
+/// Outcome of the direct-CLI confirmation gate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ConfirmOutcome {
+    Confirmed,
+    Declined,
+    NonInteractive,
+}
+
+/// Confirmation source for the direct-CLI removal gate — injected so tests
+/// never read the real process stdin.
+pub(crate) type ConfirmFn<'a> = &'a mut dyn FnMut(usize) -> ConfirmOutcome;
+
+/// Production confirmation: prompt on a TTY, fail closed otherwise.
+fn confirm_stdin(count: usize) -> ConfirmOutcome {
+    if !std::io::stdin().is_terminal() {
+        return ConfirmOutcome::NonInteractive;
+    }
+    eprint!("Proceed with removal of {count} package(s)? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    match std::io::stdin().lock().read_line(&mut line) {
+        Ok(_) => {
+            let answer = line.trim().to_ascii_lowercase();
+            if answer == "y" || answer == "yes" {
+                ConfirmOutcome::Confirmed
+            } else {
+                ConfirmOutcome::Declined
+            }
+        }
+        Err(_) => ConfirmOutcome::Declined,
+    }
+}
+
+fn run_cli_uninstall(
+    opts: &Options,
+    deps: &Deps,
+    out: &mut dyn Write,
+    err_out: &mut dyn Write,
+    confirm: ConfirmFn,
+) -> i32 {
+    let (all_installed, err) = discover(&*deps.runner);
+    if let Some(e) = err
+        && opts.debug
+    {
+        let _ = writeln!(err_out, "warn: discovery error: {e}");
+    }
+    let mut selected = Vec::new();
+    for target in &opts.packages {
+        // A source-qualified key (`apt:foo`, `snap:foo`) is unambiguous.
+        if let Some(pkg) = all_installed.iter().find(|p| p.key() == *target) {
+            selected.push(with_remnants(deps, pkg));
+            continue;
+        }
+        let by_name: Vec<&Package> = all_installed.iter().filter(|p| p.name == *target).collect();
+        match by_name.as_slice() {
+            [] => {
+                // No package by that name — a Steam game of the same name is a
+                // first-class candidate that delegates to Steam's uninstaller.
+                match remnants::steam_delegations(deps, target).as_slice() {
+                    [game] => selected.push(Package {
+                        name: target.clone(),
+                        version: game.name.clone(),
+                        source: "steam".to_string(),
+                        ..Default::default()
+                    }),
+                    [] => {
+                        let _ = writeln!(err_out, "error: package '{target}' not found");
+                        return 1;
+                    }
+                    many => {
+                        let names: Vec<&str> = many.iter().map(|g| g.name.as_str()).collect();
+                        let _ = writeln!(
+                            err_out,
+                            "error: '{target}' is ambiguous; matches {} Steam game(s)",
+                            names.join(", ")
+                        );
+                        return 1;
+                    }
+                }
+            }
+            [pkg] => selected.push(with_remnants(deps, pkg)),
+            many => {
+                // Fail closed instead of silently purging whichever source
+                // sorts first.
+                let keys: Vec<String> = many.iter().map(|p| p.key()).collect();
+                let _ = writeln!(
+                    err_out,
+                    "error: '{target}' is ambiguous; matches {} — specify a source prefix (e.g. {})",
+                    keys.join(", "),
+                    keys[0]
+                );
+                return 1;
+            }
+        }
+    }
+
+    // Dry-run header comes before the plan it introduces.
+    if opts.dry_run {
+        let _ = writeln!(out, "Dry run: previewing package removal plan.");
+    }
+    // Always print the removal plan so the action is previewable before any
+    // package is touched.
+    for pkg in &selected {
+        let _ = writeln!(
+            out,
+            "Package to remove: {}:{} ({})",
+            pkg.source,
+            pkg.name,
+            crate::size::human_kb(pkg.installed_kb as u64)
+        );
+        if !pkg.remnants_found.is_empty() {
+            let _ = writeln!(out, "Remnants to remove:");
+            for r in &pkg.remnants_found {
+                let _ = writeln!(out, "  - {r}");
+            }
+        }
+    }
+
+    if opts.dry_run {
+        let results = remove_selected_in(deps, &selected, &all_installed, true, out, err_out);
+        if let Some(e) = removal_errors(&results) {
+            let _ = writeln!(err_out, "error: {e}");
+            return 1;
+        }
+        return 0;
+    }
+
+    // Fail-closed confirmation gate (finding: unprompted `apt-get purge -y`).
+    if !opts.auto_yes {
+        match confirm(selected.len()) {
+            ConfirmOutcome::Confirmed => {}
+            ConfirmOutcome::Declined => {
+                let _ = writeln!(out, "Aborted.");
+                return 0;
+            }
+            ConfirmOutcome::NonInteractive => {
+                let _ = writeln!(
+                    out,
+                    "Non-interactive: pass --yes to confirm, or --dry-run to preview."
+                );
+                let _ = writeln!(out, "Aborted.");
+                return 0;
+            }
+        }
+    }
+
+    let results = remove_selected_in(deps, &selected, &all_installed, false, out, err_out);
+    if let Some(e) = removal_errors(&results) {
+        let _ = writeln!(err_out, "error: {e}");
+        return 1;
+    }
+    let _ = writeln!(out, "\nUninstall complete.");
+    0
+}
+
+/// Clone a discovered package and attach its remnant scan (shared by every
+/// direct-CLI resolution branch).
+fn with_remnants(deps: &Deps, pkg: &Package) -> Package {
+    let mut pkg = pkg.clone();
+    pkg.remnants_found = remnants::find_remnants_in(deps, &pkg.name);
+    pkg.remnants_kb = remnants::remnant_size(&pkg.remnants_found) / 1024;
+    pkg
 }
 
 /// `defer utils.CloseLogger()` — closes on drop at every return path.
@@ -346,6 +549,7 @@ mod tests {
         let opts = Options {
             dry_run: false,
             debug: false,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let mut err_out = Vec::new();
@@ -415,6 +619,7 @@ mod tests {
         let opts = Options {
             dry_run: false,
             debug: false,
+            ..Default::default()
         };
         let mut out = Vec::new();
         let mut err_out = Vec::new();
@@ -443,6 +648,7 @@ mod tests {
             &Options {
                 dry_run: true,
                 debug: false,
+                ..Default::default()
             },
             &deps,
             &mut err_out,
@@ -452,6 +658,270 @@ mod tests {
         assert!(
             text.contains("invalid mu configuration"),
             "expected config error, got {text:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_rejects_permanent_flag_with_code_1() {
+        let root = tempdir("perm");
+        let deps = deps_for_test(&root, Arc::new(FakeRunner::new()));
+        let mut err_out = Vec::new();
+        let code = run_in(
+            &Options {
+                permanent: true,
+                ..Default::default()
+            },
+            &deps,
+            &mut err_out,
+        );
+        assert_eq!(code, 1);
+        let text = String::from_utf8_lossy(&err_out);
+        assert!(
+            text.contains("error: --permanent is rejected: mu enforces SafeDelete via trash only")
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_direct_cli_uninstall_dry_run() {
+        let root = tempdir("direct-dry");
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_look_path("dpkg-query", "/usr/bin/dpkg-query");
+        runner.set_handler(|spec| {
+            if spec.program == "dpkg-query" {
+                return Ok(crate::runner::Output {
+                    stdout: b"install ok installed\t1024\ttest-pkg\t1.0.0\n".to_vec(),
+                    ..Default::default()
+                });
+            }
+            Ok(crate::runner::Output::default())
+        });
+        let deps = deps_for_test(&root, runner);
+        let mut err_out = Vec::new();
+        let code = run_in(
+            &Options {
+                dry_run: true,
+                packages: vec!["test-pkg".to_string()],
+                ..Default::default()
+            },
+            &deps,
+            &mut err_out,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn runner_with_pkg(pkgs: &'static str) -> Arc<FakeRunner> {
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_look_path("dpkg-query", "/usr/bin/dpkg-query");
+        runner.set_handler(move |spec| {
+            if spec.program == "dpkg-query" {
+                return Ok(crate::runner::Output {
+                    stdout: pkgs.as_bytes().to_vec(),
+                    ..Default::default()
+                });
+            }
+            Ok(crate::runner::Output::default())
+        });
+        runner
+    }
+
+    fn purge_invoked(runner: &FakeRunner, name: &str) -> bool {
+        runner.invocations().iter().any(|s| {
+            s.program == "sudo"
+                && s.args == ["apt-get", "purge", "-y", name].map(std::ffi::OsString::from)
+        })
+    }
+
+    // Finding 1 (r1): direct CLI removal must not purge without `--yes`
+    // (fail-closed), and the gate's input is injected so tests never read the
+    // real process stdin.
+    #[test]
+    fn run_cli_uninstall_requires_yes_gate() {
+        let root = tempdir("gate");
+        let runner = runner_with_pkg("install ok installed\t1024\ttest-pkg\t1.0.0\n");
+        let deps = deps_for_test(&root, runner.clone());
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_cli_uninstall(
+            &Options {
+                packages: vec!["test-pkg".to_string()],
+                auto_yes: false,
+                ..Default::default()
+            },
+            &deps,
+            &mut out,
+            &mut err_out,
+            &mut |_| ConfirmOutcome::NonInteractive,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
+        assert!(
+            String::from_utf8_lossy(&out).contains("Non-interactive: pass --yes"),
+            "expected non-interactive note, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            !purge_invoked(&runner, "test-pkg"),
+            "purge ran without --yes: {:?}",
+            runner.invocations()
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // Finding 3 (r1): an explicit TTY "no" answer aborts without touching
+    // packages, and the input is injected.
+    #[test]
+    fn run_cli_uninstall_declined_gate_aborts() {
+        let root = tempdir("declined");
+        let runner = runner_with_pkg("install ok installed\t1024\ttest-pkg\t1.0.0\n");
+        let deps = deps_for_test(&root, runner.clone());
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_cli_uninstall(
+            &Options {
+                packages: vec!["test-pkg".to_string()],
+                auto_yes: false,
+                ..Default::default()
+            },
+            &deps,
+            &mut out,
+            &mut err_out,
+            &mut |_| ConfirmOutcome::Declined,
+        );
+        assert_eq!(code, 0);
+        assert!(String::from_utf8_lossy(&out).contains("Aborted."));
+        assert!(!purge_invoked(&runner, "test-pkg"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_cli_uninstall_with_yes_executes() {
+        let root = tempdir("yes");
+        let runner = runner_with_pkg("install ok installed\t1024\ttest-pkg\t1.0.0\n");
+        let deps = deps_for_test(&root, runner.clone());
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_cli_uninstall(
+            &Options {
+                packages: vec!["test-pkg".to_string()],
+                auto_yes: true,
+                ..Default::default()
+            },
+            &deps,
+            &mut out,
+            &mut err_out,
+            &mut |_| ConfirmOutcome::NonInteractive,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
+        assert!(purge_invoked(&runner, "test-pkg"), "expected purge call");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // Finding 7: a bare name matching several sources must fail closed.
+    #[test]
+    fn run_cli_uninstall_rejects_ambiguous_name() {
+        let root = tempdir("ambiguous");
+        let runner = Arc::new(FakeRunner::new());
+        runner.set_look_path("dpkg-query", "/usr/bin/dpkg-query");
+        runner.set_look_path("snap", "/usr/bin/snap");
+        runner.set_handler(|spec| match spec.program.to_string_lossy().as_ref() {
+            "dpkg-query" => Ok(crate::runner::Output {
+                stdout: b"install ok installed\t1024\tfirefox\t1.0\n".to_vec(),
+                ..Default::default()
+            }),
+            "snap" => Ok(crate::runner::Output {
+                stdout:
+                    b"Name Version Rev Tracking Publisher Notes\nfirefox 124 1 stable mozilla -\n"
+                        .to_vec(),
+                ..Default::default()
+            }),
+            _ => Ok(crate::runner::Output::default()),
+        });
+        let deps = deps_for_test(&root, runner.clone());
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_cli_uninstall(
+            &Options {
+                dry_run: true,
+                packages: vec!["firefox".to_string()],
+                ..Default::default()
+            },
+            &deps,
+            &mut out,
+            &mut err_out,
+            &mut |_| ConfirmOutcome::NonInteractive,
+        );
+        assert_eq!(code, 1);
+        let text = String::from_utf8_lossy(&err_out);
+        assert!(
+            text.contains("ambiguous"),
+            "expected ambiguity error: {text}"
+        );
+        // A source prefix still resolves.
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_cli_uninstall(
+            &Options {
+                dry_run: true,
+                packages: vec!["snap:firefox".to_string()],
+                ..Default::default()
+            },
+            &deps,
+            &mut out,
+            &mut err_out,
+            &mut |_| ConfirmOutcome::NonInteractive,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // Finding 2 (r1): a Steam game is a first-class candidate reached by name;
+    // a non-Steam package of the same name must NOT trigger Steam.
+    #[test]
+    fn run_cli_uninstall_steam_candidate_is_explicit() {
+        let root = tempdir("steam-cand");
+        let runner = runner_with_pkg("install ok installed\t1024\tother-pkg\t1.0\n");
+        runner.set_look_path("steam", "/usr/bin/steam");
+        let deps = deps_for_test(&root, runner.clone());
+        let steamapps = deps.data_home.join("Steam").join("steamapps");
+        fs::create_dir_all(&steamapps).unwrap();
+        fs::write(
+            steamapps.join("appmanifest_220.acf"),
+            "\"appid\"\t\t\"220\"\n\"name\"\t\t\"Half-Life\"\n",
+        )
+        .unwrap();
+
+        // `mu uninstall "Half-Life"` resolves to the steam candidate, prints a
+        // plan line, and on --yes delegates to Steam.
+        let mut out = Vec::new();
+        let mut err_out = Vec::new();
+        let code = run_cli_uninstall(
+            &Options {
+                packages: vec!["Half-Life".to_string()],
+                auto_yes: true,
+                ..Default::default()
+            },
+            &deps,
+            &mut out,
+            &mut err_out,
+            &mut |_| ConfirmOutcome::NonInteractive,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("steam:Half-Life"),
+            "steam candidate missing from plan: {text}"
+        );
+        let calls: Vec<_> = runner.invocations();
+        assert!(
+            calls.iter().any(|c| c.program == "steam"
+                && c.args == [std::ffi::OsString::from("steam://uninstall/220")]),
+            "steam not delegated: {calls:?}"
+        );
+        assert!(
+            !purge_invoked(&runner, "Half-Life"),
+            "steam candidate must not purge an apt package"
         );
         fs::remove_dir_all(&root).ok();
     }

@@ -53,6 +53,20 @@ pub struct CleanTarget {
     /// while `runPlain` drops errored previews).
     pub preview: Option<PreviewFn>,
     pub execute: Box<dyn Fn(bool) -> Result<()>>,
+    /// Optional dynamic label (e.g. `System Trash (14 items)`) computed at
+    /// render time; `None` falls back to the static [`label`].
+    pub count_fn: Option<Box<dyn Fn() -> String>>,
+}
+
+impl CleanTarget {
+    /// The label shown in plain/TUI previews — [`count_fn`] when present
+    /// (fresh item count), otherwise the static [`label`].
+    pub fn display_label(&self) -> String {
+        match &self.count_fn {
+            Some(f) => f(),
+            None => self.label.to_string(),
+        }
+    }
 }
 
 /// Preview closure payload — Go's `([]string, error)` pair.
@@ -79,6 +93,8 @@ pub struct Options {
     pub include: Vec<String>,
     /// Skip the confirmation prompt.
     pub auto_yes: bool,
+    /// `--external <PATH>` — clean metadata on an external volume mount.
+    pub external: Option<PathBuf>,
 }
 
 /// Dependency bundle replacing the Go package vars. `runner` is
@@ -138,6 +154,11 @@ pub(crate) fn all_targets_in(deps: &Deps) -> Vec<CleanTarget> {
         scan_snap::snap_target_in(deps),
         scan_kernels::kernels_target_in(deps),
         scan_browser::browser_cache_target_in(deps),
+        targets::system_trash_target_in(deps),
+        targets::dev_cache_target_in(deps),
+        targets::podman_target_in(deps),
+        targets::orphaned_app_data_target_in(deps),
+        targets::orphaned_services_target_in(deps),
     ];
     if let Some(docker) = scan_docker::docker_target_in(deps) {
         targets.push(docker);
@@ -223,13 +244,21 @@ fn run_tui_in(opts: &Options, targets: Vec<CleanTarget>, deps: &Deps) -> Result<
 }
 
 /// The pre-fork half of `Run`: `LoadWhitelist` (fail closed on malformed
-/// config), `ValidateCleanupRoot(XDGCacheHome())`, `ResolveTargets`.
+/// config), `ValidateCleanupRoot(XDGCacheHome())`, `ResolveTargets`, then the
+/// `--external <PATH>` target when a mount path was given.
 fn prepare(opts: &Options, deps: &Deps) -> Result<Vec<CleanTarget>> {
     if let Err(e) = config::load_whitelist_from(&deps.config_home) {
         return Err(Error::Msg(format!("invalid mu configuration: {e}")));
     }
     paths::validate_cleanup_root(&deps.cache_home)?;
-    resolve_targets_in(deps, &opts.include)
+    let mut targets = resolve_targets_in(deps, &opts.include)?;
+    if let Some(mount) = &opts.external {
+        // Fail closed before the target is even built: the mount must be a
+        // safe cleanup root (absolute, not home/an ancestor, not protected).
+        paths::validate_cleanup_root(mount)?;
+        targets.push(targets::external_volume_target_in(deps, mount));
+    }
+    Ok(targets)
 }
 
 /// Injectable `runPlain` for tests: `deps` supplies the XDG roots and
@@ -298,15 +327,9 @@ fn run_plain(
     });
 
     for res in &results {
-        // `r.Line("%-40s %s", ...)`.
-        r.line(format_args!(
-            "{:<40} {}",
-            res.target.label,
-            size::human_size(res.size)
-        ))?;
+        let label = res.target.display_label();
+        r.line(format_args!("{:<40} {}", label, size::human_size(res.size)))?;
         for item in &res.items {
-            // `r.Line("  - %s", item)` — the renderer's 2-space indent plus
-            // the format's own 2 spaces.
             r.line(format_args!("  - {item}"))?;
         }
     }
@@ -315,6 +338,7 @@ fn run_plain(
         "Potential space to free: {}",
         size::human_size(total)
     ))?;
+    export_preview_ledger(&results, total, &deps.config_home);
     if !scan_errors.is_empty() {
         return Err(join_errors(&scan_errors));
     }
@@ -325,6 +349,7 @@ fn run_plain(
             "Validating the exact cleanup actions without changing data."
         ))?;
         execute(&mut r, &results, opts, deps)?;
+        let _ = print_downloads_large_files_hint(&deps.home, &mut r);
         let summary = format!("Dry run — {} reclaimable", size::human_size(total));
         r.summary(&summary)?;
         return Ok(summary);
@@ -339,10 +364,94 @@ fn run_plain(
     }
 
     let freed = execute(&mut r, &results, opts, deps)?;
+    let _ = print_downloads_large_files_hint(&deps.home, &mut r);
     r.summary(&format!("All done — freed {}", size::human_size(freed)))?;
+    check_project_artifacts_hint(&mut r)?;
     Ok(format!("Freed {}", size::human_size(freed)))
 }
 
+fn export_preview_ledger(results: &[ScanResult], total: i64, config_home: &std::path::Path) {
+    let mu_dir = config_home.join("mu");
+    let _ = std::fs::create_dir_all(&mu_dir);
+    let ledger_path = mu_dir.join("clean-list.txt");
+    let mut f = match std::fs::File::create(&ledger_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let _ = writeln!(f, "# mu clean preview ledger");
+    let _ = writeln!(
+        f,
+        "# Total potential space to free: {}",
+        size::human_size(total)
+    );
+    let _ = writeln!(f, "--------------------------------------------------");
+    for res in results {
+        let label = res.target.display_label();
+        let _ = writeln!(f, "{:<40} {}", label, size::human_size(res.size));
+        for item in &res.items {
+            let _ = writeln!(f, "  - {item}");
+        }
+    }
+}
+
+fn print_downloads_large_files_hint(
+    home: &std::path::Path,
+    r: &mut runtext::Run<'_>,
+) -> Result<()> {
+    let downloads = home.join("Downloads");
+    let Ok(entries) = std::fs::read_dir(&downloads) else {
+        return Ok(());
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            continue;
+        }
+        if meta.len() > 500 * 1024 * 1024 {
+            count += 1;
+        }
+    }
+    if count > 0 {
+        r.line(format_args!(
+            "\nHint: found {count} large file{} (>500MB) in ~/Downloads (run 'mu analyze' to inspect)",
+            if count == 1 { "" } else { "s" }
+        ))?;
+    }
+    Ok(())
+}
+
+/// Check default project directories for heavy build artifacts (> 2 GB) and print an advisory hint.
+fn check_project_artifacts_hint(r: &mut runtext::Run<'_>) -> Result<()> {
+    let home = xdg::home_dir();
+    let candidates = [
+        home.join("Projects"),
+        home.join("Code"),
+        home.join("src"),
+        home.join("Development"),
+    ];
+    let mut total_bytes: u64 = 0;
+    for dir in &candidates {
+        if dir.is_dir() {
+            let artifacts = crate::purge::scanner::scan_root(dir, false);
+            for a in artifacts {
+                total_bytes = total_bytes.saturating_add(a.size);
+            }
+        }
+    }
+
+    const TWO_GIGABYTES: u64 = 2 * 1024 * 1024 * 1024;
+    if total_bytes > TWO_GIGABYTES {
+        r.line(format_args!(
+            "\n💡 Hint: Found {} of project build artifacts in code directories. Run 'mu purge' to reclaim space.",
+            size::human_size(total_bytes as i64)
+        ))?;
+    }
+    Ok(())
+}
 /// `execute` — run each target's `Execute` in order, logging per-target
 /// outcomes and warning on stderr for failures. Returns the summed size of
 /// the successful targets; one or more failures yield
@@ -549,6 +658,7 @@ mod tests {
             scan: Box::new(|| (0, None)),
             preview: None,
             execute: Box::new(execute),
+            count_fn: None,
         }
     }
 
@@ -741,6 +851,92 @@ mod tests {
         assert_eq!(size, 3, "thumbnail size");
         (target.execute)(true).expect("dry-run execute");
         assert!(paths::path_exists(&thumbs), "dry-run removed thumbnails");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn system_trash_target_and_ledger_test() {
+        let tmp = tempdir("systrash");
+        let fake_runner = Arc::new(FakeRunner::new());
+        fake_runner.set_look_path("gio", "/usr/bin/gio");
+        let deps = deps_for_test(&tmp, fake_runner);
+        let trash_files = deps.data_home.join("Trash").join("files");
+        fs::create_dir_all(&trash_files).unwrap();
+        fs::write(trash_files.join("item1.txt"), "hello").unwrap();
+        fs::write(trash_files.join("item2.txt"), "world!").unwrap();
+
+        let trash_target = targets::system_trash_target_in(&deps);
+        assert!(trash_target.opt_in, "system-trash should be opt-in");
+        assert_eq!(trash_target.id, "system-trash");
+
+        let (sz, err) = (trash_target.scan)();
+        assert!(err.is_none());
+        assert!(sz > 0);
+        assert_eq!(targets::count_trash_items(&deps.data_home), 2);
+
+        // Execute in dry-run mode
+        (trash_target.execute)(true).expect("dry-run should succeed");
+        assert!(trash_files.join("item1.txt").exists());
+
+        // Test export_preview_ledger
+        let res = ScanResult {
+            target: trash_target,
+            size: sz,
+            items: vec!["item1.txt".into(), "item2.txt".into()],
+        };
+        export_preview_ledger(&[res], sz, &deps.config_home);
+        let ledger = tmp.join(".config").join("mu").join("clean-list.txt");
+        assert!(ledger.exists(), "clean-list.txt should be created");
+        let content = fs::read_to_string(&ledger).unwrap();
+        assert!(content.contains("System Trash (2 items)"));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // Finding 5 (r1): `--external` roots are validated fail-closed.
+    #[test]
+    fn external_volume_rejects_unsafe_roots() {
+        let tmp = tempdir("ext-bad");
+        let deps = deps_for_test(&tmp, Arc::new(FakeRunner::new()));
+        for bad in ["/", "/etc", "relative/path"] {
+            let mut out = Vec::new();
+            let err = run_in(
+                &Options {
+                    dry_run: true,
+                    external: Some(PathBuf::from(bad)),
+                    ..Options::default()
+                },
+                &deps,
+                &mut out,
+            )
+            .expect_err("expected external root rejection");
+            let text = err.to_string();
+            assert!(
+                text.contains("unsafe cleanup root") || text.contains("must be absolute"),
+                "bad={bad} err={text}"
+            );
+        }
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn downloads_large_files_hint_test() {
+        let tmp = tempdir("dlhint");
+        let downloads = tmp.join("Downloads");
+        fs::create_dir_all(&downloads).unwrap();
+        let big_file = downloads.join("large_iso.img");
+        // Allocate sparse or small file? We can check with mock or small if size is tested
+        // But wait: metadata.len() needs to be > 500MB.
+        // With set_len:
+        let f = fs::File::create(&big_file).unwrap();
+        f.set_len(501 * 1024 * 1024).unwrap(); // sparse file, takes 0 actual disk space
+
+        let mut out = Vec::new();
+        let mut r = runtext::Run::new(&mut out);
+        print_downloads_large_files_hint(&tmp, &mut r).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("Hint: found 1 large file (>500MB) in ~/Downloads"));
+
         fs::remove_dir_all(&tmp).ok();
     }
 }

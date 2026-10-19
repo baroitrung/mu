@@ -13,11 +13,19 @@ mod config;
 #[allow(dead_code)]
 mod error;
 #[allow(dead_code)]
+mod history;
+#[allow(dead_code)]
+mod installer;
+#[allow(dead_code)]
 mod oplog;
 #[allow(dead_code)]
 mod optimize;
 #[allow(dead_code)]
 mod paths;
+#[allow(dead_code)]
+mod purge;
+#[allow(dead_code)]
+mod remove;
 #[allow(dead_code)]
 mod runner;
 mod runtext;
@@ -25,9 +33,13 @@ mod runtext;
 mod size;
 mod status;
 #[allow(dead_code)]
+mod sudo;
+#[allow(dead_code)]
 mod trash;
 #[allow(dead_code)]
 mod uninstall;
+#[allow(dead_code)]
+mod update;
 #[allow(dead_code)]
 mod whitelist;
 mod xdg;

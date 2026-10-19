@@ -12,10 +12,14 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
 use crate::error::{Error, Result};
 
-use super::model::{CPUSample, DiskStat, MemStats, NetRate, NetStat};
+use super::model::{
+    BatteryInfo, CPUSample, DiskIORate, DiskIOSample, DiskStat, HardwareInfo, MemStats, NetRate,
+    NetStat, ProcessInfo,
+};
 
 /// Go `os.Open` surfaces `*PathError` — `open /proc/stat: no such file or
 /// directory`. Rust's io::Error Display is `No such file or directory
@@ -74,6 +78,59 @@ fn read_cpu_from(reader: impl BufRead) -> Result<CPUSample> {
         });
     }
     Err(Error::Msg("no cpu line found in /proc/stat".to_string()))
+}
+
+/// ReadCPUCores parses per-core jiffies (`cpu0`, `cpu1`, ...) from /proc/stat.
+pub fn read_cpu_cores() -> Result<Vec<CPUSample>> {
+    let f = File::open("/proc/stat").map_err(|e| open_err("/proc/stat", e))?;
+    read_cpu_cores_from(BufReader::new(f))
+}
+
+pub fn read_cpu_cores_from(reader: impl BufRead) -> Result<Vec<CPUSample>> {
+    let mut cores = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        if !line.starts_with("cpu") {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        if bytes.len() < 4 || !bytes[3].is_ascii_digit() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 9 {
+            return Err(Error::Msg(format!(
+                "unexpected /proc/stat format: {line:?}"
+            )));
+        }
+        let mut values = [0u64; 8];
+        for (i, v) in values.iter_mut().enumerate() {
+            *v = fields[i + 1]
+                .parse::<u64>()
+                .map_err(|e| Error::Msg(format!("parse /proc/stat field {}: {e}", i + 1)))?;
+        }
+        cores.push(CPUSample {
+            user: values[0],
+            nice: values[1],
+            system: values[2],
+            idle: values[3],
+            iowait: values[4],
+            irq: values[5],
+            softirq: values[6],
+            steal: values[7],
+        });
+    }
+    Ok(cores)
+}
+
+/// CPUCoresPercent computes per-core usage % between two samples.
+pub fn cpu_cores_percent(prev: &[CPUSample], curr: &[CPUSample]) -> Vec<f64> {
+    let n = prev.len().min(curr.len());
+    let mut res = Vec::with_capacity(n);
+    for i in 0..n {
+        res.push(cpu_percent(prev[i], curr[i]));
+    }
+    res
 }
 
 /// CPUPercent computes CPU usage % between two samples.
@@ -467,6 +524,314 @@ pub fn network_rates(
         );
     }
     rates
+}
+
+/// ReadDiskIO parses /proc/diskstats for disk I/O metrics.
+#[allow(dead_code)]
+pub fn read_disk_io() -> Result<BTreeMap<String, DiskIOSample>> {
+    let (samples, err) = read_disk_io_full();
+    if let Some(err) = err {
+        return Err(err);
+    }
+    Ok(samples)
+}
+
+/// ReadDiskIOFull returns (samples, joined scan errors).
+pub fn read_disk_io_full() -> (BTreeMap<String, DiskIOSample>, Option<Error>) {
+    match File::open("/proc/diskstats") {
+        Ok(f) => read_disk_io_from(BufReader::new(f)),
+        Err(e) => (BTreeMap::new(), Some(open_err("/proc/diskstats", e))),
+    }
+}
+
+pub fn read_disk_io_from(reader: impl BufRead) -> (BTreeMap<String, DiskIOSample>, Option<Error>) {
+    let mut samples = BTreeMap::new();
+    let mut scan_errors = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 11 {
+            continue;
+        }
+        let dev_name = fields[2];
+        if dev_name.starts_with("loop")
+            || dev_name.starts_with("ram")
+            || dev_name.starts_with("zram")
+            || dev_name.starts_with("dm-")
+            || Path::new("/sys/class/block")
+                .join(dev_name)
+                .join("partition")
+                .exists()
+        {
+            continue;
+        }
+        let reads = match fields[3].parse::<u64>() {
+            Ok(v) => v,
+            Err(e) => {
+                scan_errors.push(format!("parse /proc/diskstats {dev_name} reads: {e}"));
+                continue;
+            }
+        };
+        let sectors_read = match fields[5].parse::<u64>() {
+            Ok(v) => v,
+            Err(e) => {
+                scan_errors.push(format!(
+                    "parse /proc/diskstats {dev_name} sectors_read: {e}"
+                ));
+                continue;
+            }
+        };
+        let writes = match fields[7].parse::<u64>() {
+            Ok(v) => v,
+            Err(e) => {
+                scan_errors.push(format!("parse /proc/diskstats {dev_name} writes: {e}"));
+                continue;
+            }
+        };
+        let sectors_written = match fields[9].parse::<u64>() {
+            Ok(v) => v,
+            Err(e) => {
+                scan_errors.push(format!(
+                    "parse /proc/diskstats {dev_name} sectors_written: {e}"
+                ));
+                continue;
+            }
+        };
+        samples.insert(
+            dev_name.to_string(),
+            DiskIOSample {
+                reads,
+                sectors_read,
+                writes,
+                sectors_written,
+            },
+        );
+    }
+    (samples, join_errors(scan_errors))
+}
+
+/// DiskIORates computes per-second byte and IO throughput from two snapshots.
+pub fn disk_io_rates(
+    prev: &BTreeMap<String, DiskIOSample>,
+    curr: &BTreeMap<String, DiskIOSample>,
+    elapsed_sec: f64,
+) -> BTreeMap<String, DiskIORate> {
+    let elapsed = if elapsed_sec <= 0.0 { 1.0 } else { elapsed_sec };
+    let mut rates = BTreeMap::new();
+    for (dev, c) in curr {
+        if let Some(p) = prev.get(dev) {
+            let read_sectors = c.sectors_read.saturating_sub(p.sectors_read);
+            let write_sectors = c.sectors_written.saturating_sub(p.sectors_written);
+            let read_ops = c.reads.saturating_sub(p.reads);
+            let write_ops = c.writes.saturating_sub(p.writes);
+            let read_bytes = read_sectors * 512;
+            let write_bytes = write_sectors * 512;
+            rates.insert(
+                dev.clone(),
+                DiskIORate {
+                    read_bytes_per_sec: (read_bytes as f64 / elapsed).round() as u64,
+                    write_bytes_per_sec: (write_bytes as f64 / elapsed).round() as u64,
+                    read_iops: Some((read_ops as f64 / elapsed).round() as u64),
+                    write_iops: Some((write_ops as f64 / elapsed).round() as u64),
+                },
+            );
+        }
+    }
+    rates
+}
+
+/// ReadHardware gathers system and CPU specs from /proc/cpuinfo and /sys/class/dmi.
+pub fn read_hardware() -> HardwareInfo {
+    let cpuinfo = File::open("/proc/cpuinfo").ok();
+    let dmi_prod = std::fs::read_to_string("/sys/class/dmi/id/product_name").ok();
+    let dmi_vendor = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor").ok();
+    read_hardware_from(
+        cpuinfo.map(BufReader::new),
+        dmi_prod.as_deref(),
+        dmi_vendor.as_deref(),
+    )
+}
+
+pub fn read_hardware_from(
+    cpuinfo_reader: Option<impl BufRead>,
+    dmi_product: Option<&str>,
+    dmi_vendor: Option<&str>,
+) -> HardwareInfo {
+    let mut cpu_model = None;
+    let mut cpu_cores = 0;
+    if let Some(reader) = cpuinfo_reader {
+        for line in reader.lines().map_while(std::result::Result::ok) {
+            if line.starts_with("model name") && cpu_model.is_none() {
+                if let Some((_, val)) = line.split_once(':') {
+                    cpu_model = Some(val.trim().to_string());
+                }
+            } else if line.starts_with("processor") {
+                cpu_cores += 1;
+            }
+        }
+    }
+    let model = match (dmi_vendor.map(str::trim), dmi_product.map(str::trim)) {
+        (Some(v), Some(p)) if !v.is_empty() && !p.is_empty() && !p.starts_with(v) => {
+            Some(format!("{v} {p}"))
+        }
+        (_, Some(p)) if !p.is_empty() => Some(p.to_string()),
+        (Some(v), _) if !v.is_empty() => Some(v.to_string()),
+        _ => None,
+    };
+    HardwareInfo {
+        model,
+        cpu_model,
+        cpu_cores: if cpu_cores > 0 { Some(cpu_cores) } else { None },
+    }
+}
+
+/// ReadBattery parses battery charge, health, and status from /sys/class/power_supply/BAT*.
+pub fn read_battery() -> Result<Option<BatteryInfo>> {
+    read_battery_from(Path::new("/sys/class/power_supply"))
+}
+
+pub fn read_battery_from(ps_dir: &Path) -> Result<Option<BatteryInfo>> {
+    if !ps_dir.exists() {
+        return Ok(None);
+    }
+    let entries = match std::fs::read_dir(ps_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(None),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with("BAT") || name_str.starts_with("bat") {
+            let dir = entry.path();
+            let cap_str = std::fs::read_to_string(dir.join("capacity")).unwrap_or_default();
+            let percentage = cap_str.trim().parse::<u8>().unwrap_or(0);
+            let status_str = std::fs::read_to_string(dir.join("status")).unwrap_or_default();
+            let status = status_str.trim().to_string();
+
+            let health_percent = {
+                let full = std::fs::read_to_string(dir.join("energy_full"))
+                    .or_else(|_| std::fs::read_to_string(dir.join("charge_full")))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f64>().ok());
+                let design = std::fs::read_to_string(dir.join("energy_full_design"))
+                    .or_else(|_| std::fs::read_to_string(dir.join("charge_full_design")))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f64>().ok());
+                match (full, design) {
+                    (Some(f), Some(d)) if d > 0.0 => Some(((f / d) * 100.0).clamp(0.0, 100.0)),
+                    _ => None,
+                }
+            };
+
+            return Ok(Some(BatteryInfo {
+                percentage,
+                status: if status.is_empty() {
+                    "Unknown".to_string()
+                } else {
+                    status
+                },
+                health_percent,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// ReadTopProcesses reads top resource-consuming processes from /proc/[pid]/stat.
+pub fn read_top_processes() -> Result<Vec<ProcessInfo>> {
+    read_top_processes_from(Path::new("/proc"), 5)
+}
+
+pub fn read_top_processes_from(proc_dir: &Path, limit: usize) -> Result<Vec<ProcessInfo>> {
+    if !proc_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let entries = match std::fs::read_dir(proc_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let uptime_secs = std::fs::read_to_string(proc_dir.join("uptime"))
+        .or_else(|_| std::fs::read_to_string("/proc/uptime"))
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .unwrap_or(0.0);
+
+    let clk_tck = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+        .ok()
+        .flatten()
+        .map(|v| v as f64)
+        .unwrap_or(100.0);
+    let page_size = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
+        .ok()
+        .flatten()
+        .map(|v| v as u64)
+        .unwrap_or(4096);
+
+    let mut procs = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        let Ok(pid) = name_str.parse::<u32>() else {
+            continue;
+        };
+        let stat_path = entry.path().join("stat");
+        let Ok(stat_content) = std::fs::read_to_string(stat_path) else {
+            continue;
+        };
+        let Some(open_paren) = stat_content.find('(') else {
+            continue;
+        };
+        let Some(close_paren) = stat_content.rfind(')') else {
+            continue;
+        };
+        let proc_name = &stat_content[open_paren + 1..close_paren];
+        let remainder = &stat_content[close_paren + 1..];
+        let fields: Vec<&str> = remainder.split_whitespace().collect();
+        if fields.len() > 21 {
+            let utime = fields[11].parse::<u64>().unwrap_or(0);
+            let stime = fields[12].parse::<u64>().unwrap_or(0);
+            let starttime = fields[19].parse::<u64>().unwrap_or(0);
+            let rss_pages = fields[21].parse::<u64>().unwrap_or(0);
+            let memory_bytes = rss_pages * page_size;
+
+            let cpu_percent = if uptime_secs > 0.0 {
+                let start_secs = starttime as f64 / clk_tck;
+                let proc_age_secs = uptime_secs - start_secs;
+                if proc_age_secs > 0.05 {
+                    let cpu_secs = (utime + stime) as f64 / clk_tck;
+                    let pct = (cpu_secs / proc_age_secs) * 100.0;
+                    (pct * 10.0).round() / 10.0
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            procs.push(ProcessInfo {
+                pid,
+                name: proc_name.to_string(),
+                cpu_percent,
+                memory_bytes,
+            });
+        }
+    }
+    procs.sort_by(|a, b| {
+        b.memory_bytes
+            .cmp(&a.memory_bytes)
+            .then_with(|| {
+                b.cpu_percent
+                    .partial_cmp(&a.cpu_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
+    procs.truncate(limit);
+    Ok(procs)
 }
 
 #[cfg(test)]
@@ -908,5 +1273,203 @@ mod tests {
         let r = rates["eth0"];
         assert_eq!(r.rx_bytes_per_sec, 500); // 500.5 truncated
         assert_eq!(r.tx_bytes_per_sec, 499); // 499.5 truncated
+    }
+
+    // -- Phase 5 Extended Metrics Tests --
+
+    #[test]
+    fn read_cpu_cores_parses_fixture() {
+        let cores = read_cpu_cores_from(include_str!("testdata/proc_stat.txt").as_bytes()).unwrap();
+        assert_eq!(cores.len(), 2);
+        assert_eq!(cores[0].user, 617283);
+        assert_eq!(cores[1].user, 617284);
+    }
+
+    #[test]
+    fn cpu_cores_percent_computes_per_core() {
+        let s1 = vec![
+            CPUSample {
+                user: 100,
+                idle: 900,
+                ..CPUSample::default()
+            },
+            CPUSample {
+                user: 200,
+                idle: 800,
+                ..CPUSample::default()
+            },
+        ];
+        let s2 = vec![
+            CPUSample {
+                user: 200,
+                idle: 900,
+                ..CPUSample::default()
+            },
+            CPUSample {
+                user: 400,
+                idle: 800,
+                ..CPUSample::default()
+            },
+        ];
+        let pcts = cpu_cores_percent(&s1, &s2);
+        assert_eq!(pcts.len(), 2);
+        assert_eq!(pcts[0], 100.0);
+        assert_eq!(pcts[1], 100.0);
+    }
+
+    #[test]
+    fn read_disk_io_parses_sample_and_filters_virtual() {
+        let input = b"\
+   7       0 loop0 100 0 1000 50 200 0 2000 60 0 10 20
+   8       0 sda 500 10 10000 120 300 20 8000 140 0 20 50
+ 259       0 nvme0n1 1200 50 40000 200 800 30 24000 300 0 30 90
+";
+        let (samples, err) = read_disk_io_from(input.as_slice());
+        assert!(err.is_none());
+        assert_eq!(samples.len(), 2);
+        assert!(!samples.contains_key("loop0"));
+        assert!(samples.contains_key("sda"));
+        assert!(samples.contains_key("nvme0n1"));
+
+        let sda = &samples["sda"];
+        assert_eq!(sda.reads, 500);
+        assert_eq!(sda.sectors_read, 10000);
+        assert_eq!(sda.writes, 300);
+        assert_eq!(sda.sectors_written, 8000);
+    }
+
+    #[test]
+    fn disk_io_rates_computes_throughput() {
+        let mut prev = BTreeMap::new();
+        prev.insert(
+            "sda".to_string(),
+            DiskIOSample {
+                reads: 100,
+                sectors_read: 2000,
+                writes: 50,
+                sectors_written: 1000,
+            },
+        );
+        let mut curr = BTreeMap::new();
+        curr.insert(
+            "sda".to_string(),
+            DiskIOSample {
+                reads: 120,            // +20 ops
+                sectors_read: 4000,    // +2000 sectors = 1,024,000 bytes
+                writes: 60,            // +10 ops
+                sectors_written: 2000, // +1000 sectors = 512,000 bytes
+            },
+        );
+        let rates = disk_io_rates(&prev, &curr, 1.0);
+        let sda = &rates["sda"];
+        assert_eq!(sda.read_bytes_per_sec, 2000 * 512);
+        assert_eq!(sda.write_bytes_per_sec, 1000 * 512);
+        assert_eq!(sda.read_iops, Some(20));
+        assert_eq!(sda.write_iops, Some(10));
+    }
+
+    #[test]
+    fn read_hardware_parses_cpuinfo_and_dmi() {
+        let cpuinfo = b"\
+processor	: 0
+model name	: Test CPU 123
+cpu cores	: 2
+
+processor	: 1
+model name	: Test CPU 123
+cpu cores	: 2
+";
+        let hw = read_hardware_from(
+            Some(cpuinfo.as_slice()),
+            Some("Motherboard X"),
+            Some("Acme Corp"),
+        );
+        assert_eq!(hw.cpu_model.as_deref(), Some("Test CPU 123"));
+        assert_eq!(hw.cpu_cores, Some(2));
+        assert_eq!(hw.model.as_deref(), Some("Acme Corp Motherboard X"));
+    }
+
+    #[test]
+    fn read_battery_graceful_on_missing_dir() {
+        let non_existent = Path::new("/tmp/mu_test_non_existent_power_supply_123");
+        let res = read_battery_from(non_existent).unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn read_top_processes_parses_stat_and_sorts() {
+        let temp_dir = std::env::temp_dir().join(format!("mu_proc_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let p1 = temp_dir.join("101");
+        let p2 = temp_dir.join("102");
+        std::fs::create_dir_all(&p1).unwrap();
+        std::fs::create_dir_all(&p2).unwrap();
+
+        // PID 101: comm with space "proc one", utime=10, stime=20 -> total=30, rss=500, starttime=1000
+        let stat1 = "101 (proc one) S 1 101 101 0 -1 4194304 100 0 0 0 10 20 0 0 20 0 1 0 1000 10000 500 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
+        // PID 102: comm "proc_two", utime=100, stime=50 -> total=150, rss=200, starttime=1000
+        let stat2 = "102 (proc_two) R 1 102 102 0 -1 4194304 100 0 0 0 100 50 0 0 20 0 1 0 1000 10000 200 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
+
+        std::fs::write(p1.join("stat"), stat1).unwrap();
+        std::fs::write(p2.join("stat"), stat2).unwrap();
+        std::fs::write(temp_dir.join("uptime"), "100.0 200.0\n").unwrap();
+
+        let procs = read_top_processes_from(&temp_dir, 5).unwrap();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        assert_eq!(procs.len(), 2);
+        // PID 101 has rss=500, which has higher memory than PID 102 rss=200
+        assert_eq!(procs[0].pid, 101);
+        assert_eq!(procs[0].name, "proc one");
+        assert!(procs[0].memory_bytes > 0);
+        assert!(procs[0].cpu_percent > 0.0);
+        assert_eq!(procs[1].pid, 102);
+        assert_eq!(procs[1].name, "proc_two");
+        assert!(procs[1].memory_bytes > 0);
+        assert!(procs[1].cpu_percent > 0.0);
+    }
+
+    #[test]
+    fn read_battery_parses_capacity_status_and_health() {
+        let temp_dir = std::env::temp_dir().join(format!("mu_bat_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let bat0 = temp_dir.join("BAT0");
+        std::fs::create_dir_all(&bat0).unwrap();
+
+        std::fs::write(bat0.join("capacity"), "85\n").unwrap();
+        std::fs::write(bat0.join("status"), "Discharging\n").unwrap();
+        std::fs::write(bat0.join("energy_full"), "4500000\n").unwrap();
+        std::fs::write(bat0.join("energy_full_design"), "5000000\n").unwrap();
+
+        let bat = read_battery_from(&temp_dir)
+            .unwrap()
+            .expect("battery found");
+        assert_eq!(bat.percentage, 85);
+        assert_eq!(bat.status, "Discharging");
+        assert_eq!(bat.health_percent, Some(90.0));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn read_battery_charge_fallback() {
+        let temp_dir = std::env::temp_dir().join(format!("mu_bat_fb_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let bat1 = temp_dir.join("BAT1");
+        std::fs::create_dir_all(&bat1).unwrap();
+
+        std::fs::write(bat1.join("capacity"), "95\n").unwrap();
+        std::fs::write(bat1.join("status"), "Charging\n").unwrap();
+        std::fs::write(bat1.join("charge_full"), "3800000\n").unwrap();
+        std::fs::write(bat1.join("charge_full_design"), "4000000\n").unwrap();
+
+        let bat = read_battery_from(&temp_dir)
+            .unwrap()
+            .expect("battery found");
+        assert_eq!(bat.percentage, 95);
+        assert_eq!(bat.status, "Charging");
+        assert_eq!(bat.health_percent, Some(95.0));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

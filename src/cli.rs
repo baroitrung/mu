@@ -43,9 +43,15 @@ Available Commands:
   clean       Free disk space by removing caches, logs, and old packages
   completion  Generate the autocompletion script for the specified shell
   help        Help about any command
+  history     View recent operations and deletion log
+  installer   Find and remove downloaded installer packages (.deb, .AppImage, .iso)
   optimize    Run system maintenance: apt autoremove, journal vacuum, cache refresh
+  purge       Safely clean heavy project build artifacts (node_modules, target, .venv)
+  remove      Safely uninstall mu and remove configuration, logs, and cache
   status      Live system dashboard: CPU, RAM, disk, network, health score
+  sudo        Configure fingerprint authentication for sudo (pam_fprintd)
   uninstall   Remove apps and all their config, cache, and data remnants
+  update      Check for updates and self-update to the latest release
 
 Flags:
       --debug     Enable verbose debug logging
@@ -129,6 +135,7 @@ Usage:
 
 Flags:
       --dry-run           Preview actions without making changes
+      --external string   Clean metadata on an external volume (mount path)
   -h, --help              help for clean
       --include strings   Opt-in categories (e.g. browser-cache)
   -y, --yes               Skip confirmation prompt
@@ -171,14 +178,17 @@ Displays a real-time system health dashboard with visual metric bars.
 
 Use --json to output a structured JSON snapshot and exit.
 When piped (stdout is not a terminal), JSON is used automatically.
+Use --watch to stream snapshots continuously as NDJSON.
 Press q or Ctrl+C to exit the dashboard.
 
 Usage:
   mu status [flags]
 
 Flags:
-  -h, --help   help for status
-      --json   Output JSON snapshot and exit
+  -h, --help                help for status
+      --interval duration   Refresh interval for --watch (default 1s)
+      --json                Output JSON snapshot and exit
+      --watch               Stream status snapshots continuously as NDJSON
 
 Global Flags:
       --debug   Enable verbose debug logging
@@ -193,11 +203,69 @@ Executes: apt purge <pkg> + remnant cleanup.
 Use --dry-run to preview without removing anything.
 
 Usage:
-  mu uninstall [flags]
+  mu uninstall [flags] [package...]
+
+Flags:
+      --dry-run     Preview actions without making changes
+  -h, --help        help for uninstall
+      --list        List installed packages and exit
+      --permanent   Bypass trash (rejected for safety)
+  -y, --yes         Skip confirmation prompt
+
+Global Flags:
+      --debug   Enable verbose debug logging
+";
+
+const REMOVE_HELP: &str = "\
+Safely uninstall mu and remove configuration, logs, and cache.
+All deletions route strictly through trash::SafeDelete.
+
+Usage:
+  mu remove [flags]
 
 Flags:
       --dry-run   Preview actions without making changes
-  -h, --help      help for uninstall
+  -h, --help      help for remove
+  -y, --yes       Confirm removal without prompting
+
+Global Flags:
+      --debug   Enable verbose debug logging
+";
+
+const SUDO_HELP: &str = "\
+Configure fingerprint authentication for sudo (pam_fprintd).
+Enables or disables biometric authentication in /etc/pam.d/sudo with
+automatic backup creation to prevent user lockout.
+
+Usage:
+  mu sudo [command] [flags]
+
+Available Commands:
+  disable     Disable fingerprint authentication for sudo
+  enable      Enable fingerprint authentication for sudo
+  status      Show current fingerprint authentication status
+
+Flags:
+      --dry-run   Preview actions without making changes
+  -h, --help      help for sudo
+
+Global Flags:
+      --debug   Enable verbose debug logging
+
+Use \"mu sudo [command] --help\" for more information about a command.
+";
+
+const UPDATE_HELP: &str = "\
+Check for updates and self-update to the latest release.
+Verifies SHA-256 cryptographic checksums before replacing the binary.
+
+Usage:
+  mu update [flags]
+
+Flags:
+      --dry-run   Check for updates without downloading or installing
+      --force     Force reinstall or re-download even if already up-to-date
+  -h, --help      help for update
 
 Global Flags:
       --debug   Enable verbose debug logging
@@ -218,8 +286,11 @@ Available Commands:
   completion  Generate the autocompletion script for the specified shell
   help        Help about any command
   optimize    Run system maintenance: apt autoremove, journal vacuum, cache refresh
+  remove      Safely uninstall mu and remove configuration, logs, and cache
   status      Live system dashboard: CPU, RAM, disk, network, health score
+  sudo        Configure fingerprint authentication for sudo (pam_fprintd)
   uninstall   Remove apps and all their config, cache, and data remnants
+  update      Check for updates and self-update to the latest release
 
 Flags:
       --debug   Enable verbose debug logging
@@ -375,6 +446,53 @@ Flags:
 Global Flags:
       --debug   Enable verbose debug logging
 ";
+const HISTORY_HELP: &str = "\
+View recent operations and deletion log from operations.log.
+
+Usage:
+  mu history [flags]
+
+Flags:
+  -h, --help        help for history
+      --json        Output operations log as a JSON array
+      --limit int   Number of recent operations to display (default 20)
+
+Global Flags:
+      --debug   Enable verbose debug logging
+";
+
+const INSTALLER_HELP: &str = "\
+Find and remove downloaded installer packages (.deb, .AppImage, .iso).
+
+Usage:
+  mu installer [flags]
+
+Flags:
+      --dry-run         Preview actions without making changes
+  -h, --help            help for installer
+      --paths strings   Specific directories to scan
+  -y, --yes             Skip confirmation prompt
+
+Global Flags:
+      --debug   Enable verbose debug logging
+";
+
+const PURGE_HELP: &str = "\
+Safely clean heavy project build artifacts (node_modules, target, .venv).
+
+Usage:
+  mu purge [flags]
+
+Flags:
+      --dry-run         Preview actions without making changes
+  -h, --help            help for purge
+      --include-empty   Include empty build artifact directories
+      --paths strings   Specific project directories to scan
+  -y, --yes             Skip confirmation prompt
+
+Global Flags:
+      --debug   Enable verbose debug logging
+";
 
 // ---------------------------------------------------------------------------
 // Subcommand metadata
@@ -384,9 +502,15 @@ const REAL_COMMANDS: &[&str] = &[
     "analyze",
     "audit",
     "clean",
+    "history",
+    "installer",
     "optimize",
+    "purge",
+    "remove",
     "status",
+    "sudo",
     "uninstall",
+    "update",
 ];
 /// Per-command help text for the known real commands.
 fn cmd_help(name: &str) -> Option<&'static str> {
@@ -394,9 +518,15 @@ fn cmd_help(name: &str) -> Option<&'static str> {
         "analyze" => Some(ANALYZE_HELP),
         "audit" => Some(AUDIT_HELP),
         "clean" => Some(CLEAN_HELP),
+        "history" => Some(HISTORY_HELP),
+        "installer" => Some(INSTALLER_HELP),
         "optimize" => Some(OPTIMIZE_HELP),
+        "purge" => Some(PURGE_HELP),
+        "remove" => Some(REMOVE_HELP),
         "status" => Some(STATUS_HELP),
+        "sudo" => Some(SUDO_HELP),
         "uninstall" => Some(UNINSTALL_HELP),
+        "update" => Some(UPDATE_HELP),
         _ => None,
     }
 }
@@ -428,16 +558,21 @@ enum Command {
     },
     Status {
         json: bool,
+        watch: bool,
+        interval: Option<String>,
     },
     Clean {
         dry_run: bool,
         include: Vec<String>,
         yes: bool,
+        external: Option<std::path::PathBuf>,
+        whitelist: bool,
     },
     Optimize {
         dry_run: bool,
         skip: Vec<String>,
         yes: bool,
+        whitelist: bool,
     },
     Audit {
         report: bool,
@@ -447,6 +582,39 @@ enum Command {
     },
     Uninstall {
         dry_run: bool,
+        list: bool,
+        permanent: bool,
+        packages: Vec<String>,
+        yes: bool,
+    },
+    History {
+        limit: usize,
+        json: bool,
+    },
+    Purge {
+        paths: Vec<std::path::PathBuf>,
+        dry_run: bool,
+        yes: bool,
+        include_empty: bool,
+    },
+    Installer {
+        paths: Vec<std::path::PathBuf>,
+        dry_run: bool,
+        yes: bool,
+    },
+    Remove {
+        dry_run: bool,
+        yes: bool,
+    },
+    Sudo {
+        command: crate::sudo::SudoCommand,
+        dry_run: bool,
+        pam_path: Option<std::path::PathBuf>,
+    },
+    Update {
+        dry_run: bool,
+        force: bool,
+        api_url: Option<String>,
     },
 }
 
@@ -506,8 +674,45 @@ pub fn run() -> ! {
                     });
                     std::process::exit(code);
                 }
-                Command::Status { json } => std::process::exit(status::run(json)),
-                Command::Optimize { dry_run, skip, yes } => {
+                Command::Status {
+                    json,
+                    watch,
+                    interval,
+                } => {
+                    let dur = if let Some(i_str) = interval {
+                        match parse_duration(&i_str) {
+                            Some(d) => d,
+                            None => {
+                                eprintln!(
+                                    "invalid argument \"{i_str}\" for \"--interval\" flag: time: invalid duration \"{i_str}\""
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        std::time::Duration::from_secs(1)
+                    };
+                    if watch {
+                        std::process::exit(status::run_watch(dur));
+                    } else {
+                        std::process::exit(status::run(json));
+                    }
+                }
+                Command::Optimize {
+                    dry_run,
+                    skip,
+                    yes,
+                    whitelist,
+                } => {
+                    if whitelist {
+                        if std::io::stdout().is_terminal() {
+                            let _ = crate::tui::whitelist::run_whitelist_tui();
+                            std::process::exit(0);
+                        } else {
+                            println!("Whitelist configuration: ~/.config/mu/config.toml");
+                            std::process::exit(0);
+                        }
+                    }
                     let code = match optimize::run(&optimize::Options {
                         dry_run,
                         debug,
@@ -526,12 +731,24 @@ pub fn run() -> ! {
                     dry_run,
                     include,
                     yes,
+                    external,
+                    whitelist,
                 } => {
+                    if whitelist {
+                        if std::io::stdout().is_terminal() {
+                            let _ = crate::tui::whitelist::run_whitelist_tui();
+                            std::process::exit(0);
+                        } else {
+                            println!("Whitelist configuration: ~/.config/mu/config.toml");
+                            std::process::exit(0);
+                        }
+                    }
                     let code = match clean::run(&clean::Options {
                         dry_run,
                         debug,
                         include,
                         auto_yes: yes,
+                        external,
                     }) {
                         Ok(_) => 0,
                         Err(e) => {
@@ -553,8 +770,86 @@ pub fn run() -> ! {
                     debug,
                     include,
                 })),
-                Command::Uninstall { dry_run } => {
-                    std::process::exit(uninstall::run(&uninstall::Options { dry_run, debug }))
+                Command::Uninstall {
+                    dry_run,
+                    list,
+                    permanent,
+                    packages,
+                    yes,
+                } => std::process::exit(uninstall::run(&uninstall::Options {
+                    dry_run,
+                    debug,
+                    list,
+                    permanent,
+                    packages,
+                    auto_yes: yes,
+                })),
+                Command::History { limit, json } => {
+                    std::process::exit(crate::history::run(&crate::history::Options {
+                        limit,
+                        json,
+                    }));
+                }
+                Command::Purge {
+                    paths,
+                    dry_run,
+                    yes,
+                    include_empty,
+                } => {
+                    std::process::exit(crate::purge::run(&crate::purge::Options {
+                        paths,
+                        dry_run,
+                        auto_yes: yes,
+                        include_empty,
+                        debug,
+                    }));
+                }
+                Command::Installer {
+                    paths,
+                    dry_run,
+                    yes,
+                } => {
+                    std::process::exit(crate::installer::run(&crate::installer::Options {
+                        paths,
+                        dry_run,
+                        auto_yes: yes,
+                        debug,
+                    }));
+                }
+                Command::Remove { dry_run, yes } => {
+                    let code = crate::remove::run(&crate::remove::Options {
+                        dry_run,
+                        auto_yes: yes,
+                        debug,
+                    });
+                    std::process::exit(code);
+                }
+                Command::Sudo {
+                    command,
+                    dry_run,
+                    pam_path,
+                } => {
+                    let code = crate::sudo::run(&crate::sudo::Options {
+                        command,
+                        dry_run,
+                        debug,
+                        pam_path,
+                    });
+                    std::process::exit(code);
+                }
+                Command::Update {
+                    dry_run,
+                    force,
+                    api_url,
+                } => {
+                    let code = crate::update::run(&crate::update::Options {
+                        dry_run,
+                        force,
+                        debug,
+                        target_bin: None,
+                        api_url,
+                    });
+                    std::process::exit(code);
                 }
             }
         }
@@ -676,20 +971,141 @@ const F_NODESC: FlagSpec = FlagSpec {
     takes_value: false,
     display: "--no-descriptions",
 };
+const F_PERMANENT: FlagSpec = FlagSpec {
+    long: "permanent",
+    short: None,
+    takes_value: false,
+    display: "--permanent",
+};
+const F_LIST: FlagSpec = FlagSpec {
+    long: "list",
+    short: None,
+    takes_value: false,
+    display: "--list",
+};
+const F_EXTERNAL: FlagSpec = FlagSpec {
+    long: "external",
+    short: None,
+    takes_value: true,
+    display: "--external",
+};
+const F_LIMIT: FlagSpec = FlagSpec {
+    long: "limit",
+    short: None,
+    takes_value: true,
+    display: "--limit",
+};
+const F_PATHS: FlagSpec = FlagSpec {
+    long: "paths",
+    short: None,
+    takes_value: true,
+    display: "--paths",
+};
+const F_INCLUDE_EMPTY: FlagSpec = FlagSpec {
+    long: "include-empty",
+    short: None,
+    takes_value: false,
+    display: "--include-empty",
+};
+const F_WATCH: FlagSpec = FlagSpec {
+    long: "watch",
+    short: None,
+    takes_value: false,
+    display: "--watch",
+};
+const F_INTERVAL: FlagSpec = FlagSpec {
+    long: "interval",
+    short: None,
+    takes_value: true,
+    display: "--interval",
+};
+const F_FORCE: FlagSpec = FlagSpec {
+    long: "force",
+    short: None,
+    takes_value: false,
+    display: "--force",
+};
+const F_INSTALL: FlagSpec = FlagSpec {
+    long: "install",
+    short: None,
+    takes_value: false,
+    display: "--install",
+};
+const F_WHITELIST: FlagSpec = FlagSpec {
+    long: "whitelist",
+    short: None,
+    takes_value: false,
+    display: "--whitelist",
+};
+
+fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(ms_str) = s.strip_suffix("ms") {
+        let ms = ms_str.parse::<u64>().ok()?;
+        if ms > 0 {
+            Some(std::time::Duration::from_millis(ms))
+        } else {
+            None
+        }
+    } else if let Some(s_str) = s.strip_suffix('s') {
+        let v = s_str.parse::<f64>().ok()?;
+        if v > 0.0 && v.is_finite() {
+            std::time::Duration::try_from_secs_f64(v)
+                .ok()
+                .filter(|d| !d.is_zero())
+        } else {
+            None
+        }
+    } else if let Some(m_str) = s.strip_suffix('m') {
+        let v = m_str.parse::<f64>().ok()?;
+        if v > 0.0 && v.is_finite() {
+            std::time::Duration::try_from_secs_f64(v * 60.0)
+                .ok()
+                .filter(|d| !d.is_zero())
+        } else {
+            None
+        }
+    } else if let Ok(secs) = s.parse::<u64>() {
+        if secs > 0 {
+            Some(std::time::Duration::from_secs(secs))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
 
 const ROOT_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_VERSION];
 const HELP_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP];
-const COMPLETION_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP];
-const SHELL_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_NODESC];
+const COMPLETION_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_INSTALL];
+const SHELL_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_NODESC, F_INSTALL];
 
 fn cmd_flagset(name: &str) -> &'static [FlagSpec] {
     match name {
         "analyze" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON],
-        "status" => &[F_DEBUG, F_HELP, F_JSON],
-        "clean" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_INCLUDE],
-        "optimize" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_SKIP],
+        "status" => &[F_DEBUG, F_HELP, F_INTERVAL, F_JSON, F_WATCH],
+        "clean" => &[
+            F_DEBUG,
+            F_HELP,
+            F_DRY_RUN,
+            F_YES,
+            F_INCLUDE,
+            F_EXTERNAL,
+            F_WHITELIST,
+        ],
+        "optimize" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_SKIP, F_WHITELIST],
         "audit" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON, F_REPORT, F_INCLUDE],
-        "uninstall" => &[F_DEBUG, F_HELP, F_DRY_RUN],
+        "uninstall" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_PERMANENT, F_LIST, F_YES],
+        "history" => &[F_DEBUG, F_HELP, F_JSON, F_LIMIT],
+        "installer" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_PATHS],
+        "purge" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_PATHS, F_INCLUDE_EMPTY],
+        "remove" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES],
+        "sudo" => &[F_DEBUG, F_HELP, F_DRY_RUN],
+        "update" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_FORCE],
         _ => &[],
     }
 }
@@ -926,10 +1342,13 @@ const SUGGEST_COMMANDS: &[&str] = &[
     "analyze",
     "audit",
     "clean",
-    "uninstall",
-    "optimize",
-    "status",
     "completion",
+    "history",
+    "installer",
+    "optimize",
+    "purge",
+    "status",
+    "uninstall",
 ];
 
 /// `unknown command "X" for "mu"` + `Did you mean this?` suggestions
@@ -1003,24 +1422,38 @@ fn exec_subcommand(name: &str, args: &[String]) -> Outcome {
     if p.get("help") {
         return Outcome::Stdout(cmd_help(name).unwrap().to_string());
     }
+    let debug = p.get("debug");
     let cmd = match name {
         "analyze" => Command::Analyze {
             path: p.positionals.first().map(std::path::PathBuf::from),
             dry_run: p.get("dry-run"),
             json: p.get("json"),
         },
-        "status" => Command::Status {
-            json: p.get("json"),
-        },
+        "status" => {
+            let interval = p.vals("interval").into_iter().next();
+            if let Some(i_str) = interval.as_deref().filter(|s| parse_duration(s).is_none()) {
+                return perr(format!(
+                    "invalid argument \"{i_str}\" for \"--interval\" flag: time: invalid duration \"{i_str}\"\n"
+                ));
+            }
+            Command::Status {
+                json: p.get("json"),
+                watch: p.get("watch"),
+                interval,
+            }
+        }
         "clean" => Command::Clean {
             dry_run: p.get("dry-run"),
             include: p.vals("include"),
             yes: p.get("yes"),
+            external: p.vals("external").first().map(std::path::PathBuf::from),
+            whitelist: p.get("whitelist"),
         },
         "optimize" => Command::Optimize {
             dry_run: p.get("dry-run"),
             skip: p.vals("skip"),
             yes: p.get("yes"),
+            whitelist: p.get("whitelist"),
         },
         "audit" => Command::Audit {
             report: p.get("report"),
@@ -1030,13 +1463,75 @@ fn exec_subcommand(name: &str, args: &[String]) -> Outcome {
         },
         "uninstall" => Command::Uninstall {
             dry_run: p.get("dry-run"),
+            list: p.get("list"),
+            permanent: p.get("permanent"),
+            yes: p.get("yes"),
+            packages: p.positionals,
+        },
+        "history" => {
+            let limit = if let Some(s) = p.vals("limit").first() {
+                match s.parse::<usize>() {
+                    Ok(l) => l,
+                    Err(_) => {
+                        return perr(format!(
+                            "invalid argument \"{s}\" for \"--limit\" flag: strconv.ParseInt: parsing \"{s}\": invalid syntax\n"
+                        ));
+                    }
+                }
+            } else {
+                crate::history::DEFAULT_LIMIT
+            };
+            Command::History {
+                limit,
+                json: p.get("json"),
+            }
+        }
+        "purge" => Command::Purge {
+            paths: p
+                .vals("paths")
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            dry_run: p.get("dry-run"),
+            yes: p.get("yes"),
+            include_empty: p.get("include-empty"),
+        },
+        "installer" => Command::Installer {
+            paths: p
+                .vals("paths")
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            dry_run: p.get("dry-run"),
+            yes: p.get("yes"),
+        },
+        "remove" => Command::Remove {
+            dry_run: p.get("dry-run"),
+            yes: p.get("yes"),
+        },
+        "sudo" => {
+            let subcmd = match p.positionals.first().map(|s| s.as_str()) {
+                Some("enable") => crate::sudo::SudoCommand::Enable,
+                Some("disable") => crate::sudo::SudoCommand::Disable,
+                Some("status") | None => crate::sudo::SudoCommand::Status,
+                Some(other) => {
+                    return perr(format!("unknown command \"{other}\" for \"mu sudo\"\n"));
+                }
+            };
+            Command::Sudo {
+                command: subcmd,
+                dry_run: p.get("dry-run"),
+                pam_path: None,
+            }
+        }
+        "update" => Command::Update {
+            dry_run: p.get("dry-run"),
+            force: p.get("force"),
+            api_url: None,
         },
         _ => unreachable!(),
     };
-    Outcome::Run {
-        debug: p.get("debug"),
-        cmd,
-    }
+    Outcome::Run { debug, cmd }
 }
 
 /// `mu help [topics]` — cobra's help command. Flags parse first (so
@@ -1088,6 +1583,19 @@ fn exec_completion(args: &[String]) -> Outcome {
         if p.get("help") {
             return Outcome::Stdout(shell_help(&shell).to_string());
         }
+        if p.get("install") {
+            match install_completion(&shell) {
+                Ok(path) => {
+                    return Outcome::Stdout(format!(
+                        "Installed completion for {shell} to {}\n",
+                        path.display()
+                    ));
+                }
+                Err(e) => {
+                    return perr(format!("error installing completion for {shell}: {e}\n"));
+                }
+            }
+        }
         if let Some(x) = p.positionals.first() {
             return perr(format!(
                 "unknown command \"{x}\" for \"mu completion {shell}\"\n"
@@ -1097,7 +1605,29 @@ fn exec_completion(args: &[String]) -> Outcome {
     }
     match flag_parse(args, COMPLETION_FLAGS) {
         Err(o) => o,
-        Ok(_) => Outcome::Stdout(COMPLETION_HELP.to_string()),
+        Ok(p) => {
+            if p.get("install") {
+                let shell = p.positionals.first().map(|s| s.as_str()).unwrap_or("bash");
+                if is_shell(shell) || shell == "desktop" {
+                    match install_completion(shell) {
+                        Ok(path) => {
+                            return Outcome::Stdout(format!(
+                                "Installed completion for {shell} to {}\n",
+                                path.display()
+                            ));
+                        }
+                        Err(e) => {
+                            return perr(format!("error installing completion for {shell}: {e}\n"));
+                        }
+                    }
+                } else {
+                    return perr(format!(
+                        "unknown shell \"{shell}\" for completion --install\n"
+                    ));
+                }
+            }
+            Outcome::Stdout(COMPLETION_HELP.to_string())
+        }
     }
 }
 
@@ -1119,7 +1649,7 @@ fn shell_help(shell: &str) -> &'static str {
 /// Generate a minimal shell completion script. The content differs from
 /// cobra's (accepted divergence — functional parity, not byte parity).
 fn completion_script(shell: &str) -> String {
-    let cmds = "audit clean optimize status uninstall";
+    let cmds = "analyze audit clean completion help optimize remove status sudo uninstall update";
     match shell {
         "bash" => format!(
             "# bash completion for mu\n\
@@ -1151,6 +1681,55 @@ Register-ArgumentCompleter -Native -CommandName mu -ScriptBlock {{\n\
         ),
         _ => COMPLETION_HELP.to_string(),
     }
+}
+
+fn install_completion(shell: &str) -> std::result::Result<std::path::PathBuf, String> {
+    let script = completion_script(shell);
+    let target = match shell {
+        "bash" => {
+            let sys_dir = std::path::Path::new("/etc/bash_completion.d");
+            if sys_dir.exists()
+                && nix::unistd::access(sys_dir, nix::unistd::AccessFlags::W_OK).is_ok()
+            {
+                sys_dir.join("mu")
+            } else {
+                let user_dir = crate::xdg::data_home().join("bash-completion/completions");
+                std::fs::create_dir_all(&user_dir).map_err(|e| {
+                    format!("failed to create directory {}: {}", user_dir.display(), e)
+                })?;
+                user_dir.join("mu")
+            }
+        }
+        "zsh" => {
+            let home = crate::xdg::home_dir();
+            let zsh_dir = home.join(".zsh/completion");
+            std::fs::create_dir_all(&zsh_dir)
+                .map_err(|e| format!("failed to create directory {}: {}", zsh_dir.display(), e))?;
+            zsh_dir.join("_mu")
+        }
+        "fish" => {
+            let home = crate::xdg::home_dir();
+            let fish_dir = home.join(".config/fish/completions");
+            std::fs::create_dir_all(&fish_dir)
+                .map_err(|e| format!("failed to create directory {}: {}", fish_dir.display(), e))?;
+            fish_dir.join("mu.fish")
+        }
+        "desktop" => {
+            return crate::remove::install_desktop_entry(None)
+                .map_err(|e| format!("failed to install desktop launcher: {e}"));
+        }
+        _ => return Err(format!("unsupported shell for auto-install: {shell}")),
+    };
+
+    std::fs::write(&target, script).map_err(|e| {
+        format!(
+            "failed to write completion script to {}: {}",
+            target.display(),
+            e
+        )
+    })?;
+
+    Ok(target)
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,7 +1850,7 @@ mod tests {
     fn positional_args_ignored() {
         match parse(&args(&["status", "foo"])) {
             Outcome::Run { cmd, .. } => match cmd {
-                Command::Status { json } => assert!(!json),
+                Command::Status { json, .. } => assert!(!json),
                 _ => panic!("expected Status"),
             },
             _ => panic!("expected Run"),
@@ -1796,6 +2375,33 @@ mod tests {
             _ => panic!("expected Run"),
         }
     }
+
+    #[test]
+    fn clean_external_flag_parses() {
+        match parse(&args(&["clean", "--external", "/mnt/usb"])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::Clean { external, .. } => {
+                    assert_eq!(external, Some(std::path::PathBuf::from("/mnt/usb")));
+                }
+                _ => panic!("expected Clean"),
+            },
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn uninstall_yes_flag_parses() {
+        match parse(&args(&["uninstall", "--yes", "bash"])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::Uninstall { yes, packages, .. } => {
+                    assert!(yes);
+                    assert_eq!(packages, vec!["bash"]);
+                }
+                _ => panic!("expected Uninstall"),
+            },
+            _ => panic!("expected Run"),
+        }
+    }
     #[test]
     fn analyze_flag_parsing() {
         match parse(&args(&["analyze", "--json", "/var/log"])) {
@@ -1872,5 +2478,183 @@ mod tests {
             UNINSTALL_HELP,
             include_str!("../tests/golden/help-uninstall.txt")
         );
+    }
+    #[test]
+    fn golden_history_help_byte_exact() {
+        assert_eq!(
+            HISTORY_HELP,
+            include_str!("../tests/golden/help-history.txt")
+        );
+    }
+
+    #[test]
+    fn golden_installer_help_byte_exact() {
+        assert_eq!(
+            INSTALLER_HELP,
+            include_str!("../tests/golden/help-installer.txt")
+        );
+    }
+
+    #[test]
+    fn golden_purge_help_byte_exact() {
+        assert_eq!(PURGE_HELP, include_str!("../tests/golden/help-purge.txt"));
+    }
+
+    #[test]
+    fn history_flag_parsing() {
+        match parse(&args(&["history", "--json", "--limit", "50"])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::History { limit, json } => {
+                    assert_eq!(limit, 50);
+                    assert!(json);
+                }
+                _ => panic!("expected History"),
+            },
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn status_watch_and_interval_flags_parse() {
+        match parse(&args(&["status", "--watch", "--interval", "2s"])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::Status {
+                    json,
+                    watch,
+                    interval,
+                } => {
+                    assert!(!json);
+                    assert!(watch);
+                    assert_eq!(interval.as_deref(), Some("2s"));
+                }
+                _ => panic!("expected Status"),
+            },
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn purge_flag_parsing() {
+        match parse(&args(&[
+            "purge",
+            "--dry-run",
+            "-y",
+            "--include-empty",
+            "--paths=/tmp/a,/tmp/b",
+        ])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::Purge {
+                    paths,
+                    dry_run,
+                    yes,
+                    include_empty,
+                } => {
+                    assert_eq!(
+                        paths,
+                        vec![
+                            std::path::PathBuf::from("/tmp/a"),
+                            std::path::PathBuf::from("/tmp/b")
+                        ]
+                    );
+                    assert!(dry_run);
+                    assert!(yes);
+                    assert!(include_empty);
+                }
+                _ => panic!("expected Purge"),
+            },
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn installer_flag_parsing() {
+        match parse(&args(&[
+            "installer",
+            "--dry-run",
+            "-y",
+            "--paths=/tmp/install",
+        ])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::Installer {
+                    paths,
+                    dry_run,
+                    yes,
+                } => {
+                    assert_eq!(paths, vec![std::path::PathBuf::from("/tmp/install")]);
+                    assert!(dry_run);
+                    assert!(yes);
+                }
+                _ => panic!("expected Installer"),
+            },
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn status_invalid_interval_flag() {
+        match parse(&args(&["status", "--interval", "bogus"])) {
+            Outcome::Stderr { text, code } => {
+                assert_eq!(code, 1);
+                assert!(text.contains("invalid duration \"bogus\""), "{text}");
+            }
+            _ => panic!("expected Stderr"),
+        }
+    }
+
+    #[test]
+    fn parse_duration_formats() {
+        assert_eq!(
+            parse_duration("1s"),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            parse_duration("500ms"),
+            Some(std::time::Duration::from_millis(500))
+        );
+        assert_eq!(
+            parse_duration("2m"),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(parse_duration("5"), Some(std::time::Duration::from_secs(5)));
+        assert_eq!(parse_duration("bogus"), None);
+        assert_eq!(parse_duration("0s"), None);
+        assert_eq!(parse_duration("0ms"), None);
+        assert_eq!(parse_duration("0"), None);
+        assert_eq!(parse_duration("infs"), None);
+        assert_eq!(parse_duration("-1s"), None);
+        assert_eq!(parse_duration("1e300s"), None);
+        assert_eq!(parse_duration("1e-10s"), None);
+        assert_eq!(parse_duration("1e-12m"), None);
+    }
+
+    #[test]
+    fn status_interval_flag_zero_and_infinite_rejected() {
+        for arg in ["0s", "0ms", "0", "infs", "1e300s", "1e-10s", "1e-12m"] {
+            match parse(&args(&["status", "--interval", arg])) {
+                Outcome::Stderr { text, code } => {
+                    assert_eq!(code, 1);
+                    assert!(
+                        text.contains(&format!("invalid duration \"{arg}\"")),
+                        "for {arg}: {text}"
+                    );
+                }
+                _ => panic!("expected Stderr for {arg}"),
+            }
+        }
+    }
+
+    #[test]
+    fn golden_remove_help_byte_exact() {
+        assert_eq!(REMOVE_HELP, include_str!("../tests/golden/help-remove.txt"));
+    }
+
+    #[test]
+    fn golden_sudo_help_byte_exact() {
+        assert_eq!(SUDO_HELP, include_str!("../tests/golden/help-sudo.txt"));
+    }
+
+    #[test]
+    fn golden_update_help_byte_exact() {
+        assert_eq!(UPDATE_HELP, include_str!("../tests/golden/help-update.txt"));
     }
 }

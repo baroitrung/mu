@@ -6,11 +6,14 @@ Executes: apt purge <pkg> + remnant cleanup.
 Use --dry-run to preview without removing anything.
 
 Usage:
-  mu uninstall [flags]
+  mu uninstall [flags] [package...]
 
 Flags:
-      --dry-run   Preview actions without making changes
-  -h, --help      help for uninstall
+      --dry-run     Preview actions without making changes
+  -h, --help        help for uninstall
+      --list        List installed packages and exit
+      --permanent   Bypass trash (rejected for safety)
+  -y, --yes         Skip confirmation prompt
 
 Global Flags:
       --debug   Enable verbose debug logging

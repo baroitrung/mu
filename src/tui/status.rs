@@ -23,6 +23,8 @@ pub struct StatusDashboard {
     pub dashboard: Dashboard,
     pub width: u16,
     pub readers: status::Readers,
+    pub show_cores: bool,
+    pub show_processes: bool,
 }
 
 impl StatusDashboard {
@@ -32,6 +34,8 @@ impl StatusDashboard {
             dashboard: Dashboard::new(),
             width: DEFAULT_TERM,
             readers: status::Readers::real(),
+            show_cores: false,
+            show_processes: false,
         }
     }
 
@@ -45,10 +49,21 @@ impl StatusDashboard {
         self.dashboard.tick(&mut self.readers);
     }
 
-    /// Handle a key — q/Q quits. Esc is NOT a quit key (M6 fix).
+    /// Handle a key — q/Q quits, c toggles CPU cores, p toggles top processes.
     pub fn handle_key(&mut self, key: crossterm::event::KeyCode) -> bool {
         use crossterm::event::KeyCode;
-        matches!(key, KeyCode::Char('q') | KeyCode::Char('Q'))
+        match key {
+            KeyCode::Char('q') | KeyCode::Char('Q') => true,
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.show_cores = !self.show_cores;
+                false
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                self.show_processes = !self.show_processes;
+                false
+            }
+            _ => false,
+        }
     }
 
     /// Handle a key event (with modifiers). Returns true if done.
@@ -118,6 +133,25 @@ impl StatusDashboard {
                 &primary,
                 width,
             ));
+        }
+
+        // CPU Cores (toggle with 'c')
+        if self.show_cores && !m.cpu_cores.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("  CPU Cores", styles::faint()));
+            for (i, &core_pct) in m.cpu_cores.iter().enumerate() {
+                let label = format!("Core {i}");
+                let text = format!("{core_pct:.1}%");
+                lines.push(metric_line(
+                    &label,
+                    LABEL_WIDTH,
+                    core_pct,
+                    styles::usage_color(core_pct),
+                    &text,
+                    &text,
+                    width,
+                ));
+            }
         }
 
         // RAM
@@ -214,6 +248,25 @@ impl StatusDashboard {
             }
         }
 
+        // Top Processes (toggle with 'p')
+        if self.show_processes && !m.processes.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("  Top Processes", styles::faint()));
+            lines.push(Line::raw(format!(
+                "  {:<7} {:<20} {:>7} {:>10}",
+                "PID", "NAME", "CPU%", "MEM"
+            )));
+            for p in &m.processes {
+                lines.push(Line::raw(format!(
+                    "  {:<7} {:<20} {:>6.1}% {:>10}",
+                    p.pid,
+                    truncate_width(&p.name, 20),
+                    p.cpu_percent,
+                    human_bytes(p.memory_bytes),
+                )));
+            }
+        }
+
         // Scan errors (m4 fix: truncate to terminal width like Go's truncateWidth)
         for scan_err in &m.scan_errors {
             lines.push(Line::styled(
@@ -225,7 +278,10 @@ impl StatusDashboard {
         // Footer
         lines.push(Line::raw(""));
         lines.push(Line::raw(""));
-        lines.push(Line::styled("  q to quit", styles::faint()));
+        lines.push(Line::styled(
+            "  q to quit · c cores · p processes",
+            styles::faint(),
+        ));
 
         frame.render_widget(Paragraph::new(ratatui::text::Text::from(lines)), area);
     }
@@ -460,5 +516,25 @@ mod tests {
     fn non_quit_key() {
         let mut dash = StatusDashboard::new();
         assert!(!dash.handle_key(crossterm::event::KeyCode::Char('x')));
+    }
+
+    #[test]
+    fn toggle_cores_key() {
+        let mut dash = StatusDashboard::new();
+        assert!(!dash.show_cores);
+        assert!(!dash.handle_key(crossterm::event::KeyCode::Char('c')));
+        assert!(dash.show_cores);
+        assert!(!dash.handle_key(crossterm::event::KeyCode::Char('c')));
+        assert!(!dash.show_cores);
+    }
+
+    #[test]
+    fn toggle_processes_key() {
+        let mut dash = StatusDashboard::new();
+        assert!(!dash.show_processes);
+        assert!(!dash.handle_key(crossterm::event::KeyCode::Char('p')));
+        assert!(dash.show_processes);
+        assert!(!dash.handle_key(crossterm::event::KeyCode::Char('p')));
+        assert!(!dash.show_processes);
     }
 }
