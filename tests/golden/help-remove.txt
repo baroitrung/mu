@@ -1,0 +1,13 @@
+Safely uninstall mu and remove configuration, logs, and cache.
+All deletions route strictly through trash::SafeDelete.
+
+Usage:
+  mu remove [flags]
+
+Flags:
+      --dry-run   Preview actions without making changes
+  -h, --help      help for remove
+  -y, --yes       Confirm removal without prompting
+
+Global Flags:
+      --debug   Enable verbose debug logging

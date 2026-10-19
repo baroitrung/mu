@@ -240,6 +240,9 @@ fn help_lists_subcommands() {
         "history",
         "installer",
         "purge",
+        "remove",
+        "sudo",
+        "update",
     ] {
         assert!(out.contains(cmd), "missing {cmd} in help");
     }
@@ -741,3 +744,99 @@ fn installer_help_output() {
     assert_eq!(o.status.code(), Some(0));
     assert_eq!(stdout(&o), include_str!("golden/help-installer.txt"));
 }
+
+/// `mu sudo status` -> reports PAM fingerprint status, exit 0.
+#[test]
+fn sudo_status_output() {
+    let o = mu(&["sudo", "status"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(
+        out.contains("Fingerprint authentication for sudo:"),
+        "unexpected output: {out}"
+    );
+}
+
+/// `mu sudo --dry-run enable` -> previews changes without modifying files, exit 0.
+#[test]
+fn sudo_dry_run_enable() {
+    let o = mu(&["sudo", "--dry-run", "enable"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(
+        out.contains("[dry-run] Would enable fingerprint authentication for sudo"),
+        "unexpected output: {out}"
+    );
+}
+
+/// `mu update --dry-run` -> reports local version and status, exit 0.
+#[test]
+fn update_dry_run() {
+    let o = mu(&["update", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = stdout(&o);
+    assert!(
+        out.contains("Checking for updates") || out.contains("up-to-date"),
+        "unexpected output: {out}"
+    );
+}
+
+/// `mu remove --dry-run` sentinel immutability test -> exit 0, sentinel untouched.
+#[test]
+fn remove_dry_run_sentinel() {
+    let test_dir = std::env::temp_dir().join(format!("mu-remove-sentinel-{}", std::process::id()));
+    let config_dir = test_dir.join(".config/mu");
+    let _ = std::fs::create_dir_all(&config_dir);
+    let sentinel = config_dir.join("config.toml");
+    std::fs::write(&sentinel, b"# sentinel config").unwrap();
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["remove", "--dry-run"]);
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_CONFIG_HOME", test_dir.join(".config"));
+    cmd.env("XDG_CACHE_HOME", test_dir.join(".cache"));
+    cmd.env("XDG_DATA_HOME", test_dir.join(".local/share"));
+    let output = cmd.output().expect("failed to run mu remove --dry-run");
+
+    assert_eq!(output.status.code(), Some(0));
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("[dry-run]"), "expected dry run notice: {out}");
+    assert!(
+        sentinel.exists(),
+        "sentinel config.toml must not be deleted during --dry-run"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// `mu completion --install bash` -> writes completion script, exit 0.
+#[test]
+fn completion_install_bash() {
+    let test_dir = std::env::temp_dir().join(format!("mu-comp-install-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&test_dir);
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["completion", "--install", "bash"]);
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_DATA_HOME", test_dir.join(".local/share"));
+    let output = cmd
+        .output()
+        .expect("failed to run mu completion --install bash");
+
+    assert_eq!(output.status.code(), Some(0));
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("Installed completion for bash"),
+        "expected install confirmation in output: {out}"
+    );
+
+    let expected_file = test_dir.join(".local/share/bash-completion/completions/mu");
+    assert!(
+        expected_file.exists(),
+        "installed completion file must exist at {}",
+        expected_file.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+

@@ -23,6 +23,7 @@ pub mod select;
 pub mod status;
 pub mod styles;
 pub mod uninstall;
+pub mod whitelist;
 
 use std::io::IsTerminal;
 

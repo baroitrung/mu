@@ -20,6 +20,7 @@ ratatui = "0.30"
 crossterm = "0.29"
 nix = { version = "0.31", features = ["fs", "process", "user"] }
 time = { version = "0.3", features = ["local-offset", "formatting"] }
+sha2 = "0.10"
 
 [profile.release]
 # Go built with `-s -w` — match by stripping symbols from the release binary.

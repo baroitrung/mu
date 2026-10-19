@@ -7,9 +7,9 @@
 //! commands, including `--dry-run`. Unknown keys are rejected via
 //! `deny_unknown_fields` (the serde equivalent of BurntSushi's `Undecoded()`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, msg};
 use crate::{paths, xdg};
@@ -17,7 +17,7 @@ use crate::{paths, xdg};
 const DEFAULT_WHITELIST_TOML: &str = include_str!("default-whitelist.toml");
 
 /// Holds path protection rules and skip lists.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Whitelist {
     #[serde(default)]
@@ -28,7 +28,7 @@ pub struct Whitelist {
     pub optimize_skip: OptimizeSkip,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtectedPaths {
     #[serde(default)]
@@ -37,14 +37,14 @@ pub struct ProtectedPaths {
     pub protect_running_kernel: bool,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheSkip {
     #[serde(default)]
     pub dirs: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OptimizeSkip {
     #[serde(default)]
@@ -102,6 +102,24 @@ pub fn load_whitelist_from(config_home: &Path) -> Result<Whitelist> {
         wl.optimize_skip.steps = override_cfg.optimize_skip.steps;
     }
     Ok(wl)
+}
+
+/// Saves whitelist overrides to `$XDG_CONFIG_HOME/mu/config.toml`.
+pub fn save_whitelist(wl: &Whitelist) -> Result<PathBuf> {
+    save_whitelist_to(&xdg::config_home(), wl)
+}
+
+/// Testable core: saves whitelist to `<config_home>/mu/config.toml`.
+pub fn save_whitelist_to(config_home: &Path, wl: &Whitelist) -> Result<PathBuf> {
+    let mu_dir = config_home.join("mu");
+    if !mu_dir.exists() {
+        std::fs::create_dir_all(&mu_dir)?;
+    }
+    let user_cfg = mu_dir.join("config.toml");
+    let serialized = toml::to_string_pretty(wl)
+        .map_err(|e| Error::Msg(format!("failed to serialize config: {e}")))?;
+    std::fs::write(&user_cfg, serialized)?;
+    Ok(user_cfg)
 }
 
 fn validate_whitelist_override(override_cfg: &Whitelist) -> Result<()> {

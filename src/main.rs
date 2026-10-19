@@ -25,15 +25,21 @@ mod paths;
 #[allow(dead_code)]
 mod purge;
 #[allow(dead_code)]
+mod remove;
+#[allow(dead_code)]
 mod runner;
 mod runtext;
 #[allow(dead_code)]
 mod size;
 mod status;
 #[allow(dead_code)]
+mod sudo;
+#[allow(dead_code)]
 mod trash;
 #[allow(dead_code)]
 mod uninstall;
+#[allow(dead_code)]
+mod update;
 #[allow(dead_code)]
 mod whitelist;
 mod xdg;
