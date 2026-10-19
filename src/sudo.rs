@@ -47,8 +47,11 @@ pub struct StatusInfo {
 }
 
 pub fn is_module_installed() -> bool {
-    if let Ok(val) = std::env::var("MU_FPRINTD_INSTALLED") {
-        return val == "1" || val == "true";
+    #[cfg(test)]
+    {
+        if let Ok(val) = std::env::var("MU_FPRINTD_INSTALLED") {
+            return val == "1" || val == "true";
+        }
     }
     PAM_FPRINTD_PATHS.iter().any(|p| Path::new(p).exists())
 }
@@ -63,9 +66,9 @@ pub fn resolve_pam_path(custom: Option<&Path>) -> PathBuf {
     PathBuf::from(DEFAULT_PAM_SUDO)
 }
 
-pub fn get_status(pam_path: &Path) -> StatusInfo {
+pub fn get_status_with(pam_path: &Path, module_installed: Option<bool>) -> StatusInfo {
     let pam_file_exists = pam_path.exists();
-    let module_installed = is_module_installed();
+    let module_installed = module_installed.unwrap_or_else(is_module_installed);
     let mut enabled_direct = false;
     let mut enabled_included = false;
 
@@ -113,26 +116,71 @@ pub fn get_status(pam_path: &Path) -> StatusInfo {
     }
 }
 
+pub fn get_status(pam_path: &Path) -> StatusInfo {
+    get_status_with(pam_path, None)
+}
+
 fn backup_pam(pam_path: &Path, content: &str) -> Result<PathBuf, String> {
     let parent = pam_path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = pam_path
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or("sudo");
-    let ts = std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let backup_path = parent.join(format!(".{file_name}.mu-bak-{ts}"));
+        .unwrap_or_default();
+    let nanos = now.as_nanos();
+    let mut backup_path = parent.join(format!(".{file_name}.mu-bak-{nanos}"));
+    let mut counter = 1;
+    while backup_path.exists() {
+        backup_path = parent.join(format!(".{file_name}.mu-bak-{nanos}-{counter}"));
+        counter += 1;
+    }
     fs::write(&backup_path, content)
         .map_err(|e| format!("failed to create backup {}: {}", backup_path.display(), e))?;
+    if let Ok(meta) = fs::metadata(pam_path) {
+        let _ = fs::set_permissions(&backup_path, meta.permissions());
+    }
     Ok(backup_path)
+}
+
+fn rollback_pam(
+    pam_path: &Path,
+    original_content: &str,
+    original_perms: Option<fs::Permissions>,
+) -> Result<(), String> {
+    let parent = pam_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = pam_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("sudo");
+    let temp_path = parent.join(format!(".{file_name}.mu-rollback-{}", std::process::id()));
+
+    fs::write(&temp_path, original_content)
+        .map_err(|e| format!("rollback failed to write temp file: {e}"))?;
+
+    if let Some(perms) = &original_perms {
+        let _ = fs::set_permissions(&temp_path, perms.clone());
+    }
+
+    if let Ok(file) = fs::File::open(&temp_path) {
+        let _ = file.sync_all();
+    }
+
+    if let Err(e) = fs::rename(&temp_path, pam_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "rollback failed to rename over {}: {}",
+            pam_path.display(),
+            e
+        ));
+    }
+    Ok(())
 }
 
 fn atomic_write_pam(
     pam_path: &Path,
     new_content: &str,
-    backup_path: &Path,
     original_content: &str,
     expected_token: &str,
     require_token: bool,
@@ -144,6 +192,8 @@ fn atomic_write_pam(
         .unwrap_or("sudo");
     let temp_path = parent.join(format!(".{file_name}.mu-tmp-{}", std::process::id()));
 
+    let original_perms = fs::metadata(pam_path).ok().map(|m| m.permissions());
+
     if let Err(e) = fs::write(&temp_path, new_content) {
         return Err(format!(
             "cannot write temporary PAM file {} (permission denied? run with sudo): {}",
@@ -152,8 +202,8 @@ fn atomic_write_pam(
         ));
     }
 
-    if let Ok(meta) = fs::metadata(pam_path) {
-        let _ = fs::set_permissions(&temp_path, meta.permissions());
+    if let Some(perms) = &original_perms {
+        let _ = fs::set_permissions(&temp_path, perms.clone());
     }
 
     if let Ok(file) = fs::File::open(&temp_path) {
@@ -162,44 +212,55 @@ fn atomic_write_pam(
 
     if let Err(e) = fs::rename(&temp_path, pam_path) {
         let _ = fs::remove_file(&temp_path);
-        let _ = fs::write(pam_path, original_content);
-        return Err(format!(
-            "failed to replace PAM file {}: {}",
-            pam_path.display(),
-            e
-        ));
+        let rb_res = rollback_pam(pam_path, original_content, original_perms);
+        return Err(match rb_res {
+            Ok(_) => format!("failed to replace PAM file {}: {}", pam_path.display(), e),
+            Err(rb_err) => format!(
+                "failed to replace PAM file {}: {}; rollback failed: {}",
+                pam_path.display(),
+                e,
+                rb_err
+            ),
+        });
     }
 
     let verified = match fs::read_to_string(pam_path) {
         Ok(s) => s,
-        Err(_) => {
-            let _ = fs::copy(backup_path, pam_path);
-            return Err(
-                "verification failed: cannot read back PAM file; rolled back changes".to_string(),
-            );
+        Err(read_err) => {
+            let rb_res = rollback_pam(pam_path, original_content, original_perms);
+            return Err(match rb_res {
+                Ok(_) => format!("verification failed ({read_err}); rolled back changes"),
+                Err(e) => format!("verification failed ({read_err}); rollback failed: {e}"),
+            });
         }
     };
 
     if require_token && !verified.contains(expected_token) {
-        let _ = fs::copy(backup_path, pam_path);
-        return Err(
-            "verification failed: missing expected token after edit; rolled back changes"
+        let rb_res = rollback_pam(pam_path, original_content, original_perms);
+        return Err(match rb_res {
+            Ok(_) => "verification failed: missing expected token after edit; rolled back changes"
                 .to_string(),
-        );
+            Err(e) => format!("verification failed: missing expected token; rollback failed: {e}"),
+        });
     }
     if !require_token && verified.contains(expected_token) {
-        let _ = fs::copy(backup_path, pam_path);
-        return Err(
-            "verification failed: token still present after removal; rolled back changes"
+        let rb_res = rollback_pam(pam_path, original_content, original_perms);
+        return Err(match rb_res {
+            Ok(_) => "verification failed: token still present after removal; rolled back changes"
                 .to_string(),
-        );
+            Err(e) => format!("verification failed: token still present; rollback failed: {e}"),
+        });
     }
 
     Ok(())
 }
 
-pub fn enable(pam_path: &Path, dry_run: bool) -> Result<(), String> {
-    let status = get_status(pam_path);
+pub fn enable_with(
+    pam_path: &Path,
+    dry_run: bool,
+    module_installed: Option<bool>,
+) -> Result<(), String> {
+    let status = get_status_with(pam_path, module_installed);
     if !status.pam_file_exists {
         return Err(format!("PAM file does not exist: {}", pam_path.display()));
     }
@@ -254,19 +315,16 @@ pub fn enable(pam_path: &Path, dry_run: bool) -> Result<(), String> {
     let new_content = new_lines.join("\n") + "\n";
     let backup_path = backup_pam(pam_path, &content)?;
 
-    atomic_write_pam(
-        pam_path,
-        &new_content,
-        &backup_path,
-        &content,
-        "pam_fprintd.so",
-        true,
-    )?;
+    atomic_write_pam(pam_path, &new_content, &content, "pam_fprintd.so", true)?;
 
     println!("Fingerprint authentication enabled for sudo.");
     println!("Backup created at: {}", backup_path.display());
     oplog::log_outcome("sudo", "enable", "success");
     Ok(())
+}
+
+pub fn enable(pam_path: &Path, dry_run: bool) -> Result<(), String> {
+    enable_with(pam_path, dry_run, None)
 }
 
 pub fn disable(pam_path: &Path, dry_run: bool) -> Result<(), String> {
@@ -314,15 +372,7 @@ pub fn disable(pam_path: &Path, dry_run: bool) -> Result<(), String> {
 
     let backup_path = backup_pam(pam_path, &content)?;
 
-    atomic_write_pam(
-        pam_path,
-        &new_content,
-        &backup_path,
-        &content,
-        "pam_fprintd.so",
-        false,
-    )?;
-
+    atomic_write_pam(pam_path, &new_content, &content, "pam_fprintd.so", false)?;
     println!("Fingerprint authentication disabled for sudo.");
     println!("Backup created at: {}", backup_path.display());
     oplog::log_outcome("sudo", "disable", "success");
@@ -405,24 +455,18 @@ session    required   pam_env.so readenv=1 user_readenv=0
         let pam_file = tmp.join("sudo");
         fs::write(&pam_file, SAMPLE_PAM).unwrap();
 
-        // Ensure module check passes in test
-        unsafe {
-            std::env::set_var("MU_FPRINTD_INSTALLED", "1");
-        }
-
         // 1. Enable dry-run
-        let res = enable(&pam_file, true);
+        let res = enable_with(&pam_file, true, Some(true));
         assert!(res.is_ok());
-        let status = get_status(&pam_file);
+        let status = get_status_with(&pam_file, Some(true));
         assert!(!status.enabled, "dry-run must not modify PAM file");
 
         // 2. Enable real
-        let res = enable(&pam_file, false);
+        let res = enable_with(&pam_file, false, Some(true));
         assert!(res.is_ok());
-        let status = get_status(&pam_file);
+        let status = get_status_with(&pam_file, Some(true));
         assert!(status.enabled, "real enable must enable fingerprint auth");
         assert!(status.enabled_direct);
-
         // Backup must exist and be hidden (starts with .)
         let mut found_backup = false;
         for entry in fs::read_dir(&tmp).unwrap().flatten() {
@@ -455,9 +499,6 @@ session    required   pam_env.so readenv=1 user_readenv=0
         assert!(res.is_ok());
         assert!(!get_status(&pam_file).enabled);
 
-        unsafe {
-            std::env::remove_var("MU_FPRINTD_INSTALLED");
-        }
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -499,21 +540,82 @@ session    required   pam_env.so readenv=1 user_readenv=0
         let pam_file = tmp.join("sudo");
         fs::write(&pam_file, SAMPLE_PAM).unwrap();
 
-        unsafe {
-            std::env::set_var("MU_FPRINTD_INSTALLED", "0");
-        }
-
-        let res = enable(&pam_file, false);
+        let res = enable_with(&pam_file, false, Some(false));
         assert!(res.is_err(), "must refuse when module not installed");
         assert!(res.unwrap_err().contains("not installed"));
         assert!(
-            !get_status(&pam_file).enabled,
+            !get_status_with(&pam_file, Some(false)).enabled,
             "PAM file must not be modified"
         );
 
-        unsafe {
-            std::env::remove_var("MU_FPRINTD_INSTALLED");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_disable_refuses_when_enabled_via_include() {
+        let tmp = std::env::temp_dir().join(format!("mu-sudo-dis-inc-{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp);
+        let pam_file = tmp.join("sudo");
+        fs::write(&pam_file, SAMPLE_PAM).unwrap();
+
+        let common_auth = tmp.join("common-auth");
+        fs::write(
+            &common_auth,
+            "auth [success=1 default=ignore] pam_fprintd.so\nauth requisite pam_deny.so\n",
+        )
+        .unwrap();
+
+        let res = disable(&pam_file, false);
+        assert!(
+            res.is_err(),
+            "disable must refuse when enabled via common-auth"
+        );
+        let err = res.unwrap_err();
+        assert!(err.contains("managed globally via pam-auth-update"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_backups_unique_within_same_second_and_preserves_mode() {
+        let tmp = std::env::temp_dir().join(format!("mu-sudo-bak-unique-{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp);
+        let pam_file = tmp.join("sudo");
+        fs::write(&pam_file, SAMPLE_PAM).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&pam_file, fs::Permissions::from_mode(0o440)).unwrap();
         }
+
+        let res1 = enable_with(&pam_file, false, Some(true));
+        assert!(res1.is_ok());
+        let res2 = disable(&pam_file, false);
+        assert!(res2.is_ok());
+
+        let mut backups = Vec::new();
+        for entry in fs::read_dir(&tmp).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".sudo.mu-bak-") {
+                backups.push(entry.path());
+            }
+        }
+        assert_eq!(
+            backups.len(),
+            2,
+            "enable and disable must create two distinct backups"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for b in backups {
+                let meta = fs::metadata(b).unwrap();
+                assert_eq!(meta.permissions().mode() & 0o777, 0o440);
+            }
+        }
+
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -524,14 +626,10 @@ session    required   pam_env.so readenv=1 user_readenv=0
         let pam_file = tmp.join("sudo");
         fs::write(&pam_file, SAMPLE_PAM).unwrap();
 
-        let backup_file = tmp.join(".sudo.mu-bak-test");
-        fs::write(&backup_file, SAMPLE_PAM).unwrap();
-
         // Force verification failure by requiring a token that is not in the new content
         let res = atomic_write_pam(
             &pam_file,
             "corrupted pam content",
-            &backup_file,
             SAMPLE_PAM,
             "nonexistent_token_to_force_failure",
             true,

@@ -430,7 +430,7 @@ graph TD
     - Interactive Ratatui screen to view and toggle entries in `~/.config/mu/config.toml`.
   - **`mu update` (Self-Update):**
     - Queries GitHub Releases API for `https://api.github.com/repos/.../releases/latest`.
-    - Downloads architecture-matched release binary and `checksums.txt`.
+    - Downloads architecture-matched release binary (generic mu asset accepted only on x86_64) and checksums.txt.
     - Verifies SHA-256 checksum against checksums.txt asset (fail-closed, matching install.sh).
     - Atomically replaces current executable via `tempfile` and `rename`.
     - Flags: `--dry-run`, `--force`.

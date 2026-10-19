@@ -53,23 +53,41 @@ pub fn discover_components() -> Vec<RemovableItem> {
         });
     }
 
+    let data_home = xdg::data_home();
     let home = xdg::home_dir();
+
+    // 4. Desktop entry
+    let desktop = data_home.join("applications/mu.desktop");
+    if paths::path_exists(&desktop) {
+        items.push(RemovableItem {
+            label: "Desktop launcher",
+            path: desktop.clone(),
+        });
+    }
     if !home.as_os_str().is_empty() {
-        // 4. Desktop entry
-        let desktop = home.join(".local/share/applications/mu.desktop");
-        if paths::path_exists(&desktop) {
+        let legacy_desktop = home.join(".local/share/applications/mu.desktop");
+        if legacy_desktop != desktop && paths::path_exists(&legacy_desktop) {
             items.push(RemovableItem {
                 label: "Desktop launcher",
-                path: desktop,
+                path: legacy_desktop,
             });
         }
+    }
 
-        // 5. Completions
-        let bash_comp = home.join(".local/share/bash-completion/completions/mu");
-        if paths::path_exists(&bash_comp) {
+    // 5. Completions
+    let bash_comp = data_home.join("bash-completion/completions/mu");
+    if paths::path_exists(&bash_comp) {
+        items.push(RemovableItem {
+            label: "Bash completion",
+            path: bash_comp.clone(),
+        });
+    }
+    if !home.as_os_str().is_empty() {
+        let legacy_bash = home.join(".local/share/bash-completion/completions/mu");
+        if legacy_bash != bash_comp && paths::path_exists(&legacy_bash) {
             items.push(RemovableItem {
                 label: "Bash completion",
-                path: bash_comp,
+                path: legacy_bash,
             });
         }
 
@@ -80,12 +98,21 @@ pub fn discover_components() -> Vec<RemovableItem> {
                 path: zsh_comp,
             });
         }
+    }
 
-        let zsh_site = home.join(".local/share/zsh/site-functions/_mu");
-        if paths::path_exists(&zsh_site) {
+    let zsh_site = data_home.join("zsh/site-functions/_mu");
+    if paths::path_exists(&zsh_site) {
+        items.push(RemovableItem {
+            label: "Zsh site completion",
+            path: zsh_site.clone(),
+        });
+    }
+    if !home.as_os_str().is_empty() {
+        let legacy_zsh_site = home.join(".local/share/zsh/site-functions/_mu");
+        if legacy_zsh_site != zsh_site && paths::path_exists(&legacy_zsh_site) {
             items.push(RemovableItem {
                 label: "Zsh site completion",
-                path: zsh_site,
+                path: legacy_zsh_site,
             });
         }
 
@@ -107,17 +134,18 @@ pub fn discover_components() -> Vec<RemovableItem> {
         }
 
         // Running executable (if user-owned and outside system prefixes)
-        if let Ok(current_exe) = std::env::current_exe() {
-            if current_exe != local_bin
-                && paths::path_exists(&current_exe)
-                && !paths::is_protected(&current_exe)
-                && !items.iter().any(|i| i.path == current_exe)
-            {
-                items.push(RemovableItem {
-                    label: "Binary (running)",
-                    path: current_exe,
-                });
-            }
+        // Collapsed if (Finding 1)
+        if let Ok(current_exe) = std::env::current_exe()
+            && current_exe.file_name().and_then(|n| n.to_str()) == Some("mu")
+            && current_exe != local_bin
+            && paths::path_exists(&current_exe)
+            && !paths::is_protected(&current_exe)
+            && !items.iter().any(|i| i.path == current_exe)
+        {
+            items.push(RemovableItem {
+                label: "Binary (running)",
+                path: current_exe,
+            });
         }
     }
 
@@ -211,7 +239,7 @@ pub fn run(opts: &Options) -> i32 {
     let mut failed = 0;
     for item in &user_components {
         println!("Removing {}...", item.path.display());
-        if let Err(e) = trash::safe_delete(&item.path, false) {
+        if let Err(e) = trash::safe_delete_component(&item.path, false) {
             eprintln!("error removing {}: {}", item.path.display(), e);
             failed += 1;
         }
@@ -274,6 +302,89 @@ mod tests {
         assert!(installed.exists());
         let content = std::fs::read_to_string(&installed).unwrap();
         assert!(content.contains("[Desktop Entry]"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_discover_components_finds_all_items() {
+        let tmp = std::env::temp_dir().join(format!("mu-discover-test-{}", std::process::id()));
+        let config_dir = tmp.join(".config/mu");
+        let data_dir = tmp.join(".local/share/applications");
+        let _ = std::fs::create_dir_all(&config_dir);
+        let _ = std::fs::create_dir_all(&data_dir);
+        let config_file = config_dir.join("config.toml");
+        let desktop_file = data_dir.join("mu.desktop");
+        std::fs::write(&config_file, b"# config").unwrap();
+        std::fs::write(&desktop_file, b"[Desktop Entry]").unwrap();
+
+        let orig_home = std::env::var_os("HOME");
+        let orig_config = std::env::var_os("XDG_CONFIG_HOME");
+        let orig_data = std::env::var_os("XDG_DATA_HOME");
+
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+            std::env::set_var("XDG_CONFIG_HOME", tmp.join(".config"));
+            std::env::set_var("XDG_DATA_HOME", tmp.join(".local/share"));
+        }
+
+        let items = discover_components();
+        assert!(items.iter().any(|i| i.path == config_dir));
+        assert!(items.iter().any(|i| i.path == desktop_file));
+
+        unsafe {
+            match orig_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match orig_config {
+                Some(c) => std::env::set_var("XDG_CONFIG_HOME", c),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match orig_data {
+                Some(d) => std::env::set_var("XDG_DATA_HOME", d),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_remove_with_malformed_config() {
+        let tmp = std::env::temp_dir().join(format!("mu-remove-mal-{}", std::process::id()));
+        let config_dir = tmp.join(".config/mu");
+        let _ = std::fs::create_dir_all(&config_dir);
+        let bad_config = config_dir.join("config.toml");
+        std::fs::write(&bad_config, b"broken = [toml").unwrap();
+
+        let orig_home = std::env::var_os("HOME");
+        let orig_config = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+            std::env::set_var("XDG_CONFIG_HOME", tmp.join(".config"));
+        }
+
+        let opts = Options {
+            dry_run: false,
+            auto_yes: true,
+            debug: false,
+        };
+
+        let code = run(&opts);
+        assert_eq!(code, 0, "remove must succeed even if config is malformed");
+        assert!(!bad_config.exists(), "malformed config must be removed");
+
+        unsafe {
+            match orig_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            match orig_config {
+                Some(c) => std::env::set_var("XDG_CONFIG_HOME", c),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

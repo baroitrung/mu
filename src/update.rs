@@ -149,12 +149,18 @@ pub fn is_newer_version(latest_tag: &str, current: &str) -> bool {
 }
 
 pub fn target_arch_asset_names() -> Vec<String> {
-    let arch = std::env::consts::ARCH;
-    vec![
+    target_arch_asset_names_for(std::env::consts::ARCH)
+}
+
+pub fn target_arch_asset_names_for(arch: &str) -> Vec<String> {
+    let mut names = vec![
         format!("mu-{arch}-unknown-linux-gnu"),
         format!("mu-linux-{arch}"),
-        BINARY_NAME.to_string(),
-    ]
+    ];
+    if arch == "x86_64" {
+        names.push(BINARY_NAME.to_string());
+    }
+    names
 }
 
 pub fn check_background_update_silently() {
@@ -237,17 +243,21 @@ pub fn run_with(opts: &Options, runner: &dyn Runner) -> i32 {
     let bin_asset = candidate_names
         .iter()
         .find_map(|name| release.assets.iter().find(|a| &a.name == name));
-    let resolved_bin_name = bin_asset.map(|a| a.name.as_str()).unwrap_or(BINARY_NAME);
+    let bin_asset = match bin_asset {
+        Some(a) => a,
+        None => {
+            let arch = std::env::consts::ARCH;
+            eprintln!("error: no release binary for {arch}");
+            return 1;
+        }
+    };
+    let resolved_bin_name = &bin_asset.name;
     let checksum_asset = release.assets.iter().find(|a| a.name == "checksums.txt");
 
     if opts.dry_run {
         println!("[dry-run] Would update mu to {latest_tag}");
         println!("[dry-run] Target executable: {}", target_bin.display());
-        if let Some(b) = bin_asset {
-            println!("[dry-run] Binary asset: {}", b.browser_download_url);
-        } else {
-            println!("[dry-run] Binary asset: default release asset '{BINARY_NAME}'");
-        }
+        println!("[dry-run] Binary asset: {}", bin_asset.browser_download_url);
         if let Some(c) = checksum_asset {
             println!("[dry-run] Checksum asset: {}", c.browser_download_url);
         } else {
@@ -290,16 +300,7 @@ pub fn run_with(opts: &Options, runner: &dyn Runner) -> i32 {
     };
 
     // Download binary
-    let fallback_bin_url;
-    let bin_url = match bin_asset {
-        Some(a) => a.browser_download_url.as_str(),
-        None => {
-            fallback_bin_url = format!(
-                "https://github.com/{DEFAULT_REPO}/releases/download/{latest_tag}/{resolved_bin_name}"
-            );
-            &fallback_bin_url
-        }
-    };
+    let bin_url = bin_asset.browser_download_url.as_str();
 
     println!("Downloading {resolved_bin_name} {latest_tag}...");
 
@@ -503,5 +504,59 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 *other
         };
         let code = run_with(&dry_opts, &ProcessRunner);
         assert_eq!(code, 1, "update dry-run must fail when release API fails");
+    }
+
+    #[test]
+    fn test_arch_asset_preference() {
+        let x86_names = target_arch_asset_names_for("x86_64");
+        assert!(x86_names.contains(&"mu".to_string()));
+        assert!(x86_names.contains(&"mu-x86_64-unknown-linux-gnu".to_string()));
+
+        let arm_names = target_arch_asset_names_for("aarch64");
+        assert!(!arm_names.contains(&"mu".to_string()));
+        assert!(arm_names.contains(&"mu-aarch64-unknown-linux-gnu".to_string()));
+
+        let release = ReleaseInfo {
+            tag_name: "v0.4.0".to_string(),
+            name: None,
+            body: None,
+            assets: vec![
+                ReleaseAsset {
+                    name: "mu".to_string(),
+                    browser_download_url: "https://example.com/mu".to_string(),
+                    size: None,
+                },
+                ReleaseAsset {
+                    name: "mu-x86_64-unknown-linux-gnu".to_string(),
+                    browser_download_url: "https://example.com/mu-x86".to_string(),
+                    size: None,
+                },
+            ],
+        };
+
+        let picked = x86_names
+            .iter()
+            .find_map(|name| release.assets.iter().find(|a| &a.name == name))
+            .unwrap();
+        assert_eq!(picked.name, "mu-x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn test_non_x86_rejects_generic_mu_asset() {
+        let arm_names = target_arch_asset_names_for("aarch64");
+        let release = ReleaseInfo {
+            tag_name: "v0.4.0".to_string(),
+            name: None,
+            body: None,
+            assets: vec![ReleaseAsset {
+                name: "mu".to_string(),
+                browser_download_url: "https://example.com/mu".to_string(),
+                size: None,
+            }],
+        };
+        let picked = arm_names
+            .iter()
+            .find_map(|name| release.assets.iter().find(|a| &a.name == name));
+        assert!(picked.is_none(), "aarch64 must reject generic x86 mu asset");
     }
 }

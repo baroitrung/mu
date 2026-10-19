@@ -24,19 +24,31 @@ pub struct WhitelistTui {
     pub config: Whitelist,
     pub modified: bool,
     pub status_msg: Option<String>,
+    pub load_failed: bool,
+    pub config_home: Option<std::path::PathBuf>,
 }
 
 impl WhitelistTui {
     pub fn new() -> Self {
-        let (config, status_msg) = match config::load_user_whitelist() {
-            Ok(Some(cfg)) => (cfg, None),
+        Self::new_from(None)
+    }
+
+    pub fn new_from(config_home: Option<&std::path::Path>) -> Self {
+        let res = match config_home {
+            Some(p) => config::load_user_whitelist_from(p),
+            None => config::load_user_whitelist(),
+        };
+        let (config, status_msg, load_failed) = match res {
+            Ok(Some(cfg)) => (cfg, None, false),
             Ok(None) => (
                 Whitelist::default(),
                 Some("User whitelist (~/.config/mu/config.toml)".to_string()),
+                false,
             ),
             Err(e) => (
                 Whitelist::default(),
-                Some(format!("Warning: error loading user config: {e}")),
+                Some(format!("Error loading user config: {e}. Saving disabled.")),
+                true,
             ),
         };
         Self {
@@ -45,9 +57,10 @@ impl WhitelistTui {
             config,
             modified: false,
             status_msg,
+            load_failed,
+            config_home: config_home.map(|p| p.to_path_buf()),
         }
     }
-
     pub fn current_items(&self) -> &[String] {
         match self.tab {
             WhitelistTab::ProtectedPaths => &self.config.protected_paths.system,
@@ -118,7 +131,18 @@ impl WhitelistTui {
                 false
             }
             KeyCode::Char('s') => {
-                match config::save_whitelist(&self.config) {
+                if self.load_failed {
+                    self.status_msg = Some(
+                        "Refusing to save: user config file was malformed on startup. Fix syntax manually to avoid data loss."
+                            .to_string(),
+                    );
+                    return false;
+                }
+                let res = match &self.config_home {
+                    Some(p) => config::save_whitelist_to(p, &self.config),
+                    None => config::save_whitelist(&self.config),
+                };
+                match res {
                     Ok(path) => {
                         self.status_msg = Some(format!("Saved to {}", path.display()));
                         self.modified = false;
@@ -232,7 +256,8 @@ mod tests {
 
     #[test]
     fn test_whitelist_tui_tab_switch() {
-        let mut tui = WhitelistTui::new();
+        let tmp = std::env::temp_dir().join(format!("mu-tui-tab-{}", std::process::id()));
+        let mut tui = WhitelistTui::new_from(Some(&tmp));
         assert_eq!(tui.tab, WhitelistTab::ProtectedPaths);
 
         let tab_key = KeyEvent::from(KeyCode::Tab);
@@ -248,14 +273,16 @@ mod tests {
 
     #[test]
     fn test_whitelist_tui_quit() {
-        let mut tui = WhitelistTui::new();
+        let tmp = std::env::temp_dir().join(format!("mu-tui-quit-{}", std::process::id()));
+        let mut tui = WhitelistTui::new_from(Some(&tmp));
         let q_key = KeyEvent::from(KeyCode::Char('q'));
         assert!(tui.handle_key_event(q_key));
     }
 
     #[test]
     fn test_whitelist_tui_toggle_and_delete() {
-        let mut tui = WhitelistTui::new();
+        let tmp = std::env::temp_dir().join(format!("mu-tui-toggle-{}", std::process::id()));
+        let mut tui = WhitelistTui::new_from(Some(&tmp));
         tui.config
             .protected_paths
             .system
@@ -277,5 +304,32 @@ mod tests {
         let d_key = KeyEvent::from(KeyCode::Char('d'));
         assert!(!tui.handle_key_event(d_key));
         assert!(tui.current_items().is_empty());
+    }
+
+    #[test]
+    fn test_whitelist_tui_refuses_save_on_load_error() {
+        let tmp = std::env::temp_dir().join(format!("mu-tui-err-{}", std::process::id()));
+        let mu_dir = tmp.join("mu");
+        let _ = std::fs::create_dir_all(&mu_dir);
+        let bad_file = mu_dir.join("config.toml");
+        std::fs::write(&bad_file, b"broken = [toml").unwrap();
+
+        let mut tui = WhitelistTui::new_from(Some(&tmp));
+        assert!(tui.load_failed);
+
+        // Pressing 's' must refuse to save
+        let s_key = KeyEvent::from(KeyCode::Char('s'));
+        assert!(!tui.handle_key_event(s_key));
+        assert!(
+            tui.status_msg
+                .as_deref()
+                .unwrap()
+                .contains("Refusing to save")
+        );
+
+        // File content was NOT overwritten
+        assert_eq!(std::fs::read(&bad_file).unwrap(), b"broken = [toml");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -128,6 +128,49 @@ pub fn safe_delete_with(
     }
 }
 
+/// Trashes a verified mu component using default system whitelist protection,
+/// allowing self-removal to succeed even when user configuration is malformed.
+pub fn safe_delete_component(path: &Path, dry_run: bool) -> Result<()> {
+    safe_delete_component_with(&ProcessRunner, &TrashDeps::real(), path, dry_run)
+}
+
+/// Injectable core of [`safe_delete_component`].
+pub fn safe_delete_component_with(
+    runner: &dyn Runner,
+    deps: &TrashDeps,
+    path: &Path,
+    dry_run: bool,
+) -> Result<()> {
+    let wl = config::default_whitelist();
+    if whitelist::is_whitelisted(path, &wl) {
+        return msg(format!("refused: {} is a protected path", path.display()));
+    }
+    std::fs::symlink_metadata(path)
+        .map_err(|e| Error::Msg(format!("inspect {}: {e}", path.display())))?;
+    if dry_run {
+        oplog::log_outcome("trash", &path.to_string_lossy(), "dry-run");
+        return Ok(());
+    }
+
+    if runner.look_path("gio").is_ok() {
+        let spec = CommandSpec::new("gio", [std::ffi::OsStr::new("trash"), path.as_os_str()]);
+        if runner.run(&spec).is_ok() {
+            oplog::log_outcome("trash", &path.to_string_lossy(), "success");
+            return Ok(());
+        }
+    }
+    match move_to_trash(deps, path) {
+        Ok(_) => {
+            oplog::log_outcome("trash", &path.to_string_lossy(), "success");
+            Ok(())
+        }
+        Err(e) => {
+            oplog::log_outcome("trash", &path.to_string_lossy(), "failure");
+            Err(e.with_context(format!("trash {}", path.display())))
+        }
+    }
+}
+
 struct TrashLocation {
     files_dir: PathBuf,
     info_dir: PathBuf,
