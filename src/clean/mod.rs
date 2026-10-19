@@ -366,6 +366,7 @@ fn run_plain(
     let freed = execute(&mut r, &results, opts, deps)?;
     let _ = print_downloads_large_files_hint(&deps.home, &mut r);
     r.summary(&format!("All done — freed {}", size::human_size(freed)))?;
+    check_project_artifacts_hint(&mut r)?;
     Ok(format!("Freed {}", size::human_size(freed)))
 }
 
@@ -418,6 +419,35 @@ fn print_downloads_large_files_hint(
         r.line(format_args!(
             "\nHint: found {count} large file{} (>500MB) in ~/Downloads (run 'mu analyze' to inspect)",
             if count == 1 { "" } else { "s" }
+        ))?;
+    }
+    Ok(())
+}
+
+/// Check default project directories for heavy build artifacts (> 2 GB) and print an advisory hint.
+fn check_project_artifacts_hint(r: &mut runtext::Run<'_>) -> Result<()> {
+    let home = xdg::home_dir();
+    let candidates = [
+        home.join("Projects"),
+        home.join("Code"),
+        home.join("src"),
+        home.join("Development"),
+    ];
+    let mut total_bytes: u64 = 0;
+    for dir in &candidates {
+        if dir.is_dir() {
+            let artifacts = crate::purge::scanner::scan_root(dir, false);
+            for a in artifacts {
+                total_bytes = total_bytes.saturating_add(a.size);
+            }
+        }
+    }
+
+    const TWO_GIGABYTES: u64 = 2 * 1024 * 1024 * 1024;
+    if total_bytes > TWO_GIGABYTES {
+        r.line(format_args!(
+            "\n💡 Hint: Found {} of project build artifacts in code directories. Run 'mu purge' to reclaim space.",
+            size::human_size(total_bytes as i64)
         ))?;
     }
     Ok(())

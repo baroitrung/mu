@@ -169,6 +169,9 @@ fn help_lists_subcommands() {
         "status",
         "uninstall",
         "completion",
+        "history",
+        "installer",
+        "purge",
     ] {
         assert!(out.contains(cmd), "missing {cmd} in help");
     }
@@ -370,6 +373,89 @@ fn clean_dry_run_sentinel_immutability() {
     let _ = std::fs::remove_dir_all(&test_dir);
 }
 
+/// `mu history --limit 5` -> renders tabular log of recent operations, exit 0.
+#[test]
+fn history_limit_tabular() {
+    let o = mu(&["history", "--limit", "5"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    // Either header or no operations message
+    assert!(
+        out.contains("TIMESTAMP") || out.contains("No recent operations recorded"),
+        "unexpected output: {out}"
+    );
+}
+
+/// `mu history --json` -> valid JSON array with fields timestamp, action, outcome, target.
+#[test]
+fn history_json_array() {
+    let o = mu(&["history", "--json"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).expect("history JSON parse");
+    assert!(v.is_array(), "expected JSON array: {v}");
+    if let Some(first) = v.as_array().and_then(|arr| arr.first()) {
+        for key in ["timestamp", "action", "outcome", "target"] {
+            assert!(first.get(key).is_some(), "missing {key} in entry: {first}");
+        }
+    }
+}
+
+/// `mu history --help` -> renders usage matching golden fixture, exit 0.
+#[test]
+fn history_help_output() {
+    let o = mu(&["history", "--help"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), include_str!("golden/help-history.txt"));
+}
+
+/// `mu purge --dry-run` -> scans search paths and exits 0.
+#[test]
+fn purge_dry_run_scans() {
+    let o = mu(&["purge", "--dry-run"]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    let out = stdout(&o);
+    assert!(
+        out.contains("project build artifact")
+            || out.contains("No project build artifacts found")
+            || out.contains("No project directories found"),
+        "unexpected purge dry run output: {out}"
+    );
+}
+
+/// Sentinel immutability test (purge):
+/// `mu purge --dry-run --paths=/tmp/mu-purge-test` leaves sentinel.js intact.
+#[test]
+fn purge_sentinel_immutability() {
+    let test_dir = std::env::temp_dir().join(format!("mu-purge-test-{}", std::process::id()));
+    let nm = test_dir.join("node_modules");
+    std::fs::create_dir_all(&nm).unwrap();
+    let sentinel = nm.join("sentinel.js");
+    std::fs::write(&sentinel, b"console.log('sentinel');").unwrap();
+
+    let o = mu(&[
+        "purge",
+        "--dry-run",
+        &format!("--paths={}", test_dir.display()),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    assert!(
+        sentinel.exists(),
+        "purge --dry-run must leave sentinel.js intact"
+    );
+
+    let out = stdout(&o);
+    assert!(
+        out.contains("DRY RUN"),
+        "output should mention DRY RUN: {out}"
+    );
+    assert!(
+        out.contains("node_modules"),
+        "output should list node_modules: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
 /// Phase 2: `mu uninstall --list` lists installed packages with source prefix.
 #[test]
 fn uninstall_list_outputs_packages() {
@@ -537,4 +623,53 @@ fn clean_dry_run_all_opt_in_targets() {
         out.contains("Orphaned User Services"),
         "missing orphaned-services: {out}"
     );
+}
+
+/// Sentinel immutability test (installer):
+/// `mu installer --dry-run --paths=/tmp/mu-installer-test` leaves dummy.deb intact.
+#[test]
+fn installer_sentinel_immutability() {
+    let test_dir = std::env::temp_dir().join(format!("mu-installer-test-{}", std::process::id()));
+    std::fs::create_dir_all(&test_dir).unwrap();
+    let dummy = test_dir.join("dummy.deb");
+    std::fs::write(&dummy, b"dummy deb package content").unwrap();
+
+    let o = mu(&[
+        "installer",
+        "--dry-run",
+        &format!("--paths={}", test_dir.display()),
+    ]);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    assert!(
+        dummy.exists(),
+        "installer --dry-run must leave dummy.deb intact"
+    );
+
+    let out = stdout(&o);
+    assert!(
+        out.contains("DRY RUN"),
+        "output should mention DRY RUN: {out}"
+    );
+    assert!(
+        out.contains("dummy.deb"),
+        "output should list dummy.deb: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// `mu purge --help` -> renders usage matching golden fixture, exit 0.
+#[test]
+fn purge_help_output() {
+    let o = mu(&["purge", "--help"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), include_str!("golden/help-purge.txt"));
+}
+
+/// `mu installer --help` -> renders usage matching golden fixture, exit 0.
+#[test]
+fn installer_help_output() {
+    let o = mu(&["installer", "--help"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(stdout(&o), include_str!("golden/help-installer.txt"));
 }

@@ -43,7 +43,10 @@ Available Commands:
   clean       Free disk space by removing caches, logs, and old packages
   completion  Generate the autocompletion script for the specified shell
   help        Help about any command
+  history     View recent operations and deletion log
+  installer   Find and remove downloaded installer packages (.deb, .AppImage, .iso)
   optimize    Run system maintenance: apt autoremove, journal vacuum, cache refresh
+  purge       Safely clean heavy project build artifacts (node_modules, target, .venv)
   status      Live system dashboard: CPU, RAM, disk, network, health score
   uninstall   Remove apps and all their config, cache, and data remnants
 
@@ -379,6 +382,53 @@ Flags:
 Global Flags:
       --debug   Enable verbose debug logging
 ";
+const HISTORY_HELP: &str = "\
+View recent operations and deletion log from operations.log.
+
+Usage:
+  mu history [flags]
+
+Flags:
+  -h, --help        help for history
+      --json        Output operations log as a JSON array
+      --limit int   Number of recent operations to display (default 20)
+
+Global Flags:
+      --debug   Enable verbose debug logging
+";
+
+const INSTALLER_HELP: &str = "\
+Find and remove downloaded installer packages (.deb, .AppImage, .iso).
+
+Usage:
+  mu installer [flags]
+
+Flags:
+      --dry-run         Preview actions without making changes
+  -h, --help            help for installer
+      --paths strings   Specific directories to scan
+  -y, --yes             Skip confirmation prompt
+
+Global Flags:
+      --debug   Enable verbose debug logging
+";
+
+const PURGE_HELP: &str = "\
+Safely clean heavy project build artifacts (node_modules, target, .venv).
+
+Usage:
+  mu purge [flags]
+
+Flags:
+      --dry-run         Preview actions without making changes
+  -h, --help            help for purge
+      --include-empty   Include empty build artifact directories
+      --paths strings   Specific project directories to scan
+  -y, --yes             Skip confirmation prompt
+
+Global Flags:
+      --debug   Enable verbose debug logging
+";
 
 // ---------------------------------------------------------------------------
 // Subcommand metadata
@@ -388,7 +438,10 @@ const REAL_COMMANDS: &[&str] = &[
     "analyze",
     "audit",
     "clean",
+    "history",
+    "installer",
     "optimize",
+    "purge",
     "status",
     "uninstall",
 ];
@@ -398,7 +451,10 @@ fn cmd_help(name: &str) -> Option<&'static str> {
         "analyze" => Some(ANALYZE_HELP),
         "audit" => Some(AUDIT_HELP),
         "clean" => Some(CLEAN_HELP),
+        "history" => Some(HISTORY_HELP),
+        "installer" => Some(INSTALLER_HELP),
         "optimize" => Some(OPTIMIZE_HELP),
+        "purge" => Some(PURGE_HELP),
         "status" => Some(STATUS_HELP),
         "uninstall" => Some(UNINSTALL_HELP),
         _ => None,
@@ -455,6 +511,21 @@ enum Command {
         list: bool,
         permanent: bool,
         packages: Vec<String>,
+        yes: bool,
+    },
+    History {
+        limit: usize,
+        json: bool,
+    },
+    Purge {
+        paths: Vec<std::path::PathBuf>,
+        dry_run: bool,
+        yes: bool,
+        include_empty: bool,
+    },
+    Installer {
+        paths: Vec<std::path::PathBuf>,
+        dry_run: bool,
         yes: bool,
     },
 }
@@ -578,6 +649,38 @@ pub fn run() -> ! {
                     packages,
                     auto_yes: yes,
                 })),
+                Command::History { limit, json } => {
+                    std::process::exit(crate::history::run(&crate::history::Options {
+                        limit,
+                        json,
+                    }));
+                }
+                Command::Purge {
+                    paths,
+                    dry_run,
+                    yes,
+                    include_empty,
+                } => {
+                    std::process::exit(crate::purge::run(&crate::purge::Options {
+                        paths,
+                        dry_run,
+                        auto_yes: yes,
+                        include_empty,
+                        debug,
+                    }));
+                }
+                Command::Installer {
+                    paths,
+                    dry_run,
+                    yes,
+                } => {
+                    std::process::exit(crate::installer::run(&crate::installer::Options {
+                        paths,
+                        dry_run,
+                        auto_yes: yes,
+                        debug,
+                    }));
+                }
             }
         }
     }
@@ -716,6 +819,24 @@ const F_EXTERNAL: FlagSpec = FlagSpec {
     takes_value: true,
     display: "--external",
 };
+const F_LIMIT: FlagSpec = FlagSpec {
+    long: "limit",
+    short: None,
+    takes_value: true,
+    display: "--limit",
+};
+const F_PATHS: FlagSpec = FlagSpec {
+    long: "paths",
+    short: None,
+    takes_value: true,
+    display: "--paths",
+};
+const F_INCLUDE_EMPTY: FlagSpec = FlagSpec {
+    long: "include-empty",
+    short: None,
+    takes_value: false,
+    display: "--include-empty",
+};
 
 const ROOT_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_VERSION];
 const HELP_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP];
@@ -730,6 +851,9 @@ fn cmd_flagset(name: &str) -> &'static [FlagSpec] {
         "optimize" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_SKIP],
         "audit" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON, F_REPORT, F_INCLUDE],
         "uninstall" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_PERMANENT, F_LIST, F_YES],
+        "history" => &[F_DEBUG, F_HELP, F_JSON, F_LIMIT],
+        "installer" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_PATHS],
+        "purge" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_PATHS, F_INCLUDE_EMPTY],
         _ => &[],
     }
 }
@@ -966,10 +1090,13 @@ const SUGGEST_COMMANDS: &[&str] = &[
     "analyze",
     "audit",
     "clean",
-    "uninstall",
-    "optimize",
-    "status",
     "completion",
+    "history",
+    "installer",
+    "optimize",
+    "purge",
+    "status",
+    "uninstall",
 ];
 
 /// `unknown command "X" for "mu"` + `Did you mean this?` suggestions
@@ -1076,6 +1203,43 @@ fn exec_subcommand(name: &str, args: &[String]) -> Outcome {
             permanent: p.get("permanent"),
             yes: p.get("yes"),
             packages: p.positionals,
+        },
+        "history" => {
+            let limit = if let Some(s) = p.vals("limit").first() {
+                match s.parse::<usize>() {
+                    Ok(l) => l,
+                    Err(_) => {
+                        return perr(format!(
+                            "invalid argument \"{s}\" for \"--limit\" flag: strconv.ParseInt: parsing \"{s}\": invalid syntax\n"
+                        ));
+                    }
+                }
+            } else {
+                crate::history::DEFAULT_LIMIT
+            };
+            Command::History {
+                limit,
+                json: p.get("json"),
+            }
+        }
+        "purge" => Command::Purge {
+            paths: p
+                .vals("paths")
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            dry_run: p.get("dry-run"),
+            yes: p.get("yes"),
+            include_empty: p.get("include-empty"),
+        },
+        "installer" => Command::Installer {
+            paths: p
+                .vals("paths")
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            dry_run: p.get("dry-run"),
+            yes: p.get("yes"),
         },
         _ => unreachable!(),
     };
@@ -1942,5 +2106,96 @@ mod tests {
             UNINSTALL_HELP,
             include_str!("../tests/golden/help-uninstall.txt")
         );
+    }
+    #[test]
+    fn golden_history_help_byte_exact() {
+        assert_eq!(
+            HISTORY_HELP,
+            include_str!("../tests/golden/help-history.txt")
+        );
+    }
+
+    #[test]
+    fn golden_installer_help_byte_exact() {
+        assert_eq!(
+            INSTALLER_HELP,
+            include_str!("../tests/golden/help-installer.txt")
+        );
+    }
+
+    #[test]
+    fn golden_purge_help_byte_exact() {
+        assert_eq!(PURGE_HELP, include_str!("../tests/golden/help-purge.txt"));
+    }
+
+    #[test]
+    fn history_flag_parsing() {
+        match parse(&args(&["history", "--json", "--limit", "50"])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::History { limit, json } => {
+                    assert_eq!(limit, 50);
+                    assert!(json);
+                }
+                _ => panic!("expected History"),
+            },
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn purge_flag_parsing() {
+        match parse(&args(&[
+            "purge",
+            "--dry-run",
+            "-y",
+            "--include-empty",
+            "--paths=/tmp/a,/tmp/b",
+        ])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::Purge {
+                    paths,
+                    dry_run,
+                    yes,
+                    include_empty,
+                } => {
+                    assert_eq!(
+                        paths,
+                        vec![
+                            std::path::PathBuf::from("/tmp/a"),
+                            std::path::PathBuf::from("/tmp/b")
+                        ]
+                    );
+                    assert!(dry_run);
+                    assert!(yes);
+                    assert!(include_empty);
+                }
+                _ => panic!("expected Purge"),
+            },
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn installer_flag_parsing() {
+        match parse(&args(&[
+            "installer",
+            "--dry-run",
+            "-y",
+            "--paths=/tmp/install",
+        ])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::Installer {
+                    paths,
+                    dry_run,
+                    yes,
+                } => {
+                    assert_eq!(paths, vec![std::path::PathBuf::from("/tmp/install")]);
+                    assert!(dry_run);
+                    assert!(yes);
+                }
+                _ => panic!("expected Installer"),
+            },
+            _ => panic!("expected Run"),
+        }
     }
 }

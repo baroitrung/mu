@@ -1,0 +1,12 @@
+View recent operations and deletion log from operations.log.
+
+Usage:
+  mu history [flags]
+
+Flags:
+  -h, --help        help for history
+      --json        Output operations log as a JSON array
+      --limit int   Number of recent operations to display (default 20)
+
+Global Flags:
+      --debug   Enable verbose debug logging
