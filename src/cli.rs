@@ -893,14 +893,18 @@ fn parse_duration(s: &str) -> Option<std::time::Duration> {
     } else if let Some(s_str) = s.strip_suffix('s') {
         let v = s_str.parse::<f64>().ok()?;
         if v > 0.0 && v.is_finite() {
-            std::time::Duration::try_from_secs_f64(v).ok()
+            std::time::Duration::try_from_secs_f64(v)
+                .ok()
+                .filter(|d| !d.is_zero())
         } else {
             None
         }
     } else if let Some(m_str) = s.strip_suffix('m') {
         let v = m_str.parse::<f64>().ok()?;
         if v > 0.0 && v.is_finite() {
-            std::time::Duration::try_from_secs_f64(v * 60.0).ok()
+            std::time::Duration::try_from_secs_f64(v * 60.0)
+                .ok()
+                .filter(|d| !d.is_zero())
         } else {
             None
         }
@@ -2338,11 +2342,13 @@ mod tests {
         assert_eq!(parse_duration("infs"), None);
         assert_eq!(parse_duration("-1s"), None);
         assert_eq!(parse_duration("1e300s"), None);
+        assert_eq!(parse_duration("1e-10s"), None);
+        assert_eq!(parse_duration("1e-12m"), None);
     }
 
     #[test]
     fn status_interval_flag_zero_and_infinite_rejected() {
-        for arg in ["0s", "0ms", "0", "infs", "1e300s"] {
+        for arg in ["0s", "0ms", "0", "infs", "1e300s", "1e-10s", "1e-12m"] {
             match parse(&args(&["status", "--interval", arg])) {
                 Outcome::Stderr { text, code } => {
                     assert_eq!(code, 1);

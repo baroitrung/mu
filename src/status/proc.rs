@@ -1441,7 +1441,9 @@ cpu cores	: 2
         std::fs::write(bat0.join("energy_full"), "4500000\n").unwrap();
         std::fs::write(bat0.join("energy_full_design"), "5000000\n").unwrap();
 
-        let bat = read_battery_from(&temp_dir).unwrap().expect("battery found");
+        let bat = read_battery_from(&temp_dir)
+            .unwrap()
+            .expect("battery found");
         assert_eq!(bat.percentage, 85);
         assert_eq!(bat.status, "Discharging");
         assert_eq!(bat.health_percent, Some(90.0));
@@ -1461,7 +1463,9 @@ cpu cores	: 2
         std::fs::write(bat1.join("charge_full"), "3800000\n").unwrap();
         std::fs::write(bat1.join("charge_full_design"), "4000000\n").unwrap();
 
-        let bat = read_battery_from(&temp_dir).unwrap().expect("battery found");
+        let bat = read_battery_from(&temp_dir)
+            .unwrap()
+            .expect("battery found");
         assert_eq!(bat.percentage, 95);
         assert_eq!(bat.status, "Charging");
         assert_eq!(bat.health_percent, Some(95.0));

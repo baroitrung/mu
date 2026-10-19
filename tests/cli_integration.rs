@@ -120,7 +120,7 @@ fn status_help_output() {
 /// `mu status --interval 0s` and `infs` are rejected with exit code 1.
 #[test]
 fn status_interval_invalid_rejected() {
-    for arg in ["0s", "0ms", "0", "infs", "1e300s"] {
+    for arg in ["0s", "0ms", "0", "infs", "1e300s", "1e-10s", "1e-12m"] {
         let o = mu(&["status", "--interval", arg]);
         assert_eq!(o.status.code(), Some(1), "for {arg}");
         assert!(
