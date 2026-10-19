@@ -90,12 +90,13 @@ impl Deps {
 /// Go `func(io.Writer) error` — the step action writing captured
 /// stdout/stderr to the sink.
 type StepRun = Box<dyn Fn(&mut dyn Write) -> Result<()>>;
+type StepDryRunLines = Arc<dyn Fn(&Deps) -> Vec<String> + Send + Sync>;
 
 pub(crate) struct Step {
     pub id: &'static str,
     pub desc: &'static str,
     pub dry_run_cmd: &'static str,
-    pub dry_run_lines: Option<Arc<dyn Fn(&Deps) -> Vec<String> + Send + Sync>>,
+    pub dry_run_lines: Option<StepDryRunLines>,
     pub run: StepRun,
 }
 
@@ -719,13 +720,13 @@ fn find_sqlite_candidates(home: &Path) -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(&ff) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir() {
-                if let Ok(sub) = std::fs::read_dir(&p) {
-                    for f in sub.flatten() {
-                        let fp = f.path();
-                        if fp.extension().and_then(|s| s.to_str()) == Some("sqlite") {
-                            candidates.push(fp);
-                        }
+            if p.is_dir()
+                && let Ok(sub) = std::fs::read_dir(&p)
+            {
+                for f in sub.flatten() {
+                    let fp = f.path();
+                    if fp.extension().and_then(|s| s.to_str()) == Some("sqlite") {
+                        candidates.push(fp);
                     }
                 }
             }
@@ -772,13 +773,13 @@ fn find_sqlite_candidates(home: &Path) -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(&tb) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir() {
-                if let Ok(sub) = std::fs::read_dir(&p) {
-                    for f in sub.flatten() {
-                        let fp = f.path();
-                        if fp.extension().and_then(|s| s.to_str()) == Some("sqlite") {
-                            candidates.push(fp);
-                        }
+            if p.is_dir()
+                && let Ok(sub) = std::fs::read_dir(&p)
+            {
+                for f in sub.flatten() {
+                    let fp = f.path();
+                    if fp.extension().and_then(|s| s.to_str()) == Some("sqlite") {
+                        candidates.push(fp);
                     }
                 }
             }
@@ -796,10 +797,10 @@ fn is_process_running(name: &str) -> bool {
             if !path.is_dir() {
                 continue;
             }
-            if let Ok(comm) = std::fs::read_to_string(path.join("comm")) {
-                if comm.trim() == name {
-                    return true;
-                }
+            if let Ok(comm) = std::fs::read_to_string(path.join("comm"))
+                && comm.trim() == name
+            {
+                return true;
             }
         }
     }
@@ -955,24 +956,20 @@ fn clean_stale_recursive(
                     cleaned,
                     errors,
                 )?;
-            } else if meta.is_file() {
-                if let Ok(mtime) = meta.modified() {
-                    if let Ok(age) = now.duration_since(mtime) {
-                        if age >= max_age {
-                            if let Err(e) = crate::paths::validate_cleanup_candidate(state_home, &p)
-                            {
-                                errors.push(e);
-                                continue;
-                            }
-                            if let Err(e) =
-                                trash::safe_delete_with(runner, config_home, trash_deps, &p, false)
-                            {
-                                errors.push(e);
-                            } else {
-                                *cleaned += 1;
-                            }
-                        }
-                    }
+            } else if meta.is_file()
+                && let Ok(mtime) = meta.modified()
+                && let Ok(age) = now.duration_since(mtime)
+                && age >= max_age
+            {
+                if let Err(e) = crate::paths::validate_cleanup_candidate(state_home, &p) {
+                    errors.push(e);
+                    continue;
+                }
+                if let Err(e) = trash::safe_delete_with(runner, config_home, trash_deps, &p, false)
+                {
+                    errors.push(e);
+                } else {
+                    *cleaned += 1;
                 }
             }
         }
@@ -998,12 +995,12 @@ fn is_live_state(state_home: &Path, p: &Path, histfile: Option<&Path>) -> bool {
             return true;
         }
     }
-    if let Ok(rel) = p.strip_prefix(state_home) {
-        if let Some(std::path::Component::Normal(first)) = rel.components().next() {
-            return LIVE_STATE_DIRS
-                .iter()
-                .any(|d| first == std::ffi::OsStr::new(d));
-        }
+    if let Ok(rel) = p.strip_prefix(state_home)
+        && let Some(std::path::Component::Normal(first)) = rel.components().next()
+    {
+        return LIVE_STATE_DIRS
+            .iter()
+            .any(|d| first == std::ffi::OsStr::new(d));
     }
     false
 }
@@ -1071,10 +1068,11 @@ fn services_audit(config_home: &Path, out: &mut dyn Write) -> Result<()> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Ok(meta) = path.symlink_metadata() {
-                if meta.file_type().is_symlink() && std::fs::metadata(&path).is_err() {
-                    broken.push(path.display().to_string());
-                }
+            if let Ok(meta) = path.symlink_metadata()
+                && meta.file_type().is_symlink()
+                && std::fs::metadata(&path).is_err()
+            {
+                broken.push(path.display().to_string());
             }
         }
     }
@@ -1154,15 +1152,15 @@ fn disk_health_audit(runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
     let mut probed = false;
     if runner.look_path("smartctl").is_ok() {
         let res = runner.run(&CommandSpec::new("smartctl", ["--scan"]));
-        if let Ok(output) = res {
-            if !output.stdout.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "SMART devices detected:\n{}",
-                    output.stdout_lossy().trim()
-                );
-                probed = true;
-            }
+        if let Ok(output) = res
+            && !output.stdout.is_empty()
+        {
+            let _ = writeln!(
+                out,
+                "SMART devices detected:\n{}",
+                output.stdout_lossy().trim()
+            );
+            probed = true;
         }
     }
     if !probed && runner.look_path("journalctl").is_ok() {
