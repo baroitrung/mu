@@ -102,14 +102,37 @@ pub fn discover_components() -> Vec<RemovableItem> {
         if paths::path_exists(&local_bin) {
             items.push(RemovableItem {
                 label: "Binary (~/.local/bin/mu)",
-                path: local_bin,
+                path: local_bin.clone(),
             });
+        }
+
+        // Running executable (if user-owned and outside system prefixes)
+        if let Ok(current_exe) = std::env::current_exe() {
+            if current_exe != local_bin
+                && paths::path_exists(&current_exe)
+                && !paths::is_protected(&current_exe)
+                && !items.iter().any(|i| i.path == current_exe)
+            {
+                items.push(RemovableItem {
+                    label: "Binary (running)",
+                    path: current_exe,
+                });
+            }
         }
     }
 
-    // 7. System completion / binary if writable and exists
+    // 7. System binary (/usr/local/bin/mu)
+    let sys_bin = Path::new("/usr/local/bin/mu");
+    if paths::path_exists(sys_bin) && !items.iter().any(|i| i.path == sys_bin) {
+        items.push(RemovableItem {
+            label: "System binary (/usr/local/bin/mu)",
+            path: sys_bin.to_path_buf(),
+        });
+    }
+
+    // 8. System completion (/etc/bash_completion.d/mu)
     let sys_bash = Path::new("/etc/bash_completion.d/mu");
-    if paths::path_exists(sys_bash) && !paths::is_protected(sys_bash) {
+    if paths::path_exists(sys_bash) && !items.iter().any(|i| i.path == sys_bash) {
         items.push(RemovableItem {
             label: "System bash completion",
             path: sys_bash.to_path_buf(),
@@ -117,6 +140,34 @@ pub fn discover_components() -> Vec<RemovableItem> {
     }
 
     items
+}
+
+/// Generate standard FreeDesktop desktop launcher entry.
+pub fn generate_desktop_entry(exec_path: Option<&Path>) -> String {
+    let exec = exec_path.and_then(|p| p.to_str()).unwrap_or("mu");
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=mu\n\
+         Comment=System cleaner and optimizer for Ubuntu\n\
+         Exec={exec}\n\
+         Icon=utilities-system-monitor\n\
+         Terminal=true\n\
+         Categories=System;Utility;\n\
+         Keywords=cleaner;optimizer;system;cache;\n"
+    )
+}
+
+/// Installs desktop launcher to `~/.local/share/applications/mu.desktop` (or custom directory).
+pub fn install_desktop_entry(custom_path: Option<&Path>) -> std::io::Result<PathBuf> {
+    let desktop_dir = custom_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| xdg::data_home().join("applications"));
+    std::fs::create_dir_all(&desktop_dir)?;
+    let target = desktop_dir.join("mu.desktop");
+    let content = generate_desktop_entry(None);
+    std::fs::write(&target, content)?;
+    Ok(target)
 }
 
 pub fn run(opts: &Options) -> i32 {
@@ -127,15 +178,26 @@ pub fn run(opts: &Options) -> i32 {
         return 0;
     }
 
+    let (user_components, sys_components): (Vec<_>, Vec<_>) = components
+        .into_iter()
+        .partition(|item| !paths::is_protected(&item.path));
+
     println!("Discovered mu components to remove:");
-    for item in &components {
+    for item in user_components.iter().chain(sys_components.iter()) {
         println!("  • {:<26} {}", item.label, item.path.display());
     }
 
     if opts.dry_run {
         println!();
         println!("[dry-run] DRY RUN: no files were removed.");
-        println!("[dry-run] All components will be moved to trash via trash::SafeDelete.");
+        println!("[dry-run] All user components will be moved to trash via trash::SafeDelete.");
+        if !sys_components.is_empty() {
+            println!();
+            println!("[dry-run] System components require manual removal with root privileges:");
+            for item in &sys_components {
+                println!("[dry-run]   sudo rm {}", item.path.display());
+            }
+        }
         return 0;
     }
 
@@ -147,19 +209,19 @@ pub fn run(opts: &Options) -> i32 {
     }
 
     let mut failed = 0;
-    for item in &components {
-        if paths::is_protected(&item.path) {
-            eprintln!(
-                "warning: skipping protected system path: {}",
-                item.path.display()
-            );
-            continue;
-        }
-
+    for item in &user_components {
         println!("Removing {}...", item.path.display());
         if let Err(e) = trash::safe_delete(&item.path, false) {
             eprintln!("error removing {}: {}", item.path.display(), e);
             failed += 1;
+        }
+    }
+
+    if !sys_components.is_empty() {
+        println!();
+        println!("The following system files require root privileges to remove. Run:");
+        for item in &sys_components {
+            println!("  sudo rm {}", item.path.display());
         }
     }
 
@@ -168,7 +230,7 @@ pub fn run(opts: &Options) -> i32 {
         1
     } else {
         println!();
-        println!("✨ mu successfully removed. All data was safely moved to trash.");
+        println!("✨ mu successfully removed. All user data was safely moved to trash.");
         0
     }
 }
@@ -194,6 +256,24 @@ mod tests {
         assert_eq!(code, 0);
         assert!(test_file.exists(), "sentinel must remain untouched");
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_desktop_entry_generation() {
+        let content = generate_desktop_entry(Some(Path::new("/usr/local/bin/mu")));
+        assert!(content.contains("[Desktop Entry]"));
+        assert!(content.contains("Exec=/usr/local/bin/mu"));
+        assert!(content.contains("Name=mu"));
+    }
+
+    #[test]
+    fn test_install_desktop_entry() {
+        let tmp = std::env::temp_dir().join(format!("mu-desktop-test-{}", std::process::id()));
+        let installed = install_desktop_entry(Some(&tmp)).expect("install succeeds");
+        assert!(installed.exists());
+        let content = std::fs::read_to_string(&installed).unwrap();
+        assert!(content.contains("[Desktop Entry]"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

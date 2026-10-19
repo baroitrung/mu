@@ -1088,7 +1088,15 @@ fn cmd_flagset(name: &str) -> &'static [FlagSpec] {
     match name {
         "analyze" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON],
         "status" => &[F_DEBUG, F_HELP, F_INTERVAL, F_JSON, F_WATCH],
-        "clean" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_INCLUDE, F_EXTERNAL, F_WHITELIST],
+        "clean" => &[
+            F_DEBUG,
+            F_HELP,
+            F_DRY_RUN,
+            F_YES,
+            F_INCLUDE,
+            F_EXTERNAL,
+            F_WHITELIST,
+        ],
         "optimize" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_SKIP, F_WHITELIST],
         "audit" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON, F_REPORT, F_INCLUDE],
         "uninstall" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_PERMANENT, F_LIST, F_YES],
@@ -1600,7 +1608,7 @@ fn exec_completion(args: &[String]) -> Outcome {
         Ok(p) => {
             if p.get("install") {
                 let shell = p.positionals.first().map(|s| s.as_str()).unwrap_or("bash");
-                if is_shell(shell) {
+                if is_shell(shell) || shell == "desktop" {
                     match install_completion(shell) {
                         Ok(path) => {
                             return Outcome::Stdout(format!(
@@ -1705,6 +1713,10 @@ fn install_completion(shell: &str) -> std::result::Result<std::path::PathBuf, St
             std::fs::create_dir_all(&fish_dir)
                 .map_err(|e| format!("failed to create directory {}: {}", fish_dir.display(), e))?;
             fish_dir.join("mu.fish")
+        }
+        "desktop" => {
+            return crate::remove::install_desktop_entry(None)
+                .map_err(|e| format!("failed to install desktop launcher: {e}"));
         }
         _ => return Err(format!("unsupported shell for auto-install: {shell}")),
     };

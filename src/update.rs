@@ -97,13 +97,98 @@ pub fn current_version() -> &'static str {
     }
 }
 
+pub fn parse_version_tuple(v: &str) -> Option<(u64, u64, u64, u64)> {
+    let clean = v.trim_start_matches('v');
+    if clean == "dev" {
+        return None;
+    }
+    let mut parts = clean.splitn(2, '-');
+    let core = parts.next()?;
+    let suffix = parts.next();
+    let nums: Vec<&str> = core.split('.').collect();
+    if nums.len() < 3 {
+        return None;
+    }
+    let major = nums[0].parse::<u64>().ok()?;
+    let minor = nums[1].parse::<u64>().ok()?;
+    let patch = nums[2].parse::<u64>().ok()?;
+    let commits_ahead = if let Some(s) = suffix {
+        s.split('-')
+            .next()
+            .and_then(|c| c.parse::<u64>().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    Some((major, minor, patch, commits_ahead))
+}
+
 pub fn is_newer_version(latest_tag: &str, current: &str) -> bool {
-    let clean_latest = latest_tag.trim_start_matches('v');
-    let clean_current = current.trim_start_matches('v');
-    if clean_current == "dev" {
+    let clean_curr = current.trim_start_matches('v');
+    if clean_curr == "dev" {
         return false;
     }
-    clean_latest != clean_current
+    match (
+        parse_version_tuple(latest_tag),
+        parse_version_tuple(current),
+    ) {
+        (Some(latest), Some(curr)) => {
+            if latest.0 != curr.0 {
+                return latest.0 > curr.0;
+            }
+            if latest.1 != curr.1 {
+                return latest.1 > curr.1;
+            }
+            if latest.2 != curr.2 {
+                return latest.2 > curr.2;
+            }
+            latest.3 > curr.3
+        }
+        _ => latest_tag.trim_start_matches('v') != current.trim_start_matches('v'),
+    }
+}
+
+pub fn target_arch_asset_names() -> Vec<String> {
+    let arch = std::env::consts::ARCH;
+    vec![
+        format!("mu-{arch}-unknown-linux-gnu"),
+        format!("mu-linux-{arch}"),
+        BINARY_NAME.to_string(),
+    ]
+}
+
+pub fn check_background_update_silently() {
+    let cache_dir = crate::xdg::cache_home().join("mu");
+    let cache_file = cache_dir.join("last_version_check.json");
+    if let Ok(meta) = fs::metadata(&cache_file)
+        && let Ok(modified) = meta.modified()
+        && let Ok(elapsed) = modified.elapsed()
+        && elapsed.as_secs() < 86400
+    {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("mu-update-check".to_string())
+        .spawn(move || {
+            let runner = ProcessRunner;
+            let url =
+                std::env::var("MU_UPDATE_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
+            if let Ok(rel) = fetch_release_info(&url, &runner) {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let payload = serde_json::json!({
+                    "latest": rel.tag_name,
+                    "checked_at": ts,
+                });
+                let _ = fs::create_dir_all(&cache_dir);
+                let tmp_file = cache_dir.join(format!(".check.tmp-{}", std::process::id()));
+                if fs::write(&tmp_file, payload.to_string()).is_ok() {
+                    let _ = fs::rename(&tmp_file, &cache_file);
+                }
+            }
+        });
 }
 
 pub fn run_with(opts: &Options, runner: &dyn Runner) -> i32 {
@@ -133,12 +218,7 @@ pub fn run_with(opts: &Options, runner: &dyn Runner) -> i32 {
     let release = match fetch_release_info(api_url, runner) {
         Ok(rel) => rel,
         Err(e) => {
-            if opts.dry_run {
-                println!("Notice: could not query GitHub release API ({e}).");
-                println!("Local version is up-to-date: {ver_display}");
-                return 0;
-            }
-            eprintln!("error: {e}");
+            eprintln!("error: could not query GitHub release API: {e}");
             return 1;
         }
     };
@@ -153,7 +233,11 @@ pub fn run_with(opts: &Options, runner: &dyn Runner) -> i32 {
 
     println!("Found newer release: {latest_tag}");
 
-    let bin_asset = release.assets.iter().find(|a| a.name == BINARY_NAME);
+    let candidate_names = target_arch_asset_names();
+    let bin_asset = candidate_names
+        .iter()
+        .find_map(|name| release.assets.iter().find(|a| &a.name == name));
+    let resolved_bin_name = bin_asset.map(|a| a.name.as_str()).unwrap_or(BINARY_NAME);
     let checksum_asset = release.assets.iter().find(|a| a.name == "checksums.txt");
 
     if opts.dry_run {
@@ -195,10 +279,12 @@ pub fn run_with(opts: &Options, runner: &dyn Runner) -> i32 {
     };
 
     let checksum_text = String::from_utf8_lossy(&checksum_bytes);
-    let expected_hash = match parse_checksum(&checksum_text, BINARY_NAME) {
+    let expected_hash = match parse_checksum(&checksum_text, resolved_bin_name)
+        .or_else(|| parse_checksum(&checksum_text, BINARY_NAME))
+    {
         Some(h) => h,
         None => {
-            eprintln!("error: fail-closed: checksums.txt missing entry for {BINARY_NAME}");
+            eprintln!("error: fail-closed: checksums.txt missing entry for {resolved_bin_name}");
             return 1;
         }
     };
@@ -209,13 +295,14 @@ pub fn run_with(opts: &Options, runner: &dyn Runner) -> i32 {
         Some(a) => a.browser_download_url.as_str(),
         None => {
             fallback_bin_url = format!(
-                "https://github.com/{DEFAULT_REPO}/releases/download/{latest_tag}/{BINARY_NAME}"
+                "https://github.com/{DEFAULT_REPO}/releases/download/{latest_tag}/{resolved_bin_name}"
             );
             &fallback_bin_url
         }
     };
 
-    println!("Downloading {BINARY_NAME} {latest_tag}...");
+    println!("Downloading {resolved_bin_name} {latest_tag}...");
+
     let new_bin_bytes = match fetch_bytes(bin_url, runner) {
         Ok(b) => b,
         Err(e) => {
@@ -227,7 +314,7 @@ pub fn run_with(opts: &Options, runner: &dyn Runner) -> i32 {
     // Verify SHA-256
     let actual_hash = compute_sha256(&new_bin_bytes);
     if actual_hash != expected_hash {
-        eprintln!("error: SHA-256 checksum mismatch for {BINARY_NAME}!");
+        eprintln!("error: SHA-256 checksum mismatch for {resolved_bin_name}!");
         eprintln!("  expected: {expected_hash}");
         eprintln!("  actual:   {actual_hash}");
         eprintln!("Update aborted (fail-closed). Current binary was NOT modified.");
@@ -253,9 +340,16 @@ pub fn run_with(opts: &Options, runner: &dyn Runner) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&temp_target, fs::Permissions::from_mode(0o755));
+        if let Err(e) = fs::set_permissions(&temp_target, fs::Permissions::from_mode(0o755)) {
+            let _ = fs::remove_file(&temp_target);
+            eprintln!("error: failed to set executable permissions: {e}");
+            return 1;
+        }
     }
 
+    if let Ok(file) = fs::File::open(&temp_target) {
+        let _ = file.sync_all();
+    }
     if let Err(e) = fs::rename(&temp_target, &target_bin) {
         let _ = fs::remove_file(&temp_target);
         eprintln!("error: failed to replace {}: {}", target_bin.display(), e);
@@ -383,5 +477,31 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 *other
         assert_eq!(fs::read(&target_bin).unwrap(), new_bin_content);
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_semver_ordering() {
+        assert!(is_newer_version("v0.4.0", "0.3.0"));
+        assert!(is_newer_version("0.3.1", "0.3.0"));
+        assert!(!is_newer_version("v0.2.0", "0.3.0"));
+        assert!(!is_newer_version("v0.3.0", "0.3.0"));
+        // Git checkout ahead of tag must NOT be downgraded to tag
+        assert!(!is_newer_version("v0.3.0", "0.3.0-9-gccc0649"));
+        // Higher tag is newer than git checkout of older base
+        assert!(is_newer_version("v0.4.0", "0.3.0-9-gccc0649"));
+        // Dev is never updated
+        assert!(!is_newer_version("v1.0.0", "dev"));
+    }
+
+    #[test]
+    fn test_dry_run_api_failure_fails_closed() {
+        let dry_opts = Options {
+            dry_run: true,
+            force: false,
+            api_url: Some("file:///nonexistent/path/to/release.json".to_string()),
+            ..Default::default()
+        };
+        let code = run_with(&dry_opts, &ProcessRunner);
+        assert_eq!(code, 1, "update dry-run must fail when release API fails");
     }
 }

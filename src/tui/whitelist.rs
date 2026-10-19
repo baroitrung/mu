@@ -28,13 +28,23 @@ pub struct WhitelistTui {
 
 impl WhitelistTui {
     pub fn new() -> Self {
-        let config = config::load_whitelist().unwrap_or_default();
+        let (config, status_msg) = match config::load_user_whitelist() {
+            Ok(Some(cfg)) => (cfg, None),
+            Ok(None) => (
+                Whitelist::default(),
+                Some("User whitelist (~/.config/mu/config.toml)".to_string()),
+            ),
+            Err(e) => (
+                Whitelist::default(),
+                Some(format!("Warning: error loading user config: {e}")),
+            ),
+        };
         Self {
             tab: WhitelistTab::ProtectedPaths,
             cursor: 0,
             config,
             modified: false,
-            status_msg: None,
+            status_msg,
         }
     }
 
@@ -43,6 +53,13 @@ impl WhitelistTui {
             WhitelistTab::ProtectedPaths => &self.config.protected_paths.system,
             WhitelistTab::CacheSkip => &self.config.cache_skip.dirs,
             WhitelistTab::OptimizeSkip => &self.config.optimize_skip.steps,
+        }
+    }
+    pub fn current_items_for(tab: WhitelistTab, config: &mut Whitelist) -> &mut Vec<String> {
+        match tab {
+            WhitelistTab::ProtectedPaths => &mut config.protected_paths.system,
+            WhitelistTab::CacheSkip => &mut config.cache_skip.dirs,
+            WhitelistTab::OptimizeSkip => &mut config.optimize_skip.steps,
         }
     }
 
@@ -68,6 +85,35 @@ impl WhitelistTui {
                 let len = self.current_items().len();
                 if len > 0 && self.cursor < len - 1 {
                     self.cursor += 1;
+                }
+                false
+            }
+            KeyCode::Char(' ') => {
+                let cursor = self.cursor;
+                let items = Self::current_items_for(self.tab, &mut self.config);
+                if !items.is_empty() && cursor < items.len() {
+                    let item = &items[cursor];
+                    let toggled = if item.starts_with("# ") {
+                        item.trim_start_matches("# ").to_string()
+                    } else {
+                        format!("# {item}")
+                    };
+                    items[cursor] = toggled;
+                    self.modified = true;
+                    self.status_msg = Some("Entry toggled (press 's' to save)".to_string());
+                }
+                false
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                let cursor = self.cursor;
+                let items = Self::current_items_for(self.tab, &mut self.config);
+                if !items.is_empty() && cursor < items.len() {
+                    items.remove(cursor);
+                    if self.cursor >= items.len() && self.cursor > 0 {
+                        self.cursor -= 1;
+                    }
+                    self.modified = true;
+                    self.status_msg = Some("Entry deleted (press 's' to save)".to_string());
                 }
                 false
             }
@@ -147,8 +193,11 @@ impl WhitelistTui {
         // Footer
         lines.push(Line::raw(""));
         lines.push(Line::raw(""));
+        let mod_indicator = if self.modified { "  [Modified]" } else { "" };
         lines.push(Line::styled(
-            "  Tab switch category  •  ↑/↓ navigate  •  s save  •  q quit",
+            format!(
+                "  Tab category • ↑/↓ move • Space toggle • d delete • s save • q quit{mod_indicator}"
+            ),
             styles::faint(),
         ));
 
@@ -202,5 +251,31 @@ mod tests {
         let mut tui = WhitelistTui::new();
         let q_key = KeyEvent::from(KeyCode::Char('q'));
         assert!(tui.handle_key_event(q_key));
+    }
+
+    #[test]
+    fn test_whitelist_tui_toggle_and_delete() {
+        let mut tui = WhitelistTui::new();
+        tui.config
+            .protected_paths
+            .system
+            .push("/opt/test-path".to_string());
+        assert_eq!(tui.current_items().len(), 1);
+        assert!(!tui.modified);
+
+        // Space toggles commented state
+        let space_key = KeyEvent::from(KeyCode::Char(' '));
+        assert!(!tui.handle_key_event(space_key));
+        assert!(tui.modified);
+        assert_eq!(tui.current_items()[0], "# /opt/test-path");
+
+        // Space toggles back
+        assert!(!tui.handle_key_event(space_key));
+        assert_eq!(tui.current_items()[0], "/opt/test-path");
+
+        // 'd' deletes the item
+        let d_key = KeyEvent::from(KeyCode::Char('d'));
+        assert!(!tui.handle_key_event(d_key));
+        assert!(tui.current_items().is_empty());
     }
 }

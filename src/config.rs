@@ -90,18 +90,46 @@ pub fn load_whitelist_from(config_home: &Path) -> Result<Whitelist> {
         Error::Msg(format!("{}", e))
     })?;
     validate_whitelist_override(&override_cfg)?;
-    if !override_cfg.protected_paths.system.is_empty() {
-        wl.protected_paths
-            .system
-            .extend(override_cfg.protected_paths.system);
+    for path in override_cfg.protected_paths.system {
+        if !path.trim().starts_with('#') {
+            wl.protected_paths.system.push(path);
+        }
     }
-    if !override_cfg.cache_skip.dirs.is_empty() {
-        wl.cache_skip.dirs.extend(override_cfg.cache_skip.dirs);
+    for dir in override_cfg.cache_skip.dirs {
+        if !dir.trim().starts_with('#') {
+            wl.cache_skip.dirs.push(dir);
+        }
     }
-    if !override_cfg.optimize_skip.steps.is_empty() {
-        wl.optimize_skip.steps = override_cfg.optimize_skip.steps;
+    let steps: Vec<String> = override_cfg
+        .optimize_skip
+        .steps
+        .into_iter()
+        .filter(|s| !s.trim().starts_with('#'))
+        .collect();
+    if !steps.is_empty() {
+        wl.optimize_skip.steps = steps;
     }
     Ok(wl)
+}
+
+/// Loads ONLY user whitelist overrides from `<config_home>/mu/config.toml`.
+/// Returns Ok(None) if the file does not exist, or Ok(Some(wl)) if present.
+/// Fails closed if the file is malformed.
+pub fn load_user_whitelist_from(config_home: &Path) -> Result<Option<Whitelist>> {
+    let user_cfg = config_home.join("mu").join("config.toml");
+    if !paths::path_exists(&user_cfg) {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&user_cfg).map_err(Error::Io)?;
+    let override_cfg: Whitelist = toml::from_str(&text)
+        .map_err(|e| Error::Msg(format!("malformed whitelist config: {e}")))?;
+    validate_whitelist_override(&override_cfg)?;
+    Ok(Some(override_cfg))
+}
+
+/// Loads user whitelist overrides from `$XDG_CONFIG_HOME/mu/config.toml`.
+pub fn load_user_whitelist() -> Result<Option<Whitelist>> {
+    load_user_whitelist_from(&xdg::config_home())
 }
 
 /// Saves whitelist overrides to `$XDG_CONFIG_HOME/mu/config.toml`.
@@ -111,6 +139,7 @@ pub fn save_whitelist(wl: &Whitelist) -> Result<PathBuf> {
 
 /// Testable core: saves whitelist to `<config_home>/mu/config.toml`.
 pub fn save_whitelist_to(config_home: &Path, wl: &Whitelist) -> Result<PathBuf> {
+    validate_whitelist_override(wl)?;
     let mu_dir = config_home.join("mu");
     if !mu_dir.exists() {
         std::fs::create_dir_all(&mu_dir)?;
@@ -118,12 +147,24 @@ pub fn save_whitelist_to(config_home: &Path, wl: &Whitelist) -> Result<PathBuf> 
     let user_cfg = mu_dir.join("config.toml");
     let serialized = toml::to_string_pretty(wl)
         .map_err(|e| Error::Msg(format!("failed to serialize config: {e}")))?;
-    std::fs::write(&user_cfg, serialized)?;
+
+    // Atomic write via temporary file in the same directory
+    let tmp_path = mu_dir.join(format!(".config.toml.tmp-{}", std::process::id()));
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(serialized.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, &user_cfg)?;
     Ok(user_cfg)
 }
 
 fn validate_whitelist_override(override_cfg: &Whitelist) -> Result<()> {
     for path in &override_cfg.protected_paths.system {
+        if path.trim().starts_with('#') {
+            continue;
+        }
         if !Path::new(path).is_absolute() {
             return msg(format!("protected path must be absolute: {path:?}"));
         }
@@ -132,6 +173,9 @@ fn validate_whitelist_override(override_cfg: &Whitelist) -> Result<()> {
         // Go applies filepath.ToSlash here — a no-op on Unix (separator is
         // already '/'), so the pattern is used verbatim.
         let pat = pattern.trim();
+        if pat.starts_with('#') {
+            continue;
+        }
         let p = Path::new(pat);
         if pat.is_empty() || p.is_absolute() || pat == ".." || pat.starts_with("../") {
             return msg(format!(
@@ -398,5 +442,43 @@ mod tests {
         assert_eq!(glob_match("[a\\-c]", "-"), Ok(true));
         assert_eq!(glob_match("[abc", "x"), Err(())); // unclosed class
         assert_eq!(glob_match("a\\", "a"), Err(())); // trailing escape
+    }
+
+    #[test]
+    fn save_whitelist_atomic_and_no_defaults_leak() {
+        let root = tempdir("wl-save");
+        let mut custom = Whitelist::default();
+        custom
+            .protected_paths
+            .system
+            .push("/opt/my-app".to_string());
+
+        let saved = save_whitelist_to(&root, &custom).expect("save succeeds");
+        assert!(saved.exists());
+
+        let content = fs::read_to_string(&saved).unwrap();
+        assert!(content.contains("/opt/my-app"));
+        // Must not contain embedded default paths like /etc or /boot
+        assert!(!content.contains("/boot"));
+        assert!(!content.contains("go-build"));
+
+        // User whitelist loads back accurately
+        let loaded = load_user_whitelist_from(&root)
+            .expect("load succeeds")
+            .unwrap();
+        assert_eq!(
+            loaded.protected_paths.system,
+            vec!["/opt/my-app".to_string()]
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_user_whitelist_malformed_fails_closed() {
+        let root = tempdir("wl-user-mal");
+        write_config(&root, "invalid = [toml");
+        assert!(load_user_whitelist_from(&root).is_err());
+        fs::remove_dir_all(&root).ok();
     }
 }

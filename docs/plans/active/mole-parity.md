@@ -431,7 +431,7 @@ graph TD
   - **`mu update` (Self-Update):**
     - Queries GitHub Releases API for `https://api.github.com/repos/.../releases/latest`.
     - Downloads architecture-matched release binary and `checksums.txt`.
-    - Verifies SHA-256 checksum against signed asset.
+    - Verifies SHA-256 checksum against checksums.txt asset (fail-closed, matching install.sh).
     - Atomically replaces current executable via `tempfile` and `rename`.
     - Flags: `--dry-run`, `--force`.
     - Background check displays update banner in root TUI menu.

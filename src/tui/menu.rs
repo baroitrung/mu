@@ -102,6 +102,7 @@ pub struct MainMenu {
 impl MainMenu {
     /// Create a new menu with the given persisted cursor and snapshot.
     pub fn new(cursor: usize, snapshot: Option<HealthSnapshot>) -> Self {
+        crate::update::check_background_update_silently();
         Self {
             cursor,
             snapshot,

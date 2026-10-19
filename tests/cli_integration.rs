@@ -772,13 +772,32 @@ fn sudo_dry_run_enable() {
 /// `mu update --dry-run` -> reports local version and status, exit 0.
 #[test]
 fn update_dry_run() {
-    let o = mu(&["update", "--dry-run"]);
+    let tmp = std::env::temp_dir().join(format!("mu-update-dry-cli-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let release_json = tmp.join("release.json");
+    let json_content = serde_json::json!({
+        "tag_name": "v0.3.0",
+        "name": "v0.3.0",
+        "assets": []
+    });
+    std::fs::write(&release_json, json_content.to_string()).unwrap();
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["update", "--dry-run"]);
+    cmd.env(
+        "MU_UPDATE_URL",
+        format!("file://{}", release_json.display()),
+    );
+    let o = cmd.output().expect("run mu update --dry-run");
+
     assert_eq!(o.status.code(), Some(0));
-    let out = stdout(&o);
+    let out = String::from_utf8_lossy(&o.stdout);
     assert!(
         out.contains("Checking for updates") || out.contains("up-to-date"),
         "unexpected output: {out}"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// `mu remove --dry-run` sentinel immutability test -> exit 0, sentinel untouched.
@@ -840,3 +859,30 @@ fn completion_install_bash() {
     let _ = std::fs::remove_dir_all(&test_dir);
 }
 
+/// `mu completion --install desktop` -> writes desktop entry, exit 0.
+#[test]
+fn completion_install_desktop() {
+    let test_dir = std::env::temp_dir().join(format!("mu-comp-desktop-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&test_dir);
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["completion", "--install", "desktop"]);
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_DATA_HOME", test_dir.join(".local/share"));
+    let output = cmd
+        .output()
+        .expect("failed to run mu completion --install desktop");
+
+    assert_eq!(output.status.code(), Some(0));
+    let expected_file = test_dir.join(".local/share/applications/mu.desktop");
+    assert!(
+        expected_file.exists(),
+        "installed desktop file must exist at {}",
+        expected_file.display()
+    );
+    let content = std::fs::read_to_string(&expected_file).unwrap();
+    assert!(content.contains("[Desktop Entry]"));
+    assert!(content.contains("Name=mu"));
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
