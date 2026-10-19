@@ -19,6 +19,7 @@ pub mod clean;
 pub mod confirm;
 pub mod menu;
 pub mod run;
+pub mod select;
 pub mod status;
 pub mod styles;
 pub mod uninstall;
@@ -461,6 +462,36 @@ fn dispatch_subcommand(command: &str, debug: bool) -> anyhow::Result<Option<Stri
             run_status_dashboard()?;
             Ok(None)
         }
+        "purge" => {
+            // Purge TTY: the interactive multi-select drives the deletion
+            // (review F4); every removal still goes through SafeDelete.
+            let opts = crate::purge::Options {
+                paths: Vec::new(),
+                dry_run: false,
+                auto_yes: false,
+                include_empty: false,
+                debug,
+            };
+            let code = crate::purge::run(&opts);
+            if code != 0 {
+                anyhow::bail!("purge exited with code {code}");
+            }
+            Ok(None)
+        }
+        "installer" => {
+            // Installer TTY: same interactive selection flow as purge.
+            let opts = crate::installer::Options {
+                paths: Vec::new(),
+                dry_run: false,
+                auto_yes: false,
+                debug,
+            };
+            let code = crate::installer::run(&opts);
+            if code != 0 {
+                anyhow::bail!("installer exited with code {code}");
+            }
+            Ok(None)
+        }
         _ => Ok(None),
     }
 }
@@ -527,7 +558,7 @@ mod tests {
 
     #[test]
     fn menu_items_count() {
-        assert_eq!(MENU_ITEMS.len(), 6);
+        assert_eq!(MENU_ITEMS.len(), 8);
     }
 
     #[test]

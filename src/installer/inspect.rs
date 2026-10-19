@@ -7,7 +7,19 @@ use std::time::Duration;
 
 use crate::runner::{CommandSpec, ProcessRunner, Runner};
 
-/// Check if an entry name within an archive indicates an installer or executable binary.
+/// Package/container extensions that identify an installer by themselves.
+const PACKAGE_EXTS: &[&str] = &["deb", "appimage", "iso", "exe", "pkg", "rpm", "msi"];
+
+/// Extensions an `install*`/`setup*` script or binary may carry.
+const SCRIPT_EXTS: &[&str] = &["sh", "bin", "run", "exe"];
+
+/// Check if an entry name within an archive indicates an installer or
+/// executable binary.
+///
+/// Review F3: an archive used to count as an installer when *any* entry ended
+/// in `.sh`/`.bin`/`.run`, so a project archive holding `build.sh` matched.
+/// Now a script entry must itself be an installer (`install*`/`setup*` with a
+/// script/binary extension), and Python's `setup.py` no longer matches.
 pub fn is_installer_entry(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let basename = Path::new(&lower)
@@ -15,24 +27,24 @@ pub fn is_installer_entry(name: &str) -> bool {
         .and_then(|n| n.to_str())
         .unwrap_or(&lower);
 
-    // Common installer extensions
-    if basename.ends_with(".deb")
-        || basename.ends_with(".appimage")
-        || basename.ends_with(".sh")
-        || basename.ends_with(".bin")
-        || basename.ends_with(".run")
-        || basename.ends_with(".exe")
-        || basename.ends_with(".pkg")
+    let (stem, ext) = match basename.rsplit_once('.') {
+        Some((stem, ext)) => (stem, Some(ext)),
+        None => (basename, None),
+    };
+
+    // `package.deb`, `app.AppImage`, `setup.exe` are installers by extension.
+    if let Some(ext) = ext
+        && PACKAGE_EXTS.contains(&ext)
     {
         return true;
     }
 
-    // Common installer filenames
-    if basename.starts_with("install") || basename.starts_with("setup") || basename == "configure" {
-        return true;
-    }
-
-    false
+    // A bare script/binary (or one with a script extension) named install*/setup*.
+    let is_script = match ext {
+        None => true,
+        Some(ext) => SCRIPT_EXTS.contains(&ext),
+    };
+    is_script && (stem.starts_with("install") || stem.starts_with("setup") || stem == "configure")
 }
 
 /// Inspect a ZIP archive's central directory to determine if it contains installer files.
@@ -173,5 +185,83 @@ mod tests {
         assert!(!is_installer_entry("readme.txt"));
         assert!(!is_installer_entry("image.png"));
         assert!(!is_installer_entry("document.pdf"));
+    }
+
+    // Review F3: a project archive's build scripts and Python's setup.py must
+    // not make the archive an "installer".
+    #[test]
+    fn installer_entry_rejects_build_script_and_python_setup() {
+        assert!(!is_installer_entry("build.sh"));
+        assert!(!is_installer_entry("project/scripts/build.sh"));
+        assert!(!is_installer_entry("setup.py"));
+        assert!(!is_installer_entry("project/install.md"));
+        // Real installers still match.
+        assert!(is_installer_entry("configure"));
+        assert!(is_installer_entry("project/install.sh"));
+        assert!(is_installer_entry("nested/setup.run"));
+    }
+
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "mu-test-inspect-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Build a `.tar.gz` fixture with `tar` (the same tool `inspect_targz`
+    /// shells out to).
+    fn targz_fixture(dir: &Path, name: &str, entries: &[(&str, &str)]) -> std::path::PathBuf {
+        let src = dir.join(format!("{name}-src"));
+        for (rel, body) in entries {
+            let p = src.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        let out = dir.join(name);
+        let status = std::process::Command::new("tar")
+            .arg("czf")
+            .arg(&out)
+            .arg("-C")
+            .arg(&src)
+            .arg(".")
+            .status()
+            .expect("tar must be available");
+        assert!(status.success(), "tar failed for {name}");
+        out
+    }
+
+    // Review F3: a project archive holding `build.sh` is not an installer;
+    // one holding `install.sh` is.
+    #[test]
+    fn installer_ignores_project_archive_with_build_script() {
+        let dir = tempdir("targz");
+        let project = targz_fixture(
+            &dir,
+            "backup-2025.tar.gz",
+            &[("project/build.sh", "#!/bin/sh\nmake\n")],
+        );
+        let real = targz_fixture(
+            &dir,
+            "tool-1.0.tar.gz",
+            &[("tool/install.sh", "#!/bin/sh\ncp app /usr/local/bin\n")],
+        );
+
+        assert!(
+            !inspect_targz(&project),
+            "a project archive with build.sh must not count as an installer"
+        );
+        assert!(
+            inspect_targz(&real),
+            "an archive with install.sh is an installer"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

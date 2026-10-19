@@ -25,7 +25,8 @@ pub struct MenuItem {
     pub command: &'static str,
 }
 
-/// The six menu items — exact order from Go's `menuItems`.
+/// The menu items — order from Go's `menuItems`, extended with the Phase 4
+/// `purge`/`installer` commands before Quit.
 pub const MENU_ITEMS: &[MenuItem] = &[
     MenuItem {
         label: "Audit",
@@ -51,6 +52,16 @@ pub const MENU_ITEMS: &[MenuItem] = &[
         label: "Status",
         desc: "Live system dashboard",
         command: "status",
+    },
+    MenuItem {
+        label: "Purge",
+        desc: "Clean heavy project build artifacts (node_modules, target)",
+        command: "purge",
+    },
+    MenuItem {
+        label: "Installer",
+        desc: "Find and remove downloaded installer packages",
+        command: "installer",
     },
     MenuItem {
         label: "Quit",
@@ -168,7 +179,7 @@ impl MainMenu {
                 }
                 false
             }
-            KeyCode::Char(c @ '1'..='6') => {
+            KeyCode::Char(c @ '1'..='8') => {
                 let idx = (c as u8 - b'1') as usize;
                 if idx < MENU_ITEMS.len() {
                     self.chosen = Some(MENU_ITEMS[idx].command);
@@ -307,9 +318,11 @@ mod tests {
 
     #[test]
     fn menu_items_order() {
-        assert_eq!(MENU_ITEMS.len(), 6);
+        assert_eq!(MENU_ITEMS.len(), 8);
         assert_eq!(MENU_ITEMS[0].command, "audit");
-        assert_eq!(MENU_ITEMS[5].command, "quit");
+        assert_eq!(MENU_ITEMS[5].command, "purge");
+        assert_eq!(MENU_ITEMS[6].command, "installer");
+        assert_eq!(MENU_ITEMS[7].command, "quit");
     }
 
     #[test]

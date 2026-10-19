@@ -10,6 +10,14 @@ use crate::xdg;
 
 /// Resolve roots to scan for installer packages.
 pub fn resolve_installer_roots(configured: &[PathBuf]) -> Vec<PathBuf> {
+    resolve_installer_roots_in(configured, &xdg::home_dir())
+}
+
+/// Review F3: the default root is `~/Downloads` only. Downloads is where
+/// installers land; Desktop holds apps the user actually runs and Documents
+/// holds data, so scanning them turns the archive heuristic into silent data
+/// loss. `--paths` still scans an explicit directory (including Desktop).
+pub(crate) fn resolve_installer_roots_in(configured: &[PathBuf], home: &Path) -> Vec<PathBuf> {
     if !configured.is_empty() {
         return configured
             .iter()
@@ -27,13 +35,12 @@ pub fn resolve_installer_roots(configured: &[PathBuf]) -> Vec<PathBuf> {
             .collect();
     }
 
-    let home = xdg::home_dir();
-    let candidates = ["Downloads", "Desktop", "Documents"];
-    candidates
-        .iter()
-        .map(|d| home.join(d))
-        .filter(|p| p.is_dir())
-        .collect()
+    let downloads = home.join("Downloads");
+    if downloads.is_dir() {
+        vec![downloads]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Scan a root directory for installer packages.
@@ -159,6 +166,25 @@ mod tests {
         assert!(names.contains(&"editor.AppImage"));
         assert!(names.contains(&"ubuntu.iso"));
         assert!(!names.contains(&"notes.txt"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Review F3: Downloads is the only default root — Desktop/Documents hold
+    // apps in use and user data, not installers.
+    #[test]
+    fn resolve_installer_roots_defaults_to_downloads_only() {
+        let root = tempdir("roots");
+        for d in ["Downloads", "Desktop", "Documents"] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+
+        let roots = resolve_installer_roots_in(&[], &root);
+        assert_eq!(roots, vec![root.join("Downloads")]);
+
+        // An explicit `--paths` still scans what the user asked for.
+        let explicit = resolve_installer_roots_in(&[root.join("Desktop")], &root);
+        assert_eq!(explicit, vec![root.join("Desktop")]);
 
         let _ = fs::remove_dir_all(&root);
     }
