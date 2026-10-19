@@ -557,6 +557,11 @@ pub fn read_disk_io_from(reader: impl BufRead) -> (BTreeMap<String, DiskIOSample
         if dev_name.starts_with("loop")
             || dev_name.starts_with("ram")
             || dev_name.starts_with("zram")
+            || dev_name.starts_with("dm-")
+            || Path::new("/sys/class/block")
+                .join(dev_name)
+                .join("partition")
+                .exists()
         {
             continue;
         }
@@ -745,6 +750,27 @@ pub fn read_top_processes_from(proc_dir: &Path, limit: usize) -> Result<Vec<Proc
         Ok(e) => e,
         Err(_) => return Ok(Vec::new()),
     };
+    let uptime_secs = std::fs::read_to_string(proc_dir.join("uptime"))
+        .or_else(|_| std::fs::read_to_string("/proc/uptime"))
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .unwrap_or(0.0);
+
+    let clk_tck = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+        .ok()
+        .flatten()
+        .map(|v| v as f64)
+        .unwrap_or(100.0);
+    let page_size = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
+        .ok()
+        .flatten()
+        .map(|v| v as u64)
+        .unwrap_or(4096);
+
     let mut procs = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
@@ -768,23 +794,44 @@ pub fn read_top_processes_from(proc_dir: &Path, limit: usize) -> Result<Vec<Proc
         if fields.len() > 21 {
             let utime = fields[11].parse::<u64>().unwrap_or(0);
             let stime = fields[12].parse::<u64>().unwrap_or(0);
+            let starttime = fields[19].parse::<u64>().unwrap_or(0);
             let rss_pages = fields[21].parse::<u64>().unwrap_or(0);
-            let total_ticks = utime + stime;
-            let memory_bytes = rss_pages * 4096;
-            procs.push((
-                total_ticks,
-                ProcessInfo {
-                    pid,
-                    name: proc_name.to_string(),
-                    cpu_percent: 0.0,
-                    memory_bytes,
-                },
-            ));
+            let memory_bytes = rss_pages * page_size;
+
+            let cpu_percent = if uptime_secs > 0.0 {
+                let start_secs = starttime as f64 / clk_tck;
+                let proc_age_secs = uptime_secs - start_secs;
+                if proc_age_secs > 0.05 {
+                    let cpu_secs = (utime + stime) as f64 / clk_tck;
+                    let pct = (cpu_secs / proc_age_secs) * 100.0;
+                    (pct * 10.0).round() / 10.0
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            procs.push(ProcessInfo {
+                pid,
+                name: proc_name.to_string(),
+                cpu_percent,
+                memory_bytes,
+            });
         }
     }
-    procs.sort_by_key(|a| std::cmp::Reverse(a.0));
+    procs.sort_by(|a, b| {
+        b.memory_bytes
+            .cmp(&a.memory_bytes)
+            .then_with(|| {
+                b.cpu_percent
+                    .partial_cmp(&a.cpu_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
     procs.truncate(limit);
-    Ok(procs.into_iter().map(|(_, p)| p).collect())
+    Ok(procs)
 }
 
 #[cfg(test)]
@@ -1358,21 +1405,67 @@ cpu cores	: 2
         std::fs::create_dir_all(&p1).unwrap();
         std::fs::create_dir_all(&p2).unwrap();
 
-        // PID 101: comm with space "proc one", utime=10, stime=20 -> total=30, rss=500
-        let stat1 = "101 (proc one) S 1 101 101 0 -1 4194304 100 0 0 0 10 20 0 0 20 0 1 0 1234 10000 500 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
-        // PID 102: comm "proc_two", utime=100, stime=50 -> total=150, rss=200
-        let stat2 = "102 (proc_two) R 1 102 102 0 -1 4194304 100 0 0 0 100 50 0 0 20 0 1 0 1234 10000 200 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
+        // PID 101: comm with space "proc one", utime=10, stime=20 -> total=30, rss=500, starttime=1000
+        let stat1 = "101 (proc one) S 1 101 101 0 -1 4194304 100 0 0 0 10 20 0 0 20 0 1 0 1000 10000 500 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
+        // PID 102: comm "proc_two", utime=100, stime=50 -> total=150, rss=200, starttime=1000
+        let stat2 = "102 (proc_two) R 1 102 102 0 -1 4194304 100 0 0 0 100 50 0 0 20 0 1 0 1000 10000 200 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
 
         std::fs::write(p1.join("stat"), stat1).unwrap();
         std::fs::write(p2.join("stat"), stat2).unwrap();
+        std::fs::write(temp_dir.join("uptime"), "100.0 200.0\n").unwrap();
 
         let procs = read_top_processes_from(&temp_dir, 5).unwrap();
         let _ = std::fs::remove_dir_all(&temp_dir);
 
         assert_eq!(procs.len(), 2);
-        assert_eq!(procs[0].pid, 102); // 150 ticks > 30 ticks
-        assert_eq!(procs[0].name, "proc_two");
-        assert_eq!(procs[1].pid, 101);
-        assert_eq!(procs[1].name, "proc one");
+        // PID 101 has rss=500, which has higher memory than PID 102 rss=200
+        assert_eq!(procs[0].pid, 101);
+        assert_eq!(procs[0].name, "proc one");
+        assert!(procs[0].memory_bytes > 0);
+        assert!(procs[0].cpu_percent > 0.0);
+        assert_eq!(procs[1].pid, 102);
+        assert_eq!(procs[1].name, "proc_two");
+        assert!(procs[1].memory_bytes > 0);
+        assert!(procs[1].cpu_percent > 0.0);
+    }
+
+    #[test]
+    fn read_battery_parses_capacity_status_and_health() {
+        let temp_dir = std::env::temp_dir().join(format!("mu_bat_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let bat0 = temp_dir.join("BAT0");
+        std::fs::create_dir_all(&bat0).unwrap();
+
+        std::fs::write(bat0.join("capacity"), "85\n").unwrap();
+        std::fs::write(bat0.join("status"), "Discharging\n").unwrap();
+        std::fs::write(bat0.join("energy_full"), "4500000\n").unwrap();
+        std::fs::write(bat0.join("energy_full_design"), "5000000\n").unwrap();
+
+        let bat = read_battery_from(&temp_dir).unwrap().expect("battery found");
+        assert_eq!(bat.percentage, 85);
+        assert_eq!(bat.status, "Discharging");
+        assert_eq!(bat.health_percent, Some(90.0));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn read_battery_charge_fallback() {
+        let temp_dir = std::env::temp_dir().join(format!("mu_bat_fb_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let bat1 = temp_dir.join("BAT1");
+        std::fs::create_dir_all(&bat1).unwrap();
+
+        std::fs::write(bat1.join("capacity"), "95\n").unwrap();
+        std::fs::write(bat1.join("status"), "Charging\n").unwrap();
+        std::fs::write(bat1.join("charge_full"), "3800000\n").unwrap();
+        std::fs::write(bat1.join("charge_full_design"), "4000000\n").unwrap();
+
+        let bat = read_battery_from(&temp_dir).unwrap().expect("battery found");
+        assert_eq!(bat.percentage, 95);
+        assert_eq!(bat.status, "Charging");
+        assert_eq!(bat.health_percent, Some(95.0));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

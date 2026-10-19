@@ -884,28 +884,32 @@ fn parse_duration(s: &str) -> Option<std::time::Duration> {
         return None;
     }
     if let Some(ms_str) = s.strip_suffix("ms") {
-        ms_str
-            .parse::<u64>()
-            .ok()
-            .map(std::time::Duration::from_millis)
+        let ms = ms_str.parse::<u64>().ok()?;
+        if ms > 0 {
+            Some(std::time::Duration::from_millis(ms))
+        } else {
+            None
+        }
     } else if let Some(s_str) = s.strip_suffix('s') {
-        s_str.parse::<f64>().ok().and_then(|v| {
-            if v >= 0.0 {
-                Some(std::time::Duration::from_secs_f64(v))
-            } else {
-                None
-            }
-        })
+        let v = s_str.parse::<f64>().ok()?;
+        if v > 0.0 && v.is_finite() {
+            std::time::Duration::try_from_secs_f64(v).ok()
+        } else {
+            None
+        }
     } else if let Some(m_str) = s.strip_suffix('m') {
-        m_str.parse::<f64>().ok().and_then(|v| {
-            if v >= 0.0 {
-                Some(std::time::Duration::from_secs_f64(v * 60.0))
-            } else {
-                None
-            }
-        })
+        let v = m_str.parse::<f64>().ok()?;
+        if v > 0.0 && v.is_finite() {
+            std::time::Duration::try_from_secs_f64(v * 60.0).ok()
+        } else {
+            None
+        }
     } else if let Ok(secs) = s.parse::<u64>() {
-        Some(std::time::Duration::from_secs(secs))
+        if secs > 0 {
+            Some(std::time::Duration::from_secs(secs))
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -2328,5 +2332,27 @@ mod tests {
         );
         assert_eq!(parse_duration("5"), Some(std::time::Duration::from_secs(5)));
         assert_eq!(parse_duration("bogus"), None);
+        assert_eq!(parse_duration("0s"), None);
+        assert_eq!(parse_duration("0ms"), None);
+        assert_eq!(parse_duration("0"), None);
+        assert_eq!(parse_duration("infs"), None);
+        assert_eq!(parse_duration("-1s"), None);
+        assert_eq!(parse_duration("1e300s"), None);
+    }
+
+    #[test]
+    fn status_interval_flag_zero_and_infinite_rejected() {
+        for arg in ["0s", "0ms", "0", "infs", "1e300s"] {
+            match parse(&args(&["status", "--interval", arg])) {
+                Outcome::Stderr { text, code } => {
+                    assert_eq!(code, 1);
+                    assert!(
+                        text.contains(&format!("invalid duration \"{arg}\"")),
+                        "for {arg}: {text}"
+                    );
+                }
+                _ => panic!("expected Stderr for {arg}"),
+            }
+        }
     }
 }

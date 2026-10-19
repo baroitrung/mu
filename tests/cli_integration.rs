@@ -117,6 +117,20 @@ fn status_help_output() {
     assert_eq!(stdout(&o), include_str!("golden/help-status.txt"));
 }
 
+/// `mu status --interval 0s` and `infs` are rejected with exit code 1.
+#[test]
+fn status_interval_invalid_rejected() {
+    for arg in ["0s", "0ms", "0", "infs", "1e300s"] {
+        let o = mu(&["status", "--interval", arg]);
+        assert_eq!(o.status.code(), Some(1), "for {arg}");
+        assert!(
+            stderr(&o).contains(&format!("invalid duration \"{arg}\"")),
+            "for {arg}: {}",
+            stderr(&o)
+        );
+    }
+}
+
 /// `mu audit` piped → human report on stdout (Go falls back to report
 /// mode), exit code is the severity-driven 0/1/2 — never the old stub's 2+
 /// or an arg error.

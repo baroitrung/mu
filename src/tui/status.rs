@@ -253,14 +253,15 @@ impl StatusDashboard {
             lines.push(Line::raw(""));
             lines.push(Line::styled("  Top Processes", styles::faint()));
             lines.push(Line::raw(format!(
-                "  {:<7} {:<24} {:>10}",
-                "PID", "NAME", "MEM"
+                "  {:<7} {:<20} {:>7} {:>10}",
+                "PID", "NAME", "CPU%", "MEM"
             )));
             for p in &m.processes {
                 lines.push(Line::raw(format!(
-                    "  {:<7} {:<24} {:>10}",
+                    "  {:<7} {:<20} {:>6.1}% {:>10}",
                     p.pid,
-                    truncate_width(&p.name, 24),
+                    truncate_width(&p.name, 20),
+                    p.cpu_percent,
                     human_bytes(p.memory_bytes),
                 )));
             }
