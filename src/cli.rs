@@ -175,14 +175,17 @@ Displays a real-time system health dashboard with visual metric bars.
 
 Use --json to output a structured JSON snapshot and exit.
 When piped (stdout is not a terminal), JSON is used automatically.
+Use --watch to stream snapshots continuously as NDJSON.
 Press q or Ctrl+C to exit the dashboard.
 
 Usage:
   mu status [flags]
 
 Flags:
-  -h, --help   help for status
-      --json   Output JSON snapshot and exit
+  -h, --help                help for status
+      --interval duration   Refresh interval for --watch (default 1s)
+      --json                Output JSON snapshot and exit
+      --watch               Stream status snapshots continuously as NDJSON
 
 Global Flags:
       --debug   Enable verbose debug logging
@@ -488,6 +491,8 @@ enum Command {
     },
     Status {
         json: bool,
+        watch: bool,
+        interval: Option<String>,
     },
     Clean {
         dry_run: bool,
@@ -586,7 +591,30 @@ pub fn run() -> ! {
                     });
                     std::process::exit(code);
                 }
-                Command::Status { json } => std::process::exit(status::run(json)),
+                Command::Status {
+                    json,
+                    watch,
+                    interval,
+                } => {
+                    let dur = if let Some(i_str) = interval {
+                        match parse_duration(&i_str) {
+                            Some(d) => d,
+                            None => {
+                                eprintln!(
+                                    "invalid argument \"{i_str}\" for \"--interval\" flag: time: invalid duration \"{i_str}\""
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        std::time::Duration::from_secs(1)
+                    };
+                    if watch {
+                        std::process::exit(status::run_watch(dur));
+                    } else {
+                        std::process::exit(status::run(json));
+                    }
+                }
                 Command::Optimize { dry_run, skip, yes } => {
                     let code = match optimize::run(&optimize::Options {
                         dry_run,
@@ -837,6 +865,51 @@ const F_INCLUDE_EMPTY: FlagSpec = FlagSpec {
     takes_value: false,
     display: "--include-empty",
 };
+const F_WATCH: FlagSpec = FlagSpec {
+    long: "watch",
+    short: None,
+    takes_value: false,
+    display: "--watch",
+};
+const F_INTERVAL: FlagSpec = FlagSpec {
+    long: "interval",
+    short: None,
+    takes_value: true,
+    display: "--interval",
+};
+
+fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(ms_str) = s.strip_suffix("ms") {
+        ms_str
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_millis)
+    } else if let Some(s_str) = s.strip_suffix('s') {
+        s_str.parse::<f64>().ok().and_then(|v| {
+            if v >= 0.0 {
+                Some(std::time::Duration::from_secs_f64(v))
+            } else {
+                None
+            }
+        })
+    } else if let Some(m_str) = s.strip_suffix('m') {
+        m_str.parse::<f64>().ok().and_then(|v| {
+            if v >= 0.0 {
+                Some(std::time::Duration::from_secs_f64(v * 60.0))
+            } else {
+                None
+            }
+        })
+    } else if let Ok(secs) = s.parse::<u64>() {
+        Some(std::time::Duration::from_secs(secs))
+    } else {
+        None
+    }
+}
 
 const ROOT_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_VERSION];
 const HELP_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP];
@@ -846,7 +919,7 @@ const SHELL_FLAGS: &[FlagSpec] = &[F_DEBUG, F_HELP, F_NODESC];
 fn cmd_flagset(name: &str) -> &'static [FlagSpec] {
     match name {
         "analyze" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON],
-        "status" => &[F_DEBUG, F_HELP, F_JSON],
+        "status" => &[F_DEBUG, F_HELP, F_INTERVAL, F_JSON, F_WATCH],
         "clean" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_INCLUDE, F_EXTERNAL],
         "optimize" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_YES, F_SKIP],
         "audit" => &[F_DEBUG, F_HELP, F_DRY_RUN, F_JSON, F_REPORT, F_INCLUDE],
@@ -1177,9 +1250,19 @@ fn exec_subcommand(name: &str, args: &[String]) -> Outcome {
             dry_run: p.get("dry-run"),
             json: p.get("json"),
         },
-        "status" => Command::Status {
-            json: p.get("json"),
-        },
+        "status" => {
+            let interval = p.vals("interval").into_iter().next();
+            if let Some(i_str) = interval.as_deref().filter(|s| parse_duration(s).is_none()) {
+                return perr(format!(
+                    "invalid argument \"{i_str}\" for \"--interval\" flag: time: invalid duration \"{i_str}\"\n"
+                ));
+            }
+            Command::Status {
+                json: p.get("json"),
+                watch: p.get("watch"),
+                interval,
+            }
+        }
         "clean" => Command::Clean {
             dry_run: p.get("dry-run"),
             include: p.vals("include"),
@@ -1478,7 +1561,7 @@ mod tests {
     fn positional_args_ignored() {
         match parse(&args(&["status", "foo"])) {
             Outcome::Run { cmd, .. } => match cmd {
-                Command::Status { json } => assert!(!json),
+                Command::Status { json, .. } => assert!(!json),
                 _ => panic!("expected Status"),
             },
             _ => panic!("expected Run"),
@@ -2143,6 +2226,25 @@ mod tests {
     }
 
     #[test]
+    fn status_watch_and_interval_flags_parse() {
+        match parse(&args(&["status", "--watch", "--interval", "2s"])) {
+            Outcome::Run { cmd, .. } => match cmd {
+                Command::Status {
+                    json,
+                    watch,
+                    interval,
+                } => {
+                    assert!(!json);
+                    assert!(watch);
+                    assert_eq!(interval.as_deref(), Some("2s"));
+                }
+                _ => panic!("expected Status"),
+            },
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
     fn purge_flag_parsing() {
         match parse(&args(&[
             "purge",
@@ -2197,5 +2299,34 @@ mod tests {
             },
             _ => panic!("expected Run"),
         }
+    }
+
+    #[test]
+    fn status_invalid_interval_flag() {
+        match parse(&args(&["status", "--interval", "bogus"])) {
+            Outcome::Stderr { text, code } => {
+                assert_eq!(code, 1);
+                assert!(text.contains("invalid duration \"bogus\""), "{text}");
+            }
+            _ => panic!("expected Stderr"),
+        }
+    }
+
+    #[test]
+    fn parse_duration_formats() {
+        assert_eq!(
+            parse_duration("1s"),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            parse_duration("500ms"),
+            Some(std::time::Duration::from_millis(500))
+        );
+        assert_eq!(
+            parse_duration("2m"),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(parse_duration("5"), Some(std::time::Duration::from_secs(5)));
+        assert_eq!(parse_duration("bogus"), None);
     }
 }

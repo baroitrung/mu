@@ -23,6 +23,16 @@ pub struct Snapshot {
     pub disks: Option<Vec<DiskStat>>,
     pub network: Option<BTreeMap<String, NetRate>>,
     pub health: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_io: Option<BTreeMap<String, DiskIORate>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<HardwareInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery: Option<BatteryInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processes: Option<Vec<ProcessInfo>>,
     #[serde(rename = "scan_errors", skip_serializing_if = "Vec::is_empty")]
     pub scan_errors: Vec<String>,
 }
@@ -109,6 +119,57 @@ pub struct CPUSample {
     pub irq: u64,
     pub softirq: u64,
     pub steal: u64,
+}
+
+/// DiskIORate holds per-second I/O throughput rates for one device.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DiskIORate {
+    #[serde(rename = "read_bytes_per_sec")]
+    pub read_bytes_per_sec: u64,
+    #[serde(rename = "write_bytes_per_sec")]
+    pub write_bytes_per_sec: u64,
+    #[serde(rename = "read_iops", skip_serializing_if = "Option::is_none")]
+    pub read_iops: Option<u64>,
+    #[serde(rename = "write_iops", skip_serializing_if = "Option::is_none")]
+    pub write_iops: Option<u64>,
+}
+
+/// DiskIOSample holds raw /proc/diskstats counters for one device.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DiskIOSample {
+    pub reads: u64,
+    pub sectors_read: u64,
+    pub writes: u64,
+    pub sectors_written: u64,
+}
+
+/// HardwareInfo holds hardware and CPU specifications.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct HardwareInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<usize>,
+}
+
+/// BatteryInfo holds battery charge, status, and health metrics.
+#[derive(Debug, Default, Clone, PartialEq, Serialize)]
+pub struct BatteryInfo {
+    pub percentage: u8,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_percent: Option<f64>,
+}
+
+/// ProcessInfo holds process resource consumption metrics.
+#[derive(Debug, Default, Clone, PartialEq, Serialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub cpu_percent: f64,
+    pub memory_bytes: u64,
 }
 
 /// humanKB mirrors the Go helper: 0 → "0 B", else kb*1024 via humanBytes.
