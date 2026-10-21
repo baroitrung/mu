@@ -491,6 +491,22 @@ graph TD
   - `xdg-open` in CI → goes through `Runner` with `FakeRunner` (NG4).
 - **Stop / recovery:** stop and ask if a golden help file must change (R5) or if R9 changes an exit code that a released script depends on. Each phase is one revertable commit set; the cache is a disposable file under `$XDG_CACHE_HOME/mu/`.
 
+#### Parallel Execution Map (multi-agent, added 2026-10-21)
+Phase definitions above stay unchanged. `Depends: Phase 7` on Phase 8 is a **merge-order** dependency only: the two phases share no files, so they may be coded concurrently and merged 7 first.
+
+| Batch | Agent | Work | Worktree / branch | Owns (exclusive) | Must not touch |
+|---|---|---|---|---|---|
+| B1 | A1 | Phase 7 (T7.1–T7.2) | `isolation: worktree`, `feat/menu-alignment` | `src/tui/menu.rs`, `src/tui/mod.rs` menu dispatch | `src/config.rs`, `src/remove.rs`, `src/uninstall/`, `src/purge/`, `src/installer/`, `tests/golden/` |
+| B1 | A2 | Phase 8 Wave 1: T8.1 + T8.2 | `isolation: worktree`, `fix/safety-hardening` | `src/config.rs` tests, `src/purge/`, `src/installer/` | `src/tui/` |
+| B1 | A3 | Phase 8 Wave 1: T8.3 | same branch as A2 (sequential commits after A2) or own worktree `fix/noninteractive-exit` | `src/remove.rs`, `src/uninstall/mod.rs` | `src/tui/`, `src/config.rs` |
+| B1-join | lead | Phase 8 Wave 2: T8.4 integration tests | `fix/safety-hardening` after A2+A3 merge | `tests/cli_integration.rs` | — |
+| B2 | A4 (single agent) | Phase 9 → 10 → 11 in order | one worktree `feat/analyze-ux` | `src/tui/analyze.rs`, `src/analyze/` | menu, config, remove, uninstall |
+
+- **Gates:** B2 starts only after B1 phases 7 and 8 pass their checks and are merged to `main`. Merge order in B1: Phase 7, then Phase 8 rebased on it.
+- **Why B2 stays serial:** phases 9–11 all edit `src/tui/analyze.rs`; 11 depends on 9's re-lstat-before-delete.
+- **Agent brief:** each agent gets its phase block verbatim, the Owns/Must-not-touch columns, and must run its phase's Checks before reporting. Any agent needing a file outside its Owns column stops and reports to the lead instead of editing.
+- **Conflict recovery:** if a merge conflicts, the lead rebases the later branch; agents never force-push `main`.
+
 ### Phase 7: Main Menu Alignment (7a)
 - **Slug:** `menu-alignment` · **Story ID:** `MU-008-menu-alignment` · **Status:** planned · **Depends:** none · **Req:** R7, NG7
 - **Wave 1:**
