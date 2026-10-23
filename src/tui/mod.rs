@@ -458,39 +458,21 @@ fn dispatch_subcommand(command: &str, debug: bool) -> anyhow::Result<Option<Stri
             }
             Ok(None)
         }
+        "analyze" => {
+            // Analyze TTY: run the interactive disk usage explorer on the default target.
+            let opts = crate::analyze::Options {
+                path: None,
+                dry_run: false,
+                json: false,
+                debug,
+            };
+            let target = crate::analyze::resolve_target_path(None);
+            run_analyze_tui(&opts, &target)?;
+            Ok(None)
+        }
         "status" => {
             // Status TTY: run the live dashboard.
             run_status_dashboard()?;
-            Ok(None)
-        }
-        "purge" => {
-            // Purge TTY: the interactive multi-select drives the deletion
-            // (review F4); every removal still goes through SafeDelete.
-            let opts = crate::purge::Options {
-                paths: Vec::new(),
-                dry_run: false,
-                auto_yes: false,
-                include_empty: false,
-                debug,
-            };
-            let code = crate::purge::run(&opts);
-            if code != 0 {
-                anyhow::bail!("purge exited with code {code}");
-            }
-            Ok(None)
-        }
-        "installer" => {
-            // Installer TTY: same interactive selection flow as purge.
-            let opts = crate::installer::Options {
-                paths: Vec::new(),
-                dry_run: false,
-                auto_yes: false,
-                debug,
-            };
-            let code = crate::installer::run(&opts);
-            if code != 0 {
-                anyhow::bail!("installer exited with code {code}");
-            }
             Ok(None)
         }
         _ => Ok(None),
@@ -559,13 +541,23 @@ mod tests {
 
     #[test]
     fn menu_items_count() {
-        assert_eq!(MENU_ITEMS.len(), 8);
+        assert_eq!(MENU_ITEMS.len(), 7);
     }
 
     #[test]
     fn dispatch_unknown_returns_none() {
         let result = dispatch_subcommand("unknown", false).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn dispatch_analyze_non_tty_fails() {
+        if !std::io::stdout().is_terminal() {
+            let result = dispatch_subcommand("analyze", false);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("could not open a new TTY"));
+        }
     }
 
     #[test]

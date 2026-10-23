@@ -1,7 +1,7 @@
 //! Main menu — port of `cmd/mu/cli/tui.go`.
 //!
 //! Shows the mu banner, a health snapshot, and a list of menu items.
-//! Keys: ↑/↓ or j/k navigate, 1-6 select by number, Enter/Space confirms,
+//! Keys: ↑/↓ or j/k navigate, 1-7 select by number, Enter/Space confirms,
 //! q/ctrl+c quits. After a subcommand runs, the menu re-opens with a
 //! transient done-summary banner (or error banner + continue hint).
 
@@ -25,8 +25,8 @@ pub struct MenuItem {
     pub command: &'static str,
 }
 
-/// The menu items — order from Go's `menuItems`, extended with the Phase 4
-/// `purge`/`installer` commands before Quit.
+/// The menu items — order from Go's `menuItems`:
+/// Audit, Clean, Uninstall, Optimize, Analyze, Status, Quit.
 pub const MENU_ITEMS: &[MenuItem] = &[
     MenuItem {
         label: "Audit",
@@ -49,19 +49,14 @@ pub const MENU_ITEMS: &[MenuItem] = &[
         command: "optimize",
     },
     MenuItem {
+        label: "Analyze",
+        desc: "Interactive disk usage explorer (ncdu-like)",
+        command: "analyze",
+    },
+    MenuItem {
         label: "Status",
         desc: "Live system dashboard",
         command: "status",
-    },
-    MenuItem {
-        label: "Purge",
-        desc: "Clean heavy project build artifacts (node_modules, target)",
-        command: "purge",
-    },
-    MenuItem {
-        label: "Installer",
-        desc: "Find and remove downloaded installer packages",
-        command: "installer",
     },
     MenuItem {
         label: "Quit",
@@ -180,7 +175,7 @@ impl MainMenu {
                 }
                 false
             }
-            KeyCode::Char(c @ '1'..='8') => {
+            KeyCode::Char(c @ '1'..='7') => {
                 let idx = (c as u8 - b'1') as usize;
                 if idx < MENU_ITEMS.len() {
                     self.chosen = Some(MENU_ITEMS[idx].command);
@@ -346,11 +341,32 @@ mod tests {
 
     #[test]
     fn menu_items_order() {
-        assert_eq!(MENU_ITEMS.len(), 8);
-        assert_eq!(MENU_ITEMS[0].command, "audit");
-        assert_eq!(MENU_ITEMS[5].command, "purge");
-        assert_eq!(MENU_ITEMS[6].command, "installer");
-        assert_eq!(MENU_ITEMS[7].command, "quit");
+        let commands: Vec<&str> = MENU_ITEMS.iter().map(|item| item.command).collect();
+        assert_eq!(
+            commands,
+            vec![
+                "audit",
+                "clean",
+                "uninstall",
+                "optimize",
+                "analyze",
+                "status",
+                "quit"
+            ]
+        );
+        let labels: Vec<&str> = MENU_ITEMS.iter().map(|item| item.label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Audit",
+                "Clean",
+                "Uninstall",
+                "Optimize",
+                "Analyze",
+                "Status",
+                "Quit"
+            ]
+        );
     }
 
     #[test]
@@ -379,8 +395,19 @@ mod tests {
         let mut m = MainMenu::default();
         m.handle_key(KeyCode::Char('3'));
         assert_eq!(m.chosen, Some("uninstall"));
-    }
 
+        let mut m = MainMenu::default();
+        m.handle_key(KeyCode::Char('5'));
+        assert_eq!(m.chosen, Some("analyze"));
+
+        let mut m = MainMenu::default();
+        m.handle_key(KeyCode::Char('7'));
+        assert_eq!(m.chosen, Some("quit"));
+
+        let mut m = MainMenu::default();
+        assert!(!m.handle_key(KeyCode::Char('8')));
+        assert_eq!(m.chosen, None);
+    }
     #[test]
     fn enter_selects() {
         let mut m = MainMenu {
@@ -467,5 +494,68 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(content.contains("▶ Clean"));
+    }
+
+    #[test]
+    fn navigate_bounds() {
+        let mut m = MainMenu::default();
+        for _ in 0..10 {
+            m.handle_key(KeyCode::Down);
+        }
+        assert_eq!(m.cursor, MENU_ITEMS.len() - 1);
+        assert_eq!(m.cursor, 6);
+        assert_eq!(MENU_ITEMS[m.cursor].command, "quit");
+    }
+
+    #[test]
+    fn render_cursor_highlight_analyze() {
+        let m = MainMenu::new(4, None); // cursor on "Analyze"
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| m.render(f, f.area())).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(content.contains("▶ Analyze"));
+    }
+
+    #[test]
+    fn analyze_menu_selection_and_explorer_return() {
+        // Selection via navigation
+        let mut m = MainMenu::default();
+        for _ in 0..4 {
+            m.handle_key(KeyCode::Down);
+        }
+        assert_eq!(m.cursor, 4);
+        assert_eq!(MENU_ITEMS[m.cursor].command, "analyze");
+        assert!(m.handle_key(KeyCode::Enter));
+        assert_eq!(m.chosen, Some("analyze"));
+
+        // Explorer opens and renders
+        let mut tui = crate::tui::analyze::AnalyzeTui::new(false);
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(content.contains("Scanning"));
+        assert!(content.contains("q quit"));
+
+        // 'q' returns to menu
+        let q_key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert!(tui.handle_key_event(q_key));
     }
 }
