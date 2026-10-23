@@ -3,9 +3,9 @@ id: 01KZZPMPARITY000000000001
 type: plan
 intake_id: 01KZZPMPARITY000000000002
 lane: normal
-status: planned
+status: active
 created: 2026-10-14
-updated: 2026-10-14
+updated: 2026-10-21
 ---
 
 # Plan: Upstream Mole Parity for mu (Ubuntu)
@@ -20,13 +20,15 @@ updated: 2026-10-14
   - History, Purge & Installer (Phase 4): `mu history` inspects `$XDG_DATA_HOME/mu/operations.log` in table and `--json` format; `mu purge` safely cleans heavy project build artifacts (`node_modules`, `target`, `dist`, `.venv`) with `--paths`, `--dry-run`, and `--yes`; `mu installer` finds and cleans large package installers in `~/Downloads`.
   - Advanced Status Monitoring (Phase 5): `mu status` supports continuous NDJSON streaming via `--watch [--interval 1s]` and surfaces per-core CPU, disk I/O, battery, and top process stats.
   - Management & Biometrics (Phase 6): `mu sudo` provides PAM fingerprint configuration (`enable`, `disable`, `status`) mirroring `mo touchid`; `mu update` checks GitHub releases and self-updates verified binaries; `mu remove` safely uninstalls `mu`; `mu completion --install` auto-installs shell scripts.
+  - Main Menu Alignment (refine 2026-10-21): root TUI menu lists Audit, Clean, Uninstall, Optimize, Analyze, Status, Quit (Analyze after Optimize, as upstream `mole:186-190`); Purge and Installer are removed from the menu and remain reachable via `mu purge` / `mu installer`.
+  - Analyze UX Parity (refine 2026-10-21, upstream `cmd/analyze` @ `V1.61.0`): no-arg `mu analyze` opens an overview of locations plus hidden-space insights (e.g. `~/Downloads` files older than 90 days); `Space` multi-select and `⌫` batch delete via `trash::SafeDelete` behind YES/NO confirm; `/` name filter; cleanable-dir badges (`node_modules`, `target`, `CACHEDIR.TAG`) excluding paths already covered by `mu clean`; `R` rescan, `O` open via `xdg-open`, `P` preview, `F` reveal file; versioned on-disk scan cache under `$XDG_CACHE_HOME/mu/` that rejects stale schema.
 
 ## Authority and Requirements
 - authority:
   - `AGENTS.md` / `CLAUDE.md`: Inviolable safety invariants — `trash::SafeDelete` via FreeDesktop/gio trash only (never `rm`), protected prefixes in `src/paths.rs` plus user `protected_paths`, fail-closed TOML configuration, APT-policy-only autoremove, opt-in high-impact clean categories, dry-run on every destructive action, operation logging to `$XDG_DATA_HOME/mu/operations.log`.
   - `mu-prd.md`: Product requirements for Ubuntu system cleaner and optimizer, command specification (`mu`, `clean`, `uninstall`, `optimize`, `status`, `analyze`, `purge`, `installer`, `sudo`/`touchid`, `update`, `remove`), P0/P1/P2 priorities, terminal UI conventions.
   - `docs/decisions/0006-rust-rewrite-accepted-parity-divergences.md`: Rust rewrite baseline contracts, golden fixtures in `tests/golden/`, byte-exact help/error parity requirements.
-  - Upstream Mole: `https://github.com/tw93/mole` @ commit `7867c80` / release `V1.59.1` (`lib/core/commands.sh`, `lib/core/help.sh`, `bin/*.sh`, `lib/*/*.sh`, `cmd/*`).
+  - Upstream Mole: `https://github.com/tw93/mole` @ release `V1.61.0` (pin moved 2026-10-21 from `7867c80` / `V1.59.1`, the baseline of the gap matrix below) (`lib/core/commands.sh`, `lib/core/help.sh`, `bin/*.sh`, `lib/*/*.sh`, `cmd/*`).
   - Inventory Baseline: `~/quaqua/runs/detu-muinv2.md` comprehensive feature inventory.
 - requirements:
   - R1 [safety]: All user-file deletions must route strictly through `trash::SafeDelete` — moves to trash, never `rm`. Upstream features bypassing trash (e.g. `--permanent`) must be explicitly rejected.
@@ -35,6 +37,9 @@ updated: 2026-10-14
   - R4 [ubuntu-native]: Map upstream macOS mechanisms to native Ubuntu/Debian equivalents: APT/Snap/Flatpak packages, systemd user and system services, XDG base directories, PAM fingerprint authentication (`pam_fprintd.so`), `resolvectl` DNS maintenance.
   - R5 [contract]: Retain byte-exact CLI contract compatibility for existing commands where golden tests assert output (`tests/golden/`), updating golden files only alongside intentional new CLI subcommands.
   - R6 [headless]: Non-interactive / headless scripting paths must be supported when flags or arguments are explicitly passed (`mu uninstall <pkg>`, `mu clean --yes`, `mu optimize --yes`, `mu status --json`), while preserving existing TTY-check error behavior when interactive TUI commands are called headless without args.
+  - R7 [menu]: `MENU_ITEMS` order is exactly Audit, Clean, Uninstall, Optimize, Analyze, Status, Quit, asserted by a `menu_items_order` test; `mu purge --help` and `mu installer --help` output stays byte-identical to `tests/golden/`.
+  - R8 [analyze-ux]: Delivered in order 7a menu (R7) → 7b `Space` multi-select, `⌫`/`Delete` batch delete, `/` filter (`⌫` edits text in filter mode) → 7c overview, insights, badges, `R`/`O`/`P`/`F` → 7d scan cache. Each Analyze UX feature in the success signals has a `TestBackend` or unit test; batch delete logs every trashed path to the oplog, refuses whitelisted paths, and changes nothing on NO or with `--dry-run`; a cache whose schema version mismatches is ignored and rescanned. Batch delete drops descendants of selected ancestors, re-lstats each path before trashing, excludes whitelisted paths at selection, continues and reports on partial failure, and invalidates the cache. Cache is keyed by schema version + canonical root, written atomically (tmp + rename), treats a corrupt file as a miss, and `R` bypasses it; no new analyze flags are added, so `help-analyze` golden stays unchanged (R5). `O`/`F` run through the `Runner` trait (FakeRunner in tests) and show a message when no DISPLAY is set. Cleanable badges derive the `mu clean` exclusion from the clean target roots. No-arg overview is TTY-only; `mu analyze --json` and the non-TTY error stay unchanged (R6).
+  - R9 [hardening]: Lands before 7b. Mapped from upstream V1.61.0 safety fixes: an unreadable (EACCES), not only malformed, user config blocks `clean`, `optimize`, `purge`, `installer` and `uninstall`; unknown whitelist paths are rejected before cleanup; `mu uninstall` and `mu remove` exit nonzero when no TTY can confirm and `--yes` is absent. Each case has a failure-path test.
 
 ## Non-goals
 - NG1: Implementing macOS-specific features on Linux (e.g. Rosetta 2 caches, iOS simulator firmware, APFS Time Machine snapshot thinning, Gatekeeper quarantine database, macOS `.DS_Store` suppression, Spotlight `mdutil` index rebuilds, Raycast/Alfred launcher scripts).
@@ -42,6 +47,8 @@ updated: 2026-10-14
 - NG3: Bypassing trash for faster deletion or adding unsafe raw `rm -rf` flags.
 - NG4: Driving real GUI desktop sessions or taking screen captures (must obey `No GUI driving` constraint).
 - NG5: Running unsafe network stack flushes (`ip route/neigh flush`) that drop live SSH or network connections.
+- NG6: Analyze APFS clone accounting and Time Machine local snapshot detection (macOS-only, `clone_darwin.go`, `snapshots.go`).
+- NG7: Removing the `purge` / `installer` CLI commands — only their menu entries are dropped.
 
 ## Safety Invariants & Conflict Decisions
 
@@ -470,6 +477,102 @@ graph TD
      -> exit 0; confirms remove dry-run does not delete configuration file.
   5. `cargo run --release -- completion --install bash` -> exit 0; writes completion script to bash completions directory.
   6. `make test` -> all unit and integration tests pass.
+
+---
+
+### Approach for Phases 7–11 (planned 2026-10-21)
+- **Approach:** extend the existing modules in place: `src/tui/menu.rs`, `src/tui/analyze.rs`, `src/analyze/`, `src/config.rs`, `src/remove.rs`, `src/uninstall/mod.rs`. Build on the existing single-item `d` delete (`src/tui/analyze.rs:331-339`, default NO, `trash::safe_delete`). Order: menu (7a) → hardening (R9) → batch delete (7b) → overview (7c) → cache (7d). The order follows risk: batch delete needs fail-closed whitelist loading first, and cache must not land before delete revalidates paths.
+- **Rejected:** (1) a single R8 phase, too big to verify; (2) a separate hardening plan, because the playbook allows only one active plan; (3) an `--no-cache` flag, rejected to keep `help-analyze` golden unchanged (R5), so `R` bypasses the cache instead.
+- **Risks / mitigations:**
+  - batch delete of a stale or cached path → re-lstat each path and run the whitelist check right before `safe_delete`;
+  - nested selections → drop descendants of selected ancestors before trashing;
+  - `⌫` conflict → in filter mode it edits text only;
+  - exit-code changes in R9 → update golden/integration tests in the same commit;
+  - `xdg-open` in CI → goes through `Runner` with `FakeRunner` (NG4).
+- **Stop / recovery:** stop and ask if a golden help file must change (R5) or if R9 changes an exit code that a released script depends on. Each phase is one revertable commit set; the cache is a disposable file under `$XDG_CACHE_HOME/mu/`.
+
+#### Parallel Execution Map (multi-agent, added 2026-10-21)
+Phase definitions above stay unchanged. `Depends: Phase 7` on Phase 8 is a **merge-order** dependency only: the two phases share no files, so they may be coded concurrently and merged 7 first.
+
+| Batch | Agent | Work | Worktree / branch | Owns (exclusive) | Must not touch |
+|---|---|---|---|---|---|
+| B1 | A1 | Phase 7 (T7.1–T7.2) | `isolation: worktree`, `feat/menu-alignment` | `src/tui/menu.rs`, `src/tui/mod.rs` menu dispatch | `src/config.rs`, `src/remove.rs`, `src/uninstall/`, `src/purge/`, `src/installer/`, `tests/golden/` |
+| B1 | A2 | Phase 8 Wave 1: T8.1 + T8.2 | `isolation: worktree`, `fix/safety-hardening` | `src/config.rs` tests, `src/purge/`, `src/installer/` | `src/tui/` |
+| B1 | A3 | Phase 8 Wave 1: T8.3 | same branch as A2 (sequential commits after A2) or own worktree `fix/noninteractive-exit` | `src/remove.rs`, `src/uninstall/mod.rs` | `src/tui/`, `src/config.rs` |
+| B1-join | lead | Phase 8 Wave 2: T8.4 integration tests | `fix/safety-hardening` after A2+A3 merge | `tests/cli_integration.rs` | — |
+| B2 | A4 (single agent) | Phase 9 → 10 → 11 in order | one worktree `feat/analyze-ux` | `src/tui/analyze.rs`, `src/analyze/` | menu, config, remove, uninstall |
+
+- **Gates:** B2 starts only after B1 phases 7 and 8 pass their checks and are merged to `main`. Merge order in B1: Phase 7, then Phase 8 rebased on it.
+- **Why B2 stays serial:** phases 9–11 all edit `src/tui/analyze.rs`; 11 depends on 9's re-lstat-before-delete.
+- **Agent brief:** each agent gets its phase block verbatim, the Owns/Must-not-touch columns, and must run its phase's Checks before reporting. Any agent needing a file outside its Owns column stops and reports to the lead instead of editing.
+- **Conflict recovery:** if a merge conflicts, the lead rebases the later branch; agents never force-push `main`.
+
+### Phase 7: Main Menu Alignment (7a)
+- **Slug:** `menu-alignment` · **Story ID:** `MU-008-menu-alignment` · **Status:** planned · **Depends:** none · **Req:** R7, NG7
+- **Wave 1:**
+  - T7.1: In `src/tui/menu.rs`, set `MENU_ITEMS` to Audit, Clean, Uninstall, Optimize, Analyze (`command: "analyze"`), Status, Quit, and remove Purge and Installer. Make sure the menu dispatch for `analyze` launches `run_analyze_tui` on the default target.
+  - T7.2: Rewrite `menu_items_order` to assert the full ordered command vector. Grep the menu tests and snapshots for count or index assumptions and fix them.
+- **Avoid:** `src/cli.rs` help text, `src/purge/`, `src/installer/`.
+- **Checks:**
+  - `cargo test tui::menu`
+  - `cargo test --test '*' golden` (or `make test`), help goldens unchanged
+  - `git diff --stat tests/golden` shows empty output
+  - `./target/release/mu purge --help` and `./target/release/mu installer --help` exit 0
+  - manual TTY run: `mu`, select Analyze, explorer opens, `q` returns to the menu
+
+### Phase 8: Upstream Safety Hardening (R9)
+- **Slug:** `upstream-safety-hardening` · **Story ID:** `MU-009-safety-hardening` · **Status:** planned · **Depends:** Phase 7 · **Req:** R9, R1, R6
+- **Wave 1 (independent):**
+  - T8.1: Add a test proving that an unreadable `config.toml` (chmod 000) makes `load_whitelist_from` return an error. The current code already propagates `read_to_string` errors at `src/config.rs:86`; this task adds the proof.
+  - T8.2: Make sure `purge` and `installer` load the whitelist before scan or execute and fail closed (nonzero exit, no trash calls) on malformed or unreadable config. Today `load_whitelist` callers are only clean, optimize, uninstall and trash.
+  - T8.3: `src/remove.rs:232`: non-interactive without `--yes` currently returns 0. Change it to a nonzero exit (1). `src/uninstall/mod.rs:424` NonInteractive: assert it exits nonzero, and fix it if not.
+- **Wave 2:** T8.4: add integration tests (`tests/cli_integration.rs`) covering each case with a temp `XDG_CONFIG_HOME`. Update goldens only if an exit code changes, and stop and ask first (Approach stop condition).
+- **Checks:**
+  - `cargo test config::tests`
+  - `cargo test --test cli_integration`
+  - `XDG_CONFIG_HOME=$(mktemp -d) …` with chmod 000 config: `mu purge --dry-run` exits nonzero
+  - `mu remove </dev/null` exits 1
+  - `make lint`
+
+### Phase 9: Analyze Multi-Select, Batch Delete, Filter (7b)
+- **Slug:** `analyze-batch-delete` · **Story ID:** `MU-010-analyze-batch` · **Status:** planned · **Depends:** Phase 8 · **Req:** R8, R1, R2
+- **Wave 1:**
+  - T9.1: Add selection state to the analyze TUI. `Space` toggles the current row; whitelisted paths cannot be selected (show a hint).
+  - T9.2: Add a `/` filter mode with case-insensitive name matching and a match count. `Esc` clears the filter; `⌫` edits the text.
+- **Wave 2:**
+  - T9.3: `⌫`/`Delete` opens a batch confirm showing count, total size and the first 5 paths, default NO.
+  - T9.4: On confirm, drop descendants of selected ancestors, then for each path: re-lstat → whitelist check → `trash::safe_delete` → oplog entry. Continue on failure and show a summary of failures. With `--dry-run`, run no deletes. `d` stays as the single-item delete.
+- **Checks:**
+  - `cargo test tui::analyze`: new tests for select toggle, whitelisted refusal, ancestor dedupe, NO = no change, partial failure continues, filter backspace does not delete
+  - Sentinel test: `mu analyze --dry-run` leaves files intact
+  - `make lint`
+
+### Phase 10: Analyze Overview, Insights, Badges, Actions (7c)
+- **Slug:** `analyze-overview` · **Story ID:** `MU-011-analyze-overview` · **Status:** planned · **Depends:** Phase 9 · **Req:** R8, R6, NG4
+- **Wave 1 (independent):**
+  - T10.1: No-arg `mu analyze` on a TTY opens the overview (Home, Downloads, `~/.cache`, `/`). `--json` and the non-TTY behavior stay unchanged.
+  - T10.2: Add insights rows. For `~/Downloads` files older than 90 days, show a pointer to `mu installer` instead of double counting installers.
+  - T10.3: Add cleanable badges for `node_modules`, `target`, `.venv`, `dist` and `CACHEDIR.TAG`. Exclude roots covered by `mu clean`, derived from the clean target root list (no second list).
+- **Wave 2:**
+  - T10.4: `R` rescan, `O` open dir and `F` reveal file via `Runner` running `xdg-open`, and `P` text preview of the first N lines/bytes. With no `DISPLAY`/`WAYLAND_DISPLAY`, show a message instead.
+- **Checks:**
+  - `cargo test analyze`: TestBackend snapshots for the overview, badges and insights
+  - FakeRunner asserts the `xdg-open` argv
+  - `mu analyze --json /tmp | head -c1` prints `{`
+  - non-TTY `mu analyze </dev/null` output equals the pre-change output
+  - `git diff --stat tests/golden` shows empty output
+
+### Phase 11: Analyze Scan Cache (7d)
+- **Slug:** `analyze-scan-cache` · **Story ID:** `MU-012-analyze-cache` · **Status:** planned · **Depends:** Phase 10 · **Req:** R8, R5
+- **Wave 1:**
+  - T11.1: Add a cache under `$XDG_CACHE_HOME/mu/analyze/` keyed by schema version + canonical root. Ignore a relative `XDG_CACHE_HOME` (via `xdg`). Write atomically (tmp + rename); a corrupt file or a schema mismatch counts as a miss.
+  - T11.2: Wire up the TUI: load from cache, `R` bypasses it, any delete invalidates the affected root. `--json` always scans fresh. No new flags.
+- **Checks:**
+  - `cargo test analyze::cache`: round-trip, corrupt file = miss, version mismatch = miss, invalidate after delete
+  - `git diff --stat tests/golden` shows empty output
+  - `make lint && make test`
+
+**Next action:** `work` → Phase 7 (`menu-alignment`).
 
 ---
 
