@@ -427,7 +427,7 @@ fn run_cli_uninstall(
                     "Non-interactive: pass --yes to confirm, or --dry-run to preview."
                 );
                 let _ = writeln!(out, "Aborted.");
-                return 0;
+                return 1;
             }
         }
     }
@@ -755,7 +755,7 @@ mod tests {
             &mut err_out,
             &mut |_| ConfirmOutcome::NonInteractive,
         );
-        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err_out));
+        assert_eq!(code, 1, "stderr: {}", String::from_utf8_lossy(&err_out));
         assert!(
             String::from_utf8_lossy(&out).contains("Non-interactive: pass --yes"),
             "expected non-interactive note, got {:?}",

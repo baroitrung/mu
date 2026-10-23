@@ -233,7 +233,7 @@ pub fn run(opts: &Options) -> i32 {
         println!();
         println!("Non-interactive: pass --yes to confirm removal of mu.");
         println!("Aborted.");
-        return 0;
+        return 1;
     }
 
     let mut failed = 0;
@@ -386,5 +386,17 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_remove_non_interactive_without_yes_exits_nonzero() {
+        let opts = Options {
+            dry_run: false,
+            auto_yes: false,
+            debug: false,
+        };
+
+        let code = run(&opts);
+        assert_eq!(code, 1, "non-interactive remove without --yes must return 1");
     }
 }
