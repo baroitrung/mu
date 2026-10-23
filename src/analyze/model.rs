@@ -46,6 +46,7 @@ pub enum ViewMode {
     #[default]
     Tree,
     LargestFiles,
+    Overview,
 }
 
 /// A node in the scanned directory tree.

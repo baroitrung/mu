@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -12,9 +13,113 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::analyze::model::{FileNode, LargestFile, ScanMessage, SortMode, ViewMode};
 use crate::paths;
+use crate::runner::{CommandSpec, Runner};
 use crate::trash;
 use crate::tui::styles;
 
+/// Check if a node qualifies for a [cleanable] badge:
+/// 1. Must NOT be covered by any clean root (roots covered by `mu clean`, derived from clean target root list).
+/// 2. Must be named `node_modules`, `target`, `.venv`, `dist`, or `CACHEDIR.TAG`,
+///    or be a directory containing a `CACHEDIR.TAG` child.
+pub fn is_cleanable(node: &FileNode, clean_roots: &[PathBuf]) -> bool {
+    for root in clean_roots {
+        if node.path == *root || node.path.starts_with(root) {
+            return false;
+        }
+    }
+
+    let name = node.name.as_str();
+    if matches!(
+        name,
+        "node_modules" | "target" | ".venv" | "dist" | "CACHEDIR.TAG"
+    ) {
+        return true;
+    }
+
+    if node.is_dir && node.children.iter().any(|c| c.name == "CACHEDIR.TAG") {
+        return true;
+    }
+
+    false
+}
+
+/// Recursively count cleanable nodes and total size in bytes.
+pub fn count_cleanable_nodes(node: &FileNode, clean_roots: &[PathBuf]) -> (u64, usize) {
+    let mut bytes = 0u64;
+    let mut count = 0usize;
+    if is_cleanable(node, clean_roots) {
+        bytes += node.size;
+        count += 1;
+    } else {
+        for child in &node.children {
+            let (b, c) = count_cleanable_nodes(child, clean_roots);
+            bytes += b;
+            count += c;
+        }
+    }
+    (bytes, count)
+}
+
+/// Scan a directory for regular files older than `older_than_secs` (e.g. 90 days).
+pub fn scan_old_files(dir: &Path, older_than_secs: u64) -> (u64, usize) {
+    let mut total_bytes = 0u64;
+    let mut count = 0usize;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let now = std::time::SystemTime::now();
+    let threshold = std::time::Duration::from_secs(older_than_secs);
+
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_file()
+            && let Ok(mtime) = meta.modified()
+            && let Ok(elapsed) = now.duration_since(mtime)
+            && elapsed >= threshold
+        {
+            total_bytes += meta.len();
+            count += 1;
+        }
+    }
+    (total_bytes, count)
+}
+
+fn read_preview_lines(
+    path: &Path,
+    max_lines: usize,
+    max_bytes: usize,
+) -> std::io::Result<Vec<String>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; max_bytes];
+    let n = std::io::Read::read(&mut file, &mut buf)?;
+    buf.truncate(n);
+    if buf.contains(&0) {
+        return Ok(vec![
+            "(binary file cannot be previewed as text)".to_string(),
+        ]);
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let lines: Vec<String> = text
+        .lines()
+        .take(max_lines)
+        .map(ToString::to_string)
+        .collect();
+    if lines.is_empty() {
+        Ok(vec!["(empty file)".to_string()])
+    } else {
+        Ok(lines)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OverviewLocationItem {
+    pub name: &'static str,
+    pub path: PathBuf,
+    pub size_human: String,
+    pub item_count_str: String,
+}
 fn selected_style() -> Style {
     Style::default()
         .bg(Color::Rgb(0x1F, 0x29, 0x37))
@@ -27,7 +132,7 @@ fn normal_style() -> Style {
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Interactive disk analysis TUI state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AnalyzeTui {
     pub root: Option<FileNode>,
     /// Indices from root to current displayed directory node.
@@ -58,10 +163,37 @@ pub struct AnalyzeTui {
     pub largest_files: Vec<LargestFile>,
     pub window_width: u16,
     pub window_h: u16,
+    pub has_overview: bool,
+    pub runner: Arc<dyn Runner>,
+    pub clean_roots: Vec<PathBuf>,
+    pub old_downloads_bytes: u64,
+    pub old_downloads_count: usize,
+    pub cleanable_cache_bytes: u64,
+    pub cleanable_cache_count: usize,
+    pub preview_modal: Option<(String, Vec<String>)>,
+    pub rescan_requested: bool,
+}
+
+impl std::fmt::Debug for AnalyzeTui {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnalyzeTui")
+            .field("cursor", &self.cursor)
+            .field("view_mode", &self.view_mode)
+            .field("has_overview", &self.has_overview)
+            .field("scanning", &self.scanning)
+            .finish()
+    }
 }
 
 impl AnalyzeTui {
     pub fn new(dry_run: bool) -> Self {
+        let clean_roots = crate::clean::clean_target_roots();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let downloads = home.join("Downloads");
+        let (old_bytes, old_count) = scan_old_files(&downloads, 90 * 86400);
+
         Self {
             root: None,
             path_indices: Vec::new(),
@@ -85,6 +217,48 @@ impl AnalyzeTui {
             largest_files: Vec::new(),
             window_width: 80,
             window_h: 24,
+            has_overview: false,
+            runner: Arc::new(crate::runner::ProcessRunner),
+            clean_roots,
+            old_downloads_bytes: old_bytes,
+            old_downloads_count: old_count,
+            cleanable_cache_bytes: 0,
+            cleanable_cache_count: 0,
+            preview_modal: None,
+            rescan_requested: false,
+        }
+    }
+
+    pub fn with_runner(mut self, runner: Arc<dyn Runner>) -> Self {
+        self.runner = runner;
+        self
+    }
+
+    pub fn set_runner(&mut self, runner: Arc<dyn Runner>) {
+        self.runner = runner;
+    }
+
+    pub fn set_overview_mode(&mut self, enabled: bool) {
+        self.has_overview = enabled;
+        if enabled {
+            self.view_mode = ViewMode::Overview;
+            self.cursor = 0;
+            self.scroll_off = 0;
+        } else {
+            self.view_mode = ViewMode::Tree;
+        }
+    }
+
+    pub fn set_old_downloads(&mut self, bytes: u64, count: usize) {
+        self.old_downloads_bytes = bytes;
+        self.old_downloads_count = count;
+    }
+
+    pub fn update_cleanable_stats(&mut self) {
+        if let Some(root) = &self.root {
+            let (c_bytes, c_count) = count_cleanable_nodes(root, &self.clean_roots);
+            self.cleanable_cache_bytes = c_bytes;
+            self.cleanable_cache_count = c_count;
         }
     }
 
@@ -114,6 +288,9 @@ impl AnalyzeTui {
                 self.scan_progress_text = format!("{items_scanned} items ({bytes_human}) · {name}");
             }
             ScanMessage::Complete { root, stats } => {
+                let (c_bytes, c_count) = count_cleanable_nodes(&root, &self.clean_roots);
+                self.cleanable_cache_bytes = c_bytes;
+                self.cleanable_cache_count = c_count;
                 self.root = Some(root);
                 self.largest_files = stats.largest_files;
                 self.scanning = false;
@@ -245,6 +422,21 @@ impl AnalyzeTui {
             return true;
         }
 
+        // Modal preview dialog handling
+        if self.preview_modal.is_some() {
+            match key.code {
+                KeyCode::Esc
+                | KeyCode::Char('q')
+                | KeyCode::Char('p')
+                | KeyCode::Char('P')
+                | KeyCode::Enter => {
+                    self.preview_modal = None;
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         // Modal confirmation dialog handling
         if self.is_confirm_open() {
             return self.handle_confirm_key(key);
@@ -283,8 +475,44 @@ impl AnalyzeTui {
             return false;
         }
 
+        // Overview mode handling
+        if self.view_mode == ViewMode::Overview {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.navigate_up_cursor();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.navigate_down();
+                }
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    self.enter_overview_location();
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.trigger_rescan();
+                }
+                KeyCode::Char('o') | KeyCode::Char('O') => {
+                    self.trigger_open_dir();
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    return true;
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         match key.code {
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('q') => {
+                if !self.path_indices.is_empty() {
+                    self.navigate_up();
+                } else if self.has_overview {
+                    self.view_mode = ViewMode::Overview;
+                    self.cursor = 0;
+                    self.scroll_off = 0;
+                } else {
+                    return true;
+                }
+            }
             KeyCode::Esc => {
                 if !self.filter_text.is_empty() {
                     self.filter_text.clear();
@@ -294,6 +522,10 @@ impl AnalyzeTui {
                     self.view_mode = ViewMode::Tree;
                 } else if !self.path_indices.is_empty() {
                     self.navigate_up();
+                } else if self.has_overview {
+                    self.view_mode = ViewMode::Overview;
+                    self.cursor = 0;
+                    self.scroll_off = 0;
                 } else {
                     return true;
                 }
@@ -302,6 +534,7 @@ impl AnalyzeTui {
                 self.view_mode = match self.view_mode {
                     ViewMode::Tree => ViewMode::LargestFiles,
                     ViewMode::LargestFiles => ViewMode::Tree,
+                    ViewMode::Overview => ViewMode::Overview,
                 };
                 self.cursor = 0;
                 self.scroll_off = 0;
@@ -311,6 +544,18 @@ impl AnalyzeTui {
                 self.apply_sort();
                 self.cursor = 0;
                 self.scroll_off = 0;
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.trigger_rescan();
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                self.trigger_open_dir();
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                self.trigger_reveal_file();
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                self.trigger_preview();
             }
             KeyCode::Char('/') if self.view_mode == ViewMode::Tree => {
                 self.filter_mode = true;
@@ -334,7 +579,13 @@ impl AnalyzeTui {
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 if self.view_mode == ViewMode::Tree {
-                    self.navigate_up();
+                    if !self.path_indices.is_empty() {
+                        self.navigate_up();
+                    } else if self.has_overview {
+                        self.view_mode = ViewMode::Overview;
+                        self.cursor = 0;
+                        self.scroll_off = 0;
+                    }
                 }
             }
             KeyCode::Char('d') if self.view_mode == ViewMode::Tree => {
@@ -378,6 +629,7 @@ impl AnalyzeTui {
 
     fn navigate_down(&mut self) {
         let max_items = match self.view_mode {
+            ViewMode::Overview => self.overview_locations().len(),
             ViewMode::Tree => self.filtered_children().len(),
             ViewMode::LargestFiles => self.largest_files.len(),
         };
@@ -414,12 +666,23 @@ impl AnalyzeTui {
 
     fn navigate_up(&mut self) {
         if let Some(prev_idx) = self.path_indices.pop() {
-            self.cursor = prev_idx;
-            self.scroll_off = 0;
             self.apply_sort();
-            let max_len = self.filtered_children().len();
-            if self.cursor >= max_len && max_len > 0 {
-                self.cursor = max_len - 1;
+            let filtered = self.filtered_children();
+            if let Some(display_idx) = filtered
+                .iter()
+                .position(|(orig_idx, _)| *orig_idx == prev_idx)
+            {
+                self.cursor = display_idx;
+            } else {
+                let max_len = filtered.len();
+                if self.cursor >= max_len && max_len > 0 {
+                    self.cursor = max_len - 1;
+                }
+            }
+            self.scroll_off = 0;
+            let visible_height = self.window_h.saturating_sub(6) as usize;
+            if visible_height > 0 && self.cursor >= visible_height {
+                self.scroll_off = self.cursor - visible_height + 1;
             }
         }
     }
@@ -655,6 +918,7 @@ impl AnalyzeTui {
         self.render_header(f, chunks[0]);
 
         match self.view_mode {
+            ViewMode::Overview => self.render_overview(f, chunks[1]),
             ViewMode::Tree => self.render_tree(f, chunks[1]),
             ViewMode::LargestFiles => self.render_largest(f, chunks[1]),
         }
@@ -663,10 +927,56 @@ impl AnalyzeTui {
 
         if self.is_confirm_open() {
             self.render_confirm_dialog(f, area);
+        } else if self.preview_modal.is_some() {
+            self.render_preview_dialog(f, area);
         }
     }
 
     fn render_header(&self, f: &mut Frame, area: Rect) {
+        if self.view_mode == ViewMode::Overview {
+            let mut status_spans = Vec::new();
+            if self.scanning {
+                let spinner = SPINNER_FRAMES[self.spinner_idx];
+                status_spans.push(Span::styled(
+                    format!("{spinner} Scanning: {} ", self.scan_progress_text),
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else {
+                status_spans.push(Span::styled(
+                    "✔ Scan ready  ",
+                    Style::default().fg(Color::Green),
+                ));
+            }
+
+            if self.dry_run {
+                status_spans.push(Span::styled(
+                    "[DRY RUN] ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            status_spans.push(Span::styled(
+                "[View: Overview]  ",
+                Style::default().fg(Color::Magenta),
+            ));
+
+            let lines = vec![
+                Line::from(vec![Span::styled(
+                    "Disk Usage Overview",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(status_spans),
+            ];
+
+            let block = Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray));
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+            return;
+        }
         let current_path = self
             .current_node()
             .map(|n| n.path.display().to_string())
@@ -706,6 +1016,7 @@ impl AnalyzeTui {
         ));
 
         let view_label = match self.view_mode {
+            ViewMode::Overview => "[View: Overview]  ",
             ViewMode::Tree => "[View: Tree]  ",
             ViewMode::LargestFiles => "[View: Largest Files]  ",
         };
@@ -837,6 +1148,16 @@ impl AnalyzeTui {
             if child.err.is_some() {
                 style = style.fg(Color::Red);
             }
+            let clean_badge = if is_cleanable(child, &self.clean_roots) {
+                Span::styled(
+                    " [cleanable]",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            };
 
             let line = Line::from(vec![
                 Span::styled(prefix, style),
@@ -848,8 +1169,8 @@ impl AnalyzeTui {
                 Span::styled(dir_icon, Style::default().fg(Color::Cyan)),
                 Span::styled(format!("{:<30} ", name_display), style),
                 Span::styled(item_count_str, Style::default().fg(Color::DarkGray)),
+                clean_badge,
             ]);
-
             lines.push(line);
         }
 
@@ -930,7 +1251,11 @@ impl AnalyzeTui {
             return;
         }
 
-        let help = "↑/↓/j/k nav · Space select · / filter · ⌫/Del batch · d del · s sort · Tab largest · q quit";
+        let help = if self.view_mode == ViewMode::Overview {
+            "↑/↓/j/k nav · Enter browse · R rescan · O open · q quit"
+        } else {
+            "↑/↓ nav · Space sel · / filter · ⌫ del · R rescan · O open · F reveal · P view · s sort · Tab · q quit"
+        };
         let p = Paragraph::new(Line::from(vec![Span::styled(
             help,
             Style::default().fg(Color::DarkGray),
@@ -1069,6 +1394,423 @@ impl AnalyzeTui {
             .alignment(Alignment::Center);
         f.render_widget(paragraph, dialog_area);
     }
+
+    fn enter_overview_location(&mut self) {
+        let locs = self.overview_locations();
+        if self.cursor >= locs.len() {
+            return;
+        }
+        let loc_name = locs[self.cursor].name;
+        let loc_path = locs[self.cursor].path.clone();
+        self.view_mode = ViewMode::Tree;
+        self.cursor = 0;
+        self.scroll_off = 0;
+        self.path_indices.clear();
+
+        match loc_name {
+            "Home" => {}
+            "Downloads" => {
+                if let Some(root) = &self.root
+                    && let Some(idx) = root
+                        .children
+                        .iter()
+                        .position(|c| c.name == "Downloads" || c.path == loc_path)
+                {
+                    self.path_indices.push(idx);
+                    self.apply_sort();
+                }
+            }
+            "User Cache" => {
+                if let Some(root) = &self.root
+                    && let Some(idx) = root
+                        .children
+                        .iter()
+                        .position(|c| c.name == ".cache" || c.path == loc_path)
+                {
+                    self.path_indices.push(idx);
+                    self.apply_sort();
+                }
+            }
+            "Root System" => {
+                if let Some(root) = &self.root
+                    && root.path != Path::new("/")
+                {
+                    self.trigger_rescan();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn trigger_rescan(&mut self) {
+        self.scanning = true;
+        self.rescan_requested = true;
+        self.scan_progress_text = "Rescanning...".to_string();
+        self.message = Some(("Rescanning...".to_string(), false));
+    }
+
+    fn trigger_open_dir(&mut self) {
+        let target_dir = match self.view_mode {
+            ViewMode::Overview => {
+                let locs = self.overview_locations();
+                if self.cursor < locs.len() {
+                    locs[self.cursor].path.clone()
+                } else {
+                    return;
+                }
+            }
+            ViewMode::Tree => {
+                if let Some((_, child)) = self.current_child() {
+                    if child.is_dir {
+                        child.path.clone()
+                    } else {
+                        child.path.parent().unwrap_or(&child.path).to_path_buf()
+                    }
+                } else if let Some(node) = self.current_node() {
+                    node.path.clone()
+                } else {
+                    return;
+                }
+            }
+            ViewMode::LargestFiles => {
+                if self.cursor < self.largest_files.len() {
+                    let file = &self.largest_files[self.cursor];
+                    file.path.parent().unwrap_or(&file.path).to_path_buf()
+                } else {
+                    return;
+                }
+            }
+        };
+
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            self.message = Some((
+                "Cannot open GUI: neither DISPLAY nor WAYLAND_DISPLAY is set".to_string(),
+                true,
+            ));
+            return;
+        }
+
+        let spec = CommandSpec::new("xdg-open", [target_dir.as_os_str()]);
+        match self.runner.run(&spec) {
+            Ok(_) => {
+                self.message = Some((format!("Opened {}", target_dir.display()), false));
+            }
+            Err(e) => {
+                self.message = Some((
+                    format!("Failed to open {}: {e}", target_dir.display()),
+                    true,
+                ));
+            }
+        }
+    }
+
+    fn trigger_reveal_file(&mut self) {
+        let target_path = match self.view_mode {
+            ViewMode::Overview => return,
+            ViewMode::Tree => {
+                if let Some((_, child)) = self.current_child() {
+                    child.path.clone()
+                } else if let Some(node) = self.current_node() {
+                    node.path.clone()
+                } else {
+                    return;
+                }
+            }
+            ViewMode::LargestFiles => {
+                if self.cursor < self.largest_files.len() {
+                    self.largest_files[self.cursor].path.clone()
+                } else {
+                    return;
+                }
+            }
+        };
+
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            self.message = Some((
+                "Cannot open GUI: neither DISPLAY nor WAYLAND_DISPLAY is set".to_string(),
+                true,
+            ));
+            return;
+        }
+
+        let spec = CommandSpec::new("xdg-open", [target_path.as_os_str()]);
+        match self.runner.run(&spec) {
+            Ok(_) => {
+                self.message = Some((format!("Revealed {}", target_path.display()), false));
+            }
+            Err(e) => {
+                self.message = Some((
+                    format!("Failed to reveal {}: {e}", target_path.display()),
+                    true,
+                ));
+            }
+        }
+    }
+
+    fn trigger_preview(&mut self) {
+        let target_path = match self.view_mode {
+            ViewMode::Overview => return,
+            ViewMode::Tree => {
+                if let Some((_, child)) = self.current_child() {
+                    if child.is_dir {
+                        self.message = Some(("Cannot preview a directory".to_string(), true));
+                        return;
+                    }
+                    child.path.clone()
+                } else {
+                    return;
+                }
+            }
+            ViewMode::LargestFiles => {
+                if self.cursor < self.largest_files.len() {
+                    self.largest_files[self.cursor].path.clone()
+                } else {
+                    return;
+                }
+            }
+        };
+
+        let filename = target_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target_path.display().to_string());
+
+        let lines = match read_preview_lines(&target_path, 50, 8192) {
+            Ok(lines) => lines,
+            Err(err) => vec![format!("(cannot preview: {err})")],
+        };
+
+        self.preview_modal = Some((filename, lines));
+    }
+
+    pub fn overview_locations(&self) -> Vec<OverviewLocationItem> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let downloads = home.join("Downloads");
+        let cache = crate::xdg::cache_home();
+        let root_dir = PathBuf::from("/");
+
+        // Home size & items
+        let (home_size, home_items) = if let Some(root) = &self.root {
+            if root.path == home {
+                (
+                    root.size_human.clone(),
+                    format!("{} items", root.item_count),
+                )
+            } else {
+                ("—".into(), "—".into())
+            }
+        } else {
+            ("—".into(), "—".into())
+        };
+
+        // Downloads size & items
+        let (dl_size, dl_items) = if let Some(root) = &self.root {
+            if let Some(dl) = root
+                .children
+                .iter()
+                .find(|c| c.name == "Downloads" || c.path == downloads)
+            {
+                (dl.size_human.clone(), format!("{} items", dl.item_count))
+            } else {
+                ("—".into(), "—".into())
+            }
+        } else {
+            ("—".into(), "—".into())
+        };
+
+        // Cache size & items
+        let (cache_size, cache_items) = if let Some(root) = &self.root {
+            if let Some(c) = root
+                .children
+                .iter()
+                .find(|child| child.name == ".cache" || child.path == cache)
+            {
+                (c.size_human.clone(), format!("{} items", c.item_count))
+            } else {
+                ("—".into(), "—".into())
+            }
+        } else {
+            ("—".into(), "—".into())
+        };
+
+        // Root filesystem size
+        let (root_size, root_items) = {
+            let (disks, _) = crate::status::proc::read_disk_full();
+            if let Some(d) = disks.into_iter().find(|d| d.mount == "/") {
+                let used = d.total_bytes.saturating_sub(d.free_bytes);
+                (
+                    crate::size::human_size(used as i64),
+                    format!("Total: {}", crate::size::human_size(d.total_bytes as i64)),
+                )
+            } else {
+                ("—".into(), "Root filesystem".into())
+            }
+        };
+
+        vec![
+            OverviewLocationItem {
+                name: "Home",
+                path: home,
+                size_human: home_size,
+                item_count_str: home_items,
+            },
+            OverviewLocationItem {
+                name: "Downloads",
+                path: downloads,
+                size_human: dl_size,
+                item_count_str: dl_items,
+            },
+            OverviewLocationItem {
+                name: "User Cache",
+                path: cache,
+                size_human: cache_size,
+                item_count_str: cache_items,
+            },
+            OverviewLocationItem {
+                name: "Root System",
+                path: root_dir,
+                size_human: root_size,
+                item_count_str: root_items,
+            },
+        ]
+    }
+
+    pub fn overview_insights(&self) -> Vec<String> {
+        let mut insights = Vec::new();
+
+        // 1. Old downloads (>90 days) pointer to mu installer
+        if self.old_downloads_count > 0 {
+            insights.push(format!(
+                "• Downloads older than 90 days: {} ({} files) → run 'mu installer' to clean old installers",
+                crate::size::human_size(self.old_downloads_bytes as i64),
+                self.old_downloads_count
+            ));
+        } else {
+            insights.push(
+                "• Downloads older than 90 days: none (0 files) → run 'mu installer' to check for installers".to_string(),
+            );
+        }
+
+        // 2. Cleanable build artifacts
+        if self.cleanable_cache_count > 0 {
+            insights.push(format!(
+                "• Cleanable project artifacts: {} ({} directories: node_modules, target, .venv, dist)",
+                crate::size::human_size(self.cleanable_cache_bytes as i64),
+                self.cleanable_cache_count
+            ));
+        } else {
+            insights.push("• Cleanable project artifacts: none discovered".to_string());
+        }
+
+        // 3. System trash
+        let data_home = crate::xdg::data_home();
+        let trash_count = crate::clean::targets::count_trash_items(&data_home);
+        let trash_size = crate::clean::targets::system_trash_size(&data_home);
+        if trash_count > 0 {
+            insights.push(format!(
+                "• System trash: {} ({} items) → run 'mu clean' to empty trash",
+                crate::size::human_size(trash_size),
+                trash_count
+            ));
+        }
+
+        insights
+    }
+
+    fn render_overview(&self, f: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(8), // Locations
+                Constraint::Min(6),    // Insights
+            ])
+            .split(area);
+
+        // 1. Locations
+        let locs = self.overview_locations();
+        let mut loc_lines = Vec::new();
+        for (i, loc) in locs.iter().enumerate() {
+            let is_cursor = i == self.cursor;
+            let prefix = if is_cursor { "▶ " } else { "  " };
+            let style = if is_cursor {
+                selected_style()
+            } else {
+                normal_style()
+            };
+
+            let line = Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(
+                    format!("{:<14} ", loc.name),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:<10} ", loc.size_human),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(format!("{:<30} ", loc.path.display()), style),
+                Span::styled(
+                    loc.item_count_str.as_str(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            loc_lines.push(line);
+        }
+
+        let loc_block = Block::default()
+            .title(" Locations ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        f.render_widget(Paragraph::new(loc_lines).block(loc_block), chunks[0]);
+
+        // 2. Hidden-Space Insights
+        let insights = self.overview_insights();
+        let mut insight_lines = vec![Line::from("")];
+        for ins in insights {
+            insight_lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(ins, Style::default().fg(Color::White)),
+            ]));
+            insight_lines.push(Line::from(""));
+        }
+
+        let ins_block = Block::default()
+            .title(" Hidden-Space Insights ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        f.render_widget(Paragraph::new(insight_lines).block(ins_block), chunks[1]);
+    }
+
+    fn render_preview_dialog(&self, f: &mut Frame, area: Rect) {
+        let Some((filename, lines)) = &self.preview_modal else {
+            return;
+        };
+        let dialog_area = centered_rect(70, 60, area);
+        f.render_widget(Clear, dialog_area);
+
+        let block = Block::default()
+            .title(format!(" Preview: {filename} "))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+
+        let mut content_lines: Vec<Line> = lines
+            .iter()
+            .map(|l| Line::from(Span::styled(l.as_str(), Style::default().fg(Color::White))))
+            .collect();
+
+        content_lines.push(Line::from(""));
+        content_lines.push(Line::from(Span::styled(
+            "Esc / q / p to close",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let paragraph = Paragraph::new(content_lines).block(block);
+        f.render_widget(paragraph, dialog_area);
+    }
 }
 
 /// Helper to center a rectangular dialog overlay.
@@ -1176,6 +1918,9 @@ fn find_node_size(node: &FileNode, path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::FakeRunner;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn dummy_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::empty())
@@ -1654,6 +2399,484 @@ mod tests {
             tui.message.as_ref().unwrap().0.contains("dry run"),
             "message should mention dry run"
         );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_navigate_up_restores_cursor_with_active_filter() {
+        let mut tui = AnalyzeTui::new(false);
+        let mut root = FileNode::new("root".into(), PathBuf::from("/tmp/root"), 600, true, 1);
+        let f0 = FileNode::new(
+            "file_zero.txt".into(),
+            PathBuf::from("/tmp/root/file_zero.txt"),
+            100,
+            false,
+            1,
+        );
+        let f1 = FileNode::new(
+            "file_one.txt".into(),
+            PathBuf::from("/tmp/root/file_one.txt"),
+            100,
+            false,
+            1,
+        );
+        let mut d1 = FileNode::new(
+            "target_dir_one".into(),
+            PathBuf::from("/tmp/root/target_dir_one"),
+            100,
+            true,
+            1,
+        );
+        d1.children = vec![FileNode::new(
+            "sub1.txt".into(),
+            PathBuf::from("/tmp/root/target_dir_one/sub1.txt"),
+            100,
+            false,
+            1,
+        )];
+        let f2 = FileNode::new(
+            "file_two.txt".into(),
+            PathBuf::from("/tmp/root/file_two.txt"),
+            100,
+            false,
+            1,
+        );
+        let mut d2 = FileNode::new(
+            "target_dir_two".into(),
+            PathBuf::from("/tmp/root/target_dir_two"),
+            100,
+            true,
+            1,
+        );
+        d2.children = vec![FileNode::new(
+            "sub2.txt".into(),
+            PathBuf::from("/tmp/root/target_dir_two/sub2.txt"),
+            100,
+            false,
+            1,
+        )];
+        let d3 = FileNode::new(
+            "target_dir_three".into(),
+            PathBuf::from("/tmp/root/target_dir_three"),
+            100,
+            true,
+            1,
+        );
+        root.children = vec![f0, f1, d1, f2, d2, d3];
+        tui.root = Some(root);
+
+        // Filter by "target"
+        tui.filter_text = "target".to_string();
+        let filtered = tui.filtered_children();
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].1.name, "target_dir_one"); // orig_idx 2, display 0
+        assert_eq!(filtered[1].1.name, "target_dir_two"); // orig_idx 4, display 1
+        assert_eq!(filtered[2].1.name, "target_dir_three"); // orig_idx 5, display 2
+
+        // Test descending into display 0 (orig_idx 2)
+        tui.cursor = 0;
+        tui.handle_key_event(dummy_key(KeyCode::Enter));
+        assert_eq!(tui.path_indices, vec![2]);
+
+        // Navigate up: cursor must return to display index 0 (target_dir_one), not orig_idx 2
+        tui.handle_key_event(dummy_key(KeyCode::Char('h')));
+        assert!(tui.path_indices.is_empty());
+        assert_eq!(tui.cursor, 0, "cursor should restore to display index 0");
+
+        // Test descending into display 1 (orig_idx 4)
+        tui.cursor = 1;
+        tui.handle_key_event(dummy_key(KeyCode::Enter));
+        assert_eq!(tui.path_indices, vec![4]);
+
+        // Navigate up: cursor must return to display index 1 (target_dir_two), not clamped orig_idx
+        tui.handle_key_event(dummy_key(KeyCode::Left));
+        assert!(tui.path_indices.is_empty());
+        assert_eq!(tui.cursor, 1, "cursor should restore to display index 1");
+    }
+
+    fn buffer_to_string(terminal: &Terminal<TestBackend>) -> String {
+        let mut content = String::new();
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                content.push_str(buf[(x, y)].symbol());
+            }
+            content.push('\n');
+        }
+        content
+    }
+
+    #[test]
+    fn test_overview_snapshot() {
+        let mut tui = AnalyzeTui::new(false);
+        tui.set_overview_mode(true);
+        tui.set_old_downloads(2_500_000_000, 18);
+
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut root = FileNode::new("home".into(), home.clone(), 10_000_000_000, true, 1);
+        let dl = FileNode::new(
+            "Downloads".into(),
+            home.join("Downloads"),
+            2_500_000_000,
+            true,
+            1,
+        );
+        let cache = FileNode::new(".cache".into(), home.join(".cache"), 1_000_000_000, true, 1);
+        root.children = vec![dl, cache];
+        tui.root = Some(root);
+        tui.update_cleanable_stats();
+
+        let backend = TestBackend::new(100, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+
+        let text = buffer_to_string(&terminal);
+        assert!(
+            text.contains("Disk Usage Overview"),
+            "missing header in:\n{text}"
+        );
+        assert!(
+            text.contains("Locations"),
+            "missing Locations block in:\n{text}"
+        );
+        assert!(text.contains("Home"), "missing Home in:\n{text}");
+        assert!(text.contains("Downloads"), "missing Downloads in:\n{text}");
+        assert!(
+            text.contains("User Cache"),
+            "missing User Cache in:\n{text}"
+        );
+        assert!(
+            text.contains("Root System"),
+            "missing Root System in:\n{text}"
+        );
+        assert!(
+            text.contains("Hidden-Space Insights"),
+            "missing Insights block in:\n{text}"
+        );
+        assert!(
+            text.contains("Downloads older than 90 days"),
+            "missing downloads insight in:\n{text}"
+        );
+        assert!(
+            text.contains("mu installer"),
+            "missing installer pointer in:\n{text}"
+        );
+        assert!(
+            text.contains("Cleanable project artifacts"),
+            "missing cleanable insight in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_cleanable_badges_snapshot() {
+        let mut tui = AnalyzeTui::new(false);
+        let clean_root = PathBuf::from("/home/user/.cache");
+        tui.clean_roots = vec![clean_root.clone()];
+
+        let mut root = FileNode::new(
+            "workspace".into(),
+            PathBuf::from("/home/user/workspace"),
+            5000,
+            true,
+            1,
+        );
+        let n1 = FileNode::new(
+            "node_modules".into(),
+            PathBuf::from("/home/user/workspace/node_modules"),
+            1000,
+            true,
+            1,
+        );
+        let n2 = FileNode::new(
+            "target".into(),
+            PathBuf::from("/home/user/workspace/target"),
+            1000,
+            true,
+            1,
+        );
+        let n3 = FileNode::new(
+            ".venv".into(),
+            PathBuf::from("/home/user/workspace/.venv"),
+            1000,
+            true,
+            1,
+        );
+        let n4 = FileNode::new(
+            "dist".into(),
+            PathBuf::from("/home/user/workspace/dist"),
+            1000,
+            true,
+            1,
+        );
+        let mut n5 = FileNode::new(
+            "tagged_cache".into(),
+            PathBuf::from("/home/user/workspace/tagged_cache"),
+            500,
+            true,
+            1,
+        );
+        n5.children = vec![FileNode::new(
+            "CACHEDIR.TAG".into(),
+            PathBuf::from("/home/user/workspace/tagged_cache/CACHEDIR.TAG"),
+            50,
+            false,
+            1,
+        )];
+        let regular = FileNode::new(
+            "src".into(),
+            PathBuf::from("/home/user/workspace/src"),
+            500,
+            true,
+            1,
+        );
+        // Inside clean root -> excluded from badge
+        let excluded = FileNode::new("target".into(), clean_root.join("target"), 1000, true, 1);
+
+        root.children = vec![n1, n2, n3, n4, n5, regular, excluded];
+        tui.root = Some(root);
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+
+        let text = buffer_to_string(&terminal);
+
+        // Must display [cleanable]
+        assert!(
+            text.contains("[cleanable]"),
+            "missing cleanable badge in:\n{text}"
+        );
+
+        // Separate lines check
+        let lines: Vec<&str> = text.lines().collect();
+        let node_modules_line = lines
+            .iter()
+            .find(|l| l.contains("node_modules/"))
+            .expect("node_modules line");
+        assert!(
+            node_modules_line.contains("[cleanable]"),
+            "node_modules must have badge: {node_modules_line}"
+        );
+
+        let target_line = lines
+            .iter()
+            .find(|l| l.contains("target/"))
+            .expect("target line");
+        assert!(
+            target_line.contains("[cleanable]"),
+            "target must have badge: {target_line}"
+        );
+
+        let venv_line = lines
+            .iter()
+            .find(|l| l.contains(".venv/"))
+            .expect(".venv line");
+        assert!(
+            venv_line.contains("[cleanable]"),
+            ".venv must have badge: {venv_line}"
+        );
+
+        let dist_line = lines
+            .iter()
+            .find(|l| l.contains("dist/"))
+            .expect("dist line");
+        assert!(
+            dist_line.contains("[cleanable]"),
+            "dist must have badge: {dist_line}"
+        );
+
+        let tagged_line = lines
+            .iter()
+            .find(|l| l.contains("tagged_cache/"))
+            .expect("tagged line");
+        assert!(
+            tagged_line.contains("[cleanable]"),
+            "tagged_cache must have badge: {tagged_line}"
+        );
+
+        let src_line = lines.iter().find(|l| l.contains("src/")).expect("src line");
+        assert!(
+            !src_line.contains("[cleanable]"),
+            "src must NOT have badge: {src_line}"
+        );
+
+        // Check excluded in clean root does not have badge
+        assert!(!is_cleanable(
+            &FileNode::new("target".into(), clean_root.join("target"), 100, true, 1),
+            &tui.clean_roots
+        ));
+    }
+
+    #[test]
+    fn test_insights_snapshot() {
+        let mut tui = AnalyzeTui::new(false);
+        tui.set_overview_mode(true);
+        tui.set_old_downloads(3_500_000_000, 25);
+        tui.cleanable_cache_bytes = 800_000_000;
+        tui.cleanable_cache_count = 5;
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+
+        let text = buffer_to_string(&terminal);
+        assert!(text.contains("Downloads older than 90 days"));
+        assert!(text.contains("25 files"));
+        assert!(text.contains("run 'mu installer' to clean old installers"));
+        assert!(text.contains("Cleanable project artifacts"));
+        assert!(text.contains("5 directories"));
+    }
+
+    #[test]
+    fn test_fake_runner_xdg_open_argv() {
+        let runner = Arc::new(FakeRunner::new());
+        let mut tui = AnalyzeTui::new(false).with_runner(runner.clone() as Arc<dyn Runner>);
+
+        let dir_path = PathBuf::from("/tmp/test_dir");
+        let file_path = PathBuf::from("/tmp/test_dir/file.txt");
+        let mut root = FileNode::new("test_dir".into(), dir_path.clone(), 200, true, 1);
+        let child_file = FileNode::new("file.txt".into(), file_path.clone(), 200, false, 1);
+        root.children = vec![child_file];
+        tui.root = Some(root);
+
+        // Save and unset GUI display variables
+        let orig_disp = std::env::var_os("DISPLAY");
+        let orig_wayland = std::env::var_os("WAYLAND_DISPLAY");
+        unsafe {
+            std::env::remove_var("DISPLAY");
+            std::env::remove_var("WAYLAND_DISPLAY");
+        }
+
+        // Trigger O and F without GUI display: must refuse and not invoke runner
+        tui.cursor = 0;
+        tui.handle_key_event(dummy_key(KeyCode::Char('o')));
+        assert!(
+            runner.invocations().is_empty(),
+            "runner must not be called without GUI display"
+        );
+        assert!(tui.message.as_ref().unwrap().0.contains("DISPLAY"));
+
+        tui.handle_key_event(dummy_key(KeyCode::Char('f')));
+        assert!(
+            runner.invocations().is_empty(),
+            "runner must not be called without GUI display"
+        );
+        assert!(tui.message.as_ref().unwrap().0.contains("DISPLAY"));
+
+        // Set DISPLAY and test again
+        unsafe {
+            std::env::set_var("DISPLAY", ":0");
+        }
+
+        // O on file -> opens its directory
+        tui.handle_key_event(dummy_key(KeyCode::Char('o')));
+        let calls = runner.invocations();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].program, "xdg-open");
+        assert_eq!(calls[0].args, vec![dir_path.as_os_str()]);
+
+        // F on file -> reveals the file itself
+        tui.handle_key_event(dummy_key(KeyCode::Char('f')));
+        let calls = runner.invocations();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].program, "xdg-open");
+        assert_eq!(calls[1].args, vec![file_path.as_os_str()]);
+
+        // Restore env
+        unsafe {
+            if let Some(v) = orig_disp {
+                std::env::set_var("DISPLAY", v);
+            } else {
+                std::env::remove_var("DISPLAY");
+            }
+            if let Some(v) = orig_wayland {
+                std::env::set_var("WAYLAND_DISPLAY", v);
+            } else {
+                std::env::remove_var("WAYLAND_DISPLAY");
+            }
+        }
+    }
+
+    #[test]
+    fn test_overview_navigation_and_tree_return() {
+        let mut tui = AnalyzeTui::new(false);
+        tui.set_overview_mode(true);
+
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut root = FileNode::new("home".into(), home.clone(), 1000, true, 1);
+        let mut dl = FileNode::new("Downloads".into(), home.join("Downloads"), 500, true, 1);
+        dl.children = vec![FileNode::new(
+            "item.zip".into(),
+            home.join("Downloads/item.zip"),
+            500,
+            false,
+            1,
+        )];
+        root.children = vec![dl];
+        tui.root = Some(root);
+
+        // Starts at Home (cursor 0)
+        assert_eq!(tui.cursor, 0);
+        assert_eq!(tui.view_mode, ViewMode::Overview);
+
+        // Move down to Downloads (cursor 1)
+        tui.handle_key_event(dummy_key(KeyCode::Char('j')));
+        assert_eq!(tui.cursor, 1);
+
+        // Enter Downloads -> enters tree inside Downloads
+        tui.handle_key_event(dummy_key(KeyCode::Enter));
+        assert_eq!(tui.view_mode, ViewMode::Tree);
+        assert_eq!(tui.path_indices, vec![0]);
+
+        // Leave Downloads with 'h' -> returns to root tree
+        tui.handle_key_event(dummy_key(KeyCode::Char('h')));
+        assert!(tui.path_indices.is_empty());
+        assert_eq!(tui.view_mode, ViewMode::Tree);
+
+        // At root tree, 'h' or 'q' returns to Overview
+        tui.handle_key_event(dummy_key(KeyCode::Char('h')));
+        assert_eq!(tui.view_mode, ViewMode::Overview);
+
+        // In Overview, 'q' exits
+        assert!(tui.handle_key_event(dummy_key(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn test_actions_rescan_and_preview() {
+        let mut tui = AnalyzeTui::new(false);
+
+        // Test R triggers rescan
+        assert!(!tui.rescan_requested);
+        tui.handle_key_event(dummy_key(KeyCode::Char('r')));
+        assert!(tui.rescan_requested);
+        assert!(tui.scanning);
+
+        // Test P preview
+        let d = tempdir("preview");
+        let file = d.join("sample.txt");
+        std::fs::write(&file, b"Line 1\nLine 2\nLine 3").unwrap();
+
+        let mut root = FileNode::new("d".into(), d.clone(), 100, true, 1);
+        let child = FileNode::new("sample.txt".into(), file.clone(), 100, false, 1);
+        root.children = vec![child];
+        tui.root = Some(root);
+        tui.cursor = 0;
+
+        // Press P on sample.txt
+        tui.handle_key_event(dummy_key(KeyCode::Char('p')));
+        assert!(tui.preview_modal.is_some());
+        let (title, lines) = tui.preview_modal.as_ref().unwrap();
+        assert_eq!(title, "sample.txt");
+        assert_eq!(lines, &["Line 1", "Line 2", "Line 3"]);
+
+        // Press Esc -> closes preview modal
+        tui.handle_key_event(dummy_key(KeyCode::Esc));
+        assert!(tui.preview_modal.is_none());
 
         let _ = std::fs::remove_dir_all(&d);
     }

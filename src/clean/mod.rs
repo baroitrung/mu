@@ -36,6 +36,8 @@ use crate::{config, oplog, paths, size, xdg};
 #[allow(unused_imports)]
 pub use scan_kernels::{parse_autoremove_simulation, run_autoremove};
 #[allow(unused_imports)]
+pub use targets::clean_target_roots;
+#[allow(unused_imports)]
 pub use targets::journal_size;
 
 /// CleanTarget describes one cleaning category — the port of Go's struct of

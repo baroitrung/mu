@@ -123,4 +123,41 @@ mod tests {
         assert!(res.is_absolute(), "path should be absolute, got {:?}", res);
         assert_eq!(res, crate::xdg::clean(&cwd));
     }
+
+    #[test]
+    fn test_non_tty_without_dry_run_fails_with_tty_error() {
+        let opts = Options {
+            path: None,
+            dry_run: false,
+            json: false,
+            debug: false,
+        };
+        let exit_code = run(&opts);
+        assert_eq!(exit_code, 1);
+    }
+
+    #[test]
+    fn test_json_output_starts_with_brace_and_is_valid_json() {
+        let d = std::env::temp_dir().join(format!("mu-analyze-json-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        let sample = d.join("sample.txt");
+        let _ = std::fs::write(&sample, b"test data");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (root, stats) = scan_path(&d, WalkerOptions::default(), None, cancel).unwrap();
+        let json_str = json::to_json_pretty(&root, &stats).unwrap();
+
+        assert!(json_str.starts_with('{'));
+        assert!(json_str.contains("\"path\""));
+        assert!(json_str.contains("\"size\""));
+
+        let val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(val.is_object());
+        assert_eq!(
+            val["root"]["name"],
+            d.file_name().unwrap().to_str().unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

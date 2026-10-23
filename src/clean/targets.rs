@@ -913,6 +913,25 @@ fn dev_cache_root(home: &Path, p: &Path) -> PathBuf {
     p.parent().unwrap_or(home).to_path_buf()
 }
 
+/// Roots covered by built-in clean targets (used by analyze TUI cleanable badges).
+pub fn clean_target_roots() -> Vec<PathBuf> {
+    clean_target_roots_in(&Deps::real(Arc::new(crate::runner::ProcessRunner)))
+}
+
+pub(crate) fn clean_target_roots_in(deps: &Deps) -> Vec<PathBuf> {
+    let mut roots = vec![
+        deps.cache_home.clone(),
+        PathBuf::from("/var/cache/apt/archives"),
+        deps.data_home.join("Trash"),
+    ];
+    roots.extend(dev_cache_paths(&deps.home));
+    roots.extend(font_cache_dirs(&deps.cache_home));
+    for (root, _) in sandbox_font_cache_dirs_in(&deps.home) {
+        roots.push(root);
+    }
+    roots
+}
+
 /// One line of `podman system df --format '{{json .}}'`.
 #[derive(serde::Deserialize)]
 struct PodmanDfLine {
