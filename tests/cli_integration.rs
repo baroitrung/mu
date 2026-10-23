@@ -886,3 +886,131 @@ fn completion_install_desktop() {
 
     let _ = std::fs::remove_dir_all(&test_dir);
 }
+
+#[cfg(unix)]
+fn assert_unreadable_config_fails(cmd_args: &[&str]) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = std::env::temp_dir().join(format!(
+        "mu-unreadable-cfg-{}-{}-{}",
+        cmd_args[0],
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let config_dir = test_dir.join("mu");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let cfg_file = config_dir.join("config.toml");
+    std::fs::write(&cfg_file, b"[optimize_skip]\nsteps = [\"apt\"]\n").unwrap();
+
+    let mut perms = std::fs::metadata(&cfg_file).unwrap().permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(&cfg_file, perms).unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(cmd_args);
+    cmd.stdin(Stdio::null());
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_CONFIG_HOME", &test_dir);
+    cmd.env("XDG_CACHE_HOME", test_dir.join("cache"));
+    cmd.env("XDG_DATA_HOME", test_dir.join("data"));
+    let output = cmd.output().expect("failed to run mu command");
+
+    let mut perms = std::fs::metadata(&cfg_file).unwrap().permissions();
+    perms.set_mode(0o600);
+    let _ = std::fs::set_permissions(&cfg_file, perms);
+    let _ = std::fs::remove_dir_all(&test_dir);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "command {:?} must exit 1 on unreadable config",
+        cmd_args
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("invalid mu configuration") || err.contains("Permission denied"),
+        "stderr for {:?} should mention config error: {err}",
+        cmd_args
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn purge_unreadable_config_fails_closed() {
+    assert_unreadable_config_fails(&["purge", "--dry-run"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn installer_unreadable_config_fails_closed() {
+    assert_unreadable_config_fails(&["installer", "--dry-run"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn clean_unreadable_config_fails_closed() {
+    assert_unreadable_config_fails(&["clean", "--dry-run"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn optimize_unreadable_config_fails_closed() {
+    assert_unreadable_config_fails(&["optimize", "--dry-run"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn uninstall_unreadable_config_fails_closed() {
+    assert_unreadable_config_fails(&["uninstall", "--dry-run", "bash"]);
+}
+
+#[test]
+fn remove_non_interactive_without_yes_exits_nonzero() {
+    let test_dir = std::env::temp_dir().join(format!("mu-remove-nonint-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&test_dir);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["remove"]);
+    cmd.stdin(Stdio::null());
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_CONFIG_HOME", test_dir.join(".config"));
+    cmd.env("XDG_CACHE_HOME", test_dir.join(".cache"));
+    cmd.env("XDG_DATA_HOME", test_dir.join(".local/share"));
+    let output = cmd.output().expect("failed to run mu remove");
+
+    assert_eq!(output.status.code(), Some(1));
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("Non-interactive: pass --yes"),
+        "expected non-interactive note: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn uninstall_non_interactive_without_yes_exits_nonzero() {
+    let test_dir = std::env::temp_dir().join(format!("mu-uninst-nonint-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&test_dir);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["uninstall", "bash"]);
+    cmd.stdin(Stdio::null());
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_CONFIG_HOME", test_dir.join(".config"));
+    cmd.env("XDG_CACHE_HOME", test_dir.join(".cache"));
+    cmd.env("XDG_DATA_HOME", test_dir.join(".local/share"));
+    let output = cmd.output().expect("failed to run mu uninstall");
+
+    assert_eq!(output.status.code(), Some(1));
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("Non-interactive: pass --yes"),
+        "expected non-interactive note: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
