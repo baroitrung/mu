@@ -21,6 +21,8 @@ pub type DeleteFn = Box<dyn Fn(&Path) -> Result<()>>;
 
 /// Injectable dependencies for `mu installer` — see `purge::Deps`.
 pub struct Deps {
+    /// XDG config home holding `mu/config.toml`.
+    pub config_home: PathBuf,
     /// XDG data home holding `mu/operations.log`.
     pub data_home: PathBuf,
     /// `MU_NO_OPLOG=1` disables the operations log.
@@ -35,6 +37,7 @@ impl Deps {
     /// The production hooks.
     pub fn real() -> Self {
         Self {
+            config_home: xdg::config_home(),
             data_home: xdg::data_home(),
             no_oplog: std::env::var_os("MU_NO_OPLOG").as_deref() == Some(std::ffi::OsStr::new("1")),
             select: Box::new(|packages| {
@@ -61,6 +64,11 @@ pub fn run(opts: &Options) -> i32 {
 
 /// Testable core of [`run`].
 pub(crate) fn run_in(opts: &Options, deps: &Deps) -> i32 {
+    if let Err(e) = crate::config::load_whitelist_from(&deps.config_home) {
+        eprintln!("invalid mu configuration: {e}");
+        return 1;
+    }
+
     // Review F1: every destructive command opens the operations log itself —
     // `log_outcome` silently no-ops while `LOG_FILE` is closed.
     if !deps.no_oplog
@@ -190,6 +198,7 @@ mod tests {
         let log = Arc::new(Mutex::new(Vec::new()));
         let sink = log.clone();
         let deps = Deps {
+            config_home: root.join("config-home"),
             data_home: root.join("data-home"),
             no_oplog: false,
             select,
@@ -334,6 +343,31 @@ mod tests {
         assert!(dummy.exists());
 
         oplog::close_logger();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn installer_fails_closed_on_malformed_or_unreadable_config() {
+        let root = tempdir("bad-cfg");
+        let cfg_dir = root.join("config-home").join("mu");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        fs::write(cfg_dir.join("config.toml"), "invalid = [toml").unwrap();
+
+        let dummy = fixture(&root, "dummy.deb");
+
+        let (deps, removed) = test_deps(&root, Box::new(|_| panic!("bad config must not reach select")));
+        let opts = Options {
+            paths: vec![root.clone()],
+            dry_run: true,
+            auto_yes: false,
+            debug: false,
+        };
+
+        let code = run_in(&opts, &deps);
+        assert_eq!(code, 1, "malformed config must cause nonzero exit");
+        assert!(dummy.exists(), "malformed config must not delete anything");
+        assert!(removed.lock().unwrap().is_empty());
+
         let _ = fs::remove_dir_all(&root);
     }
 }
