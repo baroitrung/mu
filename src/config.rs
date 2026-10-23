@@ -481,4 +481,33 @@ mod tests {
         assert!(load_user_whitelist_from(&root).is_err());
         fs::remove_dir_all(&root).ok();
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn unreadable_config_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir("wl-unreadable");
+        let cfg_file = root.join("mu").join("config.toml");
+        write_config(&root, "[optimize_skip]\nsteps = [\"apt\"]\n");
+
+        let mut perms = fs::metadata(&cfg_file).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&cfg_file, perms).unwrap();
+
+        let err = load_whitelist_from(&root);
+        assert!(err.is_err(), "expected error for unreadable config.toml");
+
+        let user_err = load_user_whitelist_from(&root);
+        assert!(
+            user_err.is_err(),
+            "expected error for unreadable user config.toml"
+        );
+
+        // Restore permissions for clean removal
+        let mut perms = fs::metadata(&cfg_file).unwrap().permissions();
+        perms.set_mode(0o600);
+        let _ = fs::set_permissions(&cfg_file, perms);
+        let _ = fs::remove_dir_all(&root);
+    }
 }
