@@ -2,12 +2,13 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use nix::sys::statvfs::statvfs;
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -16,8 +17,38 @@ use crate::analyze::model::{FileNode, LargestFile, ScanMessage, SortMode, ViewMo
 use crate::paths;
 use crate::runner::{CommandSpec, Runner};
 use crate::trash;
-use crate::tui::styles;
 
+/// Confirmation state for deletion in the Analyze TUI.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DeleteConfirm {
+    #[default]
+    None,
+    Single(PathBuf, u64),
+    Batch(Vec<PathBuf>, u64),
+}
+
+impl DeleteConfirm {
+    pub fn is_none(&self) -> bool {
+        matches!(self, DeleteConfirm::None)
+    }
+
+    pub fn is_some(&self) -> bool {
+        !self.is_none()
+    }
+}
+
+/// Message emitted by background deletion worker.
+#[derive(Debug)]
+pub enum DeleteMsg {
+    Progress {
+        removed: usize,
+    },
+    Done {
+        successful_paths: Vec<PathBuf>,
+        fail_count: usize,
+        first_error: Option<String>,
+    },
+}
 /// Check if a node qualifies for a [cleanable] badge:
 /// 1. Must NOT be covered by any clean root (roots covered by `mu clean`, derived from clean target root list).
 /// 2. Must be named `node_modules`, `target`, `.venv`, `dist`, or `CACHEDIR.TAG`,
@@ -143,14 +174,16 @@ pub struct AnalyzeTui {
     pub sort_mode: SortMode,
     pub view_mode: ViewMode,
     pub dry_run: bool,
-    /// If Some, modal confirmation is open for this target path.
-    pub confirm_delete: Option<PathBuf>,
-    pub confirm_size: u64,
-    /// If Some, batch modal confirmation is open for these target paths.
-    pub confirm_batch: Option<Vec<PathBuf>>,
-    pub confirm_batch_size: u64,
-    /// 0 = NO, 1 = YES (default 0).
-    pub confirm_cursor: usize,
+    /// If not None, inline confirmation is open for target path(s).
+    pub confirm_delete: DeleteConfirm,
+    /// Whether an asynchronous deletion is currently in flight.
+    pub deleting: bool,
+    /// Live counter of successfully removed items during deletion.
+    pub delete_count: u64,
+    /// Total number of target items being deleted.
+    pub delete_total: usize,
+    /// Channel receiver for async delete progress / completion.
+    pub delete_rx: Option<Arc<Mutex<mpsc::Receiver<DeleteMsg>>>>,
     /// Multi-selected paths for batch operations.
     pub selected_paths: HashSet<PathBuf>,
     /// Whether user is actively typing a name filter in Tree view.
@@ -561,11 +594,11 @@ impl AnalyzeTui {
             sort_mode: SortMode::SizeDesc,
             view_mode: ViewMode::Tree,
             dry_run,
-            confirm_delete: None,
-            confirm_size: 0,
-            confirm_batch: None,
-            confirm_batch_size: 0,
-            confirm_cursor: 0,
+            confirm_delete: DeleteConfirm::None,
+            deleting: false,
+            delete_count: 0,
+            delete_total: 0,
+            delete_rx: None,
             selected_paths: HashSet::new(),
             filter_mode: false,
             filter_text: String::new(),
@@ -645,9 +678,10 @@ impl AnalyzeTui {
         }
     }
 
-    /// Advance spinner animation.
+    /// Advance spinner animation and poll async deletion.
     pub fn tick(&mut self) {
         self.spinner_idx = (self.spinner_idx + 1) % SPINNER_FRAMES.len();
+        self.poll_delete();
     }
 
     pub fn resize(&mut self, w: u16, h: u16) {
@@ -731,9 +765,9 @@ impl AnalyzeTui {
             node.sort_children(mode);
         }
     }
-    /// Returns true if any modal confirmation is open.
+    /// Returns true if confirmation is open.
     pub fn is_confirm_open(&self) -> bool {
-        self.confirm_delete.is_some() || self.confirm_batch.is_some()
+        self.confirm_delete.is_some()
     }
 
     /// Returns the children of the current node matching the filter (or all children if no filter).
@@ -814,6 +848,11 @@ impl AnalyzeTui {
 
     /// Checks whether a path is protected by system prefixes or user whitelist.
     pub fn is_path_protected(&self, path: &Path) -> bool {
+        Self::is_path_protected_static(path)
+    }
+
+    /// Standalone path protection check (prefixes + config whitelist).
+    pub fn is_path_protected_static(path: &Path) -> bool {
         let abs_path = if path.is_relative() {
             std::env::current_dir()
                 .map(|cwd| cwd.join(path))
@@ -852,6 +891,14 @@ impl AnalyzeTui {
 
     /// Handle keyboard input. Returns true if the TUI should exit.
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        // While a delete is in flight, inputs are locked except the busy view's own quit (Ctrl+C).
+        if self.deleting {
+            if crate::tui::is_ctrl_c(&key) {
+                return true;
+            }
+            return false;
+        }
+
         // Clear non-persistent message on next key press
         if !self.is_confirm_open() {
             self.message = None;
@@ -1052,7 +1099,11 @@ impl AnalyzeTui {
                 self.toggle_select_current();
             }
             KeyCode::Backspace | KeyCode::Delete if self.view_mode == ViewMode::Tree => {
-                self.trigger_batch_delete();
+                if !self.selected_paths.is_empty() {
+                    self.trigger_batch_delete();
+                } else {
+                    self.trigger_delete();
+                }
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
                 self.navigate_down();
@@ -1087,7 +1138,11 @@ impl AnalyzeTui {
                 }
             }
             KeyCode::Char('d') if self.view_mode == ViewMode::Tree => {
-                self.trigger_delete();
+                if !self.selected_paths.is_empty() {
+                    self.trigger_batch_delete();
+                } else {
+                    self.trigger_delete();
+                }
             }
             _ => {}
         }
@@ -1097,34 +1152,21 @@ impl AnalyzeTui {
 
     fn handle_confirm_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
-            KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Char('h')
-            | KeyCode::Char('H')
-            | KeyCode::Char('l')
-            | KeyCode::Char('L')
-            | KeyCode::Tab => {
-                self.confirm_cursor = if self.confirm_cursor == 0 { 1 } else { 0 };
+            KeyCode::Enter => {
+                self.start_async_delete();
+                false
             }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
-                self.confirm_delete = None;
-                self.confirm_batch = None;
+                self.confirm_delete = DeleteConfirm::None;
+                false
             }
-            KeyCode::Enter => {
-                if self.confirm_cursor == 1 {
-                    if self.confirm_batch.is_some() {
-                        self.execute_batch_delete();
-                    } else {
-                        self.execute_delete();
-                    }
-                } else {
-                    self.confirm_delete = None;
-                    self.confirm_batch = None;
+            _ => {
+                if crate::tui::is_ctrl_c(&key) {
+                    return true;
                 }
+                false
             }
-            _ => {}
         }
-        false
     }
 
     fn navigate_down(&mut self) {
@@ -1245,9 +1287,7 @@ impl AnalyzeTui {
             return;
         }
 
-        self.confirm_delete = Some(target_path);
-        self.confirm_size = target_size;
-        self.confirm_cursor = 0; // Default NO
+        self.confirm_delete = DeleteConfirm::Single(target_path, target_size);
     }
 
     fn trigger_batch_delete(&mut self) {
@@ -1267,9 +1307,7 @@ impl AnalyzeTui {
 
         let total_size: u64 = targets.iter().map(|p| self.find_path_size(p)).sum();
 
-        self.confirm_batch = Some(targets);
-        self.confirm_batch_size = total_size;
-        self.confirm_cursor = 0; // Default NO
+        self.confirm_delete = DeleteConfirm::Batch(targets, total_size);
     }
 
     fn find_path_size(&self, path: &Path) -> u64 {
@@ -1283,174 +1321,265 @@ impl AnalyzeTui {
             .unwrap_or(0)
     }
 
-    fn execute_batch_delete(&mut self) {
-        let Some(batch_targets) = self.confirm_batch.take() else {
-            return;
+    /// Start asynchronous deletion of current confirmed target path(s).
+    pub fn start_async_delete(&mut self) {
+        let confirm = std::mem::take(&mut self.confirm_delete);
+        let targets = match confirm {
+            DeleteConfirm::Single(path, _) => vec![path],
+            DeleteConfirm::Batch(paths, _) => paths,
+            DeleteConfirm::None => return,
         };
 
-        let targets = drop_descendants(&batch_targets);
+        let targets = drop_descendants(&targets);
+        if targets.is_empty() {
+            self.message = Some(("Nothing to delete".to_string(), false));
+            return;
+        }
 
-        let mut success_count = 0usize;
-        let mut fail_count = 0usize;
-        let mut first_error: Option<String> = None;
+        self.deleting = true;
+        self.delete_count = 0;
+        self.delete_total = targets.len();
 
-        for target_path in targets {
-            // Re-lstat check
-            if let Err(e) = std::fs::symlink_metadata(&target_path) {
-                fail_count += 1;
-                if first_error.is_none() {
-                    first_error = Some(format!("{}: {e}", target_path.display()));
-                }
-                continue;
-            }
+        let (tx, rx) = mpsc::channel();
+        self.delete_rx = Some(Arc::new(Mutex::new(rx)));
 
-            // Whitelist check
-            if self.is_path_protected(&target_path) {
-                fail_count += 1;
-                if first_error.is_none() {
-                    first_error = Some(format!(
-                        "Refused: {} is a protected path",
-                        target_path.display()
-                    ));
-                }
-                continue;
-            }
+        let dry_run = self.dry_run;
+        std::thread::spawn(move || {
+            let mut successful_paths = Vec::new();
+            let mut fail_count = 0usize;
+            let mut first_error: Option<String> = None;
+            let mut removed_count = 0usize;
 
-            match trash::safe_delete(&target_path, self.dry_run) {
-                Ok(()) => {
-                    success_count += 1;
-                    if !self.dry_run {
-                        if let Some(root) = &mut self.root {
-                            remove_from_tree(root, &target_path);
-                        }
-                        self.selected_paths.remove(&target_path);
-                    }
-                }
-                Err(e) => {
+            for target_path in targets {
+                // Re-lstat check
+                if let Err(e) = std::fs::symlink_metadata(&target_path) {
                     fail_count += 1;
                     if first_error.is_none() {
                         first_error = Some(format!("{}: {e}", target_path.display()));
                     }
+                    continue;
                 }
-            }
-        }
 
-        if !self.dry_run {
-            if success_count > 0
-                && let Some(root) = &self.root
-            {
-                crate::analyze::cache::invalidate_cache(&root.path);
-            }
-            if let Some(root) = &mut self.root {
-                root.recalculate_sizes();
-            }
-            self.selected_paths.retain(|p| {
-                if let Some(root) = &self.root {
-                    find_node(root, p).is_some()
-                } else {
-                    false
+                // Whitelist check
+                if AnalyzeTui::is_path_protected_static(&target_path) {
+                    fail_count += 1;
+                    if first_error.is_none() {
+                        first_error = Some(format!(
+                            "Refused: {} is a protected path",
+                            target_path.display()
+                        ));
+                    }
+                    continue;
                 }
+
+                match trash::safe_delete(&target_path, dry_run) {
+                    Ok(()) => {
+                        successful_paths.push(target_path.clone());
+                        removed_count += 1;
+                        let _ = tx.send(DeleteMsg::Progress {
+                            removed: removed_count,
+                        });
+                    }
+                    Err(e) => {
+                        fail_count += 1;
+                        if first_error.is_none() {
+                            first_error = Some(format!("{}: {e}", target_path.display()));
+                        }
+                    }
+                }
+            }
+
+            let _ = tx.send(DeleteMsg::Done {
+                successful_paths,
+                fail_count,
+                first_error,
             });
-        }
+        });
+    }
 
-        let max_len = self.filtered_children().len();
-        if self.cursor >= max_len && self.cursor > 0 {
-            self.cursor = max_len.saturating_sub(1);
+    /// Poll delete channel for progress or completion messages.
+    pub fn poll_delete(&mut self) {
+        if !self.deleting {
+            return;
         }
-
-        if fail_count == 0 {
-            let msg = if self.dry_run {
-                format!("Moved {success_count} items to trash (dry run)")
-            } else {
-                format!("Moved {success_count} items to trash")
-            };
-            self.message = Some((msg, false));
-        } else if success_count > 0 {
-            self.message = Some((
-                format!(
-                    "Moved {success_count} items to trash; {fail_count} failed: {}",
-                    first_error.unwrap_or_default()
-                ),
-                true,
-            ));
-        } else {
-            self.message = Some((
-                format!(
-                    "Batch delete failed ({fail_count} errors): {}",
-                    first_error.unwrap_or_default()
-                ),
-                true,
-            ));
+        let Some(rx_lock) = self.delete_rx.clone() else {
+            return;
+        };
+        let Ok(rx) = rx_lock.try_lock() else {
+            return;
+        };
+        while let Ok(msg) = rx.try_recv() {
+            self.apply_delete_message(msg);
+            if !self.deleting {
+                break;
+            }
         }
     }
 
-    fn execute_delete(&mut self) {
-        let Some(target_path) = self.confirm_delete.take() else {
-            return;
-        };
+    /// Synchronously wait for in-flight deletion to complete.
+    pub fn wait_for_delete(&mut self) {
+        while self.deleting {
+            let Some(rx_lock) = self.delete_rx.clone() else {
+                break;
+            };
+            let Ok(rx) = rx_lock.lock() else {
+                break;
+            };
+            match rx.recv() {
+                Ok(msg) => self.apply_delete_message(msg),
+                Err(_) => {
+                    self.deleting = false;
+                    self.delete_rx = None;
+                    break;
+                }
+            }
+        }
+    }
 
-        match trash::safe_delete(&target_path, self.dry_run) {
-            Ok(()) => {
-                let name = target_path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| target_path.display().to_string());
+    /// Apply a message from the background delete worker.
+    pub fn apply_delete_message(&mut self, msg: DeleteMsg) {
+        match msg {
+            DeleteMsg::Progress { removed } => {
+                self.delete_count = removed as u64;
+            }
+            DeleteMsg::Done {
+                successful_paths,
+                fail_count,
+                first_error,
+            } => {
+                self.deleting = false;
+                self.delete_rx = None;
+
                 if !self.dry_run {
-                    if let Some(root) = &self.root {
-                        crate::analyze::cache::invalidate_cache(&root.path);
+                    for path in &successful_paths {
+                        if let Some(root) = &mut self.root {
+                            remove_from_tree(root, path);
+                        }
+                        self.selected_paths.remove(path);
+                        crate::analyze::cache::invalidate_cache(path);
                     }
-                    crate::analyze::cache::invalidate_cache(&target_path);
+                    if !successful_paths.is_empty() {
+                        if let Some(root) = &self.root {
+                            crate::analyze::cache::invalidate_cache(&root.path);
+                        }
+                        if let Some(root) = &mut self.root {
+                            root.recalculate_sizes();
+                        }
+                        self.selected_paths.retain(|p| {
+                            if let Some(root) = &self.root {
+                                find_node(root, p).is_some()
+                            } else {
+                                false
+                            }
+                        });
+                    }
                 }
 
-                // Remove child from memory
-                if let Some(root) = &mut self.root {
-                    remove_from_tree(root, &target_path);
-                    root.recalculate_sizes();
-                }
-
-                self.selected_paths.remove(&target_path);
-
-                // Re-adjust cursor if needed
                 let max_len = self.filtered_children().len();
                 if self.cursor >= max_len && self.cursor > 0 {
                     self.cursor = max_len.saturating_sub(1);
                 }
 
-                self.message = Some((format!("Moved to trash: {name}"), false));
+                let total_attempted = successful_paths.len() + fail_count;
+                if fail_count == 0 {
+                    let msg = if self.dry_run {
+                        if successful_paths.len() == 1 {
+                            let name = successful_paths[0]
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| successful_paths[0].display().to_string());
+                            format!("Moved to trash: {name} (dry run)")
+                        } else {
+                            format!("Moved {} items to trash (dry run)", successful_paths.len())
+                        }
+                    } else if successful_paths.len() == 1 {
+                        let name = successful_paths[0]
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| successful_paths[0].display().to_string());
+                        format!("Moved to trash: {name}")
+                    } else {
+                        format!("Moved {} items to trash", successful_paths.len())
+                    };
+                    self.message = Some((msg, false));
+                } else if !successful_paths.is_empty() {
+                    self.message = Some((
+                        format!(
+                            "Moved {} items to trash; {fail_count} failed: {}",
+                            successful_paths.len(),
+                            first_error.unwrap_or_default()
+                        ),
+                        true,
+                    ));
+                } else {
+                    let msg = if total_attempted == 1 {
+                        format!("Delete failed: {}", first_error.unwrap_or_default())
+                    } else {
+                        format!(
+                            "Batch delete failed ({fail_count} errors): {}",
+                            first_error.unwrap_or_default()
+                        )
+                    };
+                    self.message = Some((msg, true));
+                }
             }
-            Err(e) => {
-                self.message = Some((format!("Delete failed: {e}"), true));
+        }
+    }
+
+    /// Execute delete synchronously (used in tests and non-interactive workflows).
+    pub fn execute_delete(&mut self) {
+        self.start_async_delete();
+        self.wait_for_delete();
+    }
+
+    /// Execute batch delete synchronously (used in tests and non-interactive workflows).
+    pub fn execute_batch_delete(&mut self) {
+        self.start_async_delete();
+        self.wait_for_delete();
+    }
+
+    fn calculate_footer_height(&self) -> u16 {
+        match &self.confirm_delete {
+            DeleteConfirm::Batch(targets, _) if targets.len() > 1 => {
+                1 + targets.len().min(5) as u16
             }
+            _ => 1,
         }
     }
 
     /// Render full TUI frame.
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
+        self.poll_delete();
+
         self.window_width = area.width;
         self.window_h = area.height;
+
+        let footer_height = self.calculate_footer_height();
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // Header
-                Constraint::Min(5),    // Body
-                Constraint::Length(1), // Footer / Keybindings
+                Constraint::Length(3),             // Header
+                Constraint::Min(5),                // Body
+                Constraint::Length(footer_height), // Footer / Keybindings / Confirm
             ])
             .split(area);
 
         self.render_header(f, chunks[0]);
 
-        match self.view_mode {
-            ViewMode::Overview => self.render_overview(f, chunks[1]),
-            ViewMode::Tree => self.render_tree(f, chunks[1]),
-            ViewMode::LargestFiles => self.render_largest(f, chunks[1]),
+        if self.deleting {
+            self.render_deleting(f, chunks[1]);
+        } else {
+            match self.view_mode {
+                ViewMode::Overview => self.render_overview(f, chunks[1]),
+                ViewMode::Tree => self.render_tree(f, chunks[1]),
+                ViewMode::LargestFiles => self.render_largest(f, chunks[1]),
+            }
         }
 
         self.render_footer(f, chunks[2]);
 
-        if self.is_confirm_open() {
-            self.render_confirm_dialog(f, area);
-        } else if self.preview_modal.is_some() {
+        if self.preview_modal.is_some() {
             self.render_preview_dialog(f, area);
         }
     }
@@ -1860,6 +1989,20 @@ impl AnalyzeTui {
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
+        if self.confirm_delete.is_some() {
+            self.render_confirm_footer(f, area);
+            return;
+        }
+
+        if self.deleting {
+            let p = Paragraph::new(Line::from(vec![Span::styled(
+                "Ctrl+C Quit",
+                Style::default().fg(Color::DarkGray),
+            )]));
+            f.render_widget(p, area);
+            return;
+        }
+
         if let Some((text, is_err)) = &self.message {
             let color = if *is_err { Color::Red } else { Color::Green };
             let p = Paragraph::new(Line::from(vec![Span::styled(
@@ -1878,136 +2021,177 @@ impl AnalyzeTui {
         f.render_widget(p, area);
     }
 
-    fn render_confirm_dialog(&self, f: &mut Frame, area: Rect) {
-        if let Some(targets) = &self.confirm_batch {
-            let count = targets.len();
-            let size_str = crate::size::human_size(self.confirm_batch_size as i64);
+    fn render_confirm_footer(&self, f: &mut Frame, area: Rect) {
+        let max_w = area.width as usize;
+        let mut lines = Vec::new();
 
-            let dialog_area = centered_rect(70, 50, area);
-            f.render_widget(Clear, dialog_area);
-
-            let block = Block::default()
-                .title(" Move to Trash (Batch) ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red));
-
-            let prompt = format!("Move {count} selected items ({size_str}) to trash?");
-
-            let mut lines = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    prompt,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-            ];
-
-            for target in targets.iter().take(5) {
+        match &self.confirm_delete {
+            DeleteConfirm::Single(target, size) => {
                 let name = target
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| target.display().to_string());
-                lines.push(Line::from(vec![
-                    Span::raw("  • "),
-                    Span::styled(name, Style::default().fg(Color::Yellow)),
+                let size_str = crate::size::human_size(*size as i64);
+
+                let prefix = "Delete: ";
+                let suffix = "  Press Enter to confirm  |  Esc cancel";
+                let fixed_w =
+                    display_width(prefix) + display_width(suffix) + 2 + display_width(&size_str);
+
+                let name_disp = if max_w > fixed_w {
+                    truncate_middle(&name, max_w.saturating_sub(fixed_w))
+                } else if max_w >= display_width(prefix) + 10 {
+                    truncate_middle(&name, 8)
+                } else {
+                    name
+                };
+
+                let line = Line::from(vec![
                     Span::styled(
-                        format!(" ({})", target.display()),
-                        Style::default().fg(Color::DarkGray),
+                        "Delete:",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     ),
-                ]));
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("{name_disp}, {size_str}"),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(suffix, Style::default().fg(Color::DarkGray)),
+                ]);
+                lines.push(line);
             }
+            DeleteConfirm::Batch(targets, total_size) => {
+                let count = targets.len();
+                let size_str = crate::size::human_size(*total_size as i64);
+                let suffix = "  Press Enter to confirm  |  Esc cancel";
 
-            if count > 5 {
-                lines.push(Line::from(Span::styled(
-                    format!("  ... and {} more", count - 5),
-                    Style::default().fg(Color::DarkGray),
-                )));
+                if count <= 1 {
+                    let name = targets
+                        .first()
+                        .and_then(|p| p.file_name())
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| {
+                            targets
+                                .first()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default()
+                        });
+
+                    let prefix = "Delete: ";
+                    let fixed_w = display_width(prefix)
+                        + display_width(suffix)
+                        + 2
+                        + display_width(&size_str);
+                    let name_disp = if max_w > fixed_w {
+                        truncate_middle(&name, max_w.saturating_sub(fixed_w))
+                    } else {
+                        name
+                    };
+
+                    let line = Line::from(vec![
+                        Span::styled(
+                            "Delete:",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("{name_disp}, {size_str}"),
+                            Style::default().fg(Color::White),
+                        ),
+                        Span::styled(suffix, Style::default().fg(Color::DarkGray)),
+                    ]);
+                    lines.push(line);
+                } else {
+                    let first_line = Line::from(vec![
+                        Span::styled(
+                            "Delete:",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("{count} items, {size_str}"),
+                            Style::default().fg(Color::White),
+                        ),
+                        Span::styled(suffix, Style::default().fg(Color::DarkGray)),
+                    ]);
+                    lines.push(first_line);
+
+                    for target in targets.iter().take(5) {
+                        let name = target
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| target.display().to_string());
+                        let path_display = target.display().to_string();
+
+                        let bullet = "  • ";
+                        let bullet_w = display_width(bullet);
+                        let name_w = display_width(&name);
+                        let paren_extra = 3; // " ()"
+                        let budget = max_w.saturating_sub(bullet_w + name_w + paren_extra);
+
+                        let path_span = if budget >= 10 {
+                            let trunc_path = truncate_middle(&path_display, budget);
+                            Span::styled(
+                                format!(" ({trunc_path})"),
+                                Style::default().fg(Color::DarkGray),
+                            )
+                        } else {
+                            Span::raw("")
+                        };
+
+                        let item_line = Line::from(vec![
+                            Span::raw(bullet),
+                            Span::styled(name, Style::default().fg(Color::Yellow)),
+                            path_span,
+                        ]);
+                        lines.push(item_line);
+                    }
+                }
             }
-
-            let no_style = if self.confirm_cursor == 0 {
-                styles::button_on()
-            } else {
-                styles::button_off()
-            };
-
-            let yes_style = if self.confirm_cursor == 1 {
-                styles::button_on()
-            } else {
-                styles::button_off()
-            };
-
-            lines.extend([
-                Line::from(""),
-                Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(" [ NO ] ", no_style),
-                    Span::raw("        "),
-                    Span::styled(" [ YES ] ", yes_style),
-                ]),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "←/→ toggle · Enter confirm · Esc cancel",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ]);
-
-            let paragraph = Paragraph::new(lines)
-                .block(block)
-                .alignment(Alignment::Center);
-            f.render_widget(paragraph, dialog_area);
-            return;
+            DeleteConfirm::None => return,
         }
 
-        let Some(target) = &self.confirm_delete else {
-            return;
-        };
+        let p = Paragraph::new(lines);
+        f.render_widget(p, area);
+    }
 
-        let dialog_area = centered_rect(60, 25, area);
-        f.render_widget(Clear, dialog_area);
+    fn render_deleting(&self, f: &mut Frame, area: Rect) {
+        let spinner = SPINNER_FRAMES[self.spinner_idx];
+        let mut spans = Vec::new();
+        spans.push(Span::styled(
+            format!("{spinner} "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            "Deleting: ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
 
-        let size_str = crate::size::human_size(self.confirm_size as i64);
-        let block = Block::default()
-            .title(" Move to Trash ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red));
-
-        let prompt = format!("Move to trash: {} ({size_str})?", target.display());
-
-        let no_style = if self.confirm_cursor == 0 {
-            styles::button_on()
+        if self.delete_count > 0 {
+            spans.push(Span::styled(
+                format_number(self.delete_count),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                " items removed, please wait…",
+                Style::default().fg(Color::White),
+            ));
         } else {
-            styles::button_off()
-        };
+            spans.push(Span::styled(
+                "moving to Trash, please wait…",
+                Style::default().fg(Color::White),
+            ));
+        }
 
-        let yes_style = if self.confirm_cursor == 1 {
-            styles::button_on()
-        } else {
-            styles::button_off()
-        };
-
-        let lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(prompt, Style::default().fg(Color::White))),
-            Line::from(""),
-            Line::from(vec![
-                Span::raw("    "),
-                Span::styled(" [ NO ] ", no_style),
-                Span::raw("        "),
-                Span::styled(" [ YES ] ", yes_style),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "←/→ toggle · Enter confirm · Esc cancel",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
-
-        let paragraph = Paragraph::new(lines)
-            .block(block)
-            .alignment(Alignment::Center);
-        f.render_widget(paragraph, dialog_area);
+        let lines = vec![Line::from(""), Line::from(spans)];
+        let p = Paragraph::new(lines);
+        f.render_widget(p, area);
     }
 
     fn enter_overview_location(&mut self) {
@@ -2899,15 +3083,18 @@ mod tests {
 
         // Trigger batch delete
         tui.handle_key_event(dummy_key(KeyCode::Backspace));
-        assert!(tui.confirm_batch.is_some());
+        assert!(tui.confirm_delete.is_some());
         // Batch confirm targets must contain only sub
-        let targets = tui.confirm_batch.as_ref().unwrap();
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0], sub);
+        if let DeleteConfirm::Batch(targets, _) = &tui.confirm_delete {
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0], sub);
+        } else {
+            panic!("expected DeleteConfirm::Batch");
+        }
 
-        // Confirm YES
-        tui.confirm_cursor = 1;
+        // Confirm YES (direct Enter in D1)
         tui.handle_key_event(dummy_key(KeyCode::Enter));
+        tui.wait_for_delete();
 
         assert!(!sub.exists(), "ancestor dir should be trashed");
         assert!(!file1.exists(), "child inside trashed dir should be gone");
@@ -2917,7 +3104,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_means_no_change() {
+    fn test_esc_cancel_means_no_change() {
         let d = tempdir("no-change");
         let f1 = d.join("file1.txt");
         let f2 = d.join("file2.txt");
@@ -2936,16 +3123,28 @@ mod tests {
 
         // Press Delete to open batch confirm
         tui.handle_key_event(dummy_key(KeyCode::Delete));
-        assert!(tui.confirm_batch.is_some());
-        assert_eq!(tui.confirm_cursor, 0, "default confirm cursor must be NO");
+        assert!(tui.confirm_delete.is_some());
 
-        // Press Enter on NO
-        tui.handle_key_event(dummy_key(KeyCode::Enter));
-        assert!(tui.confirm_batch.is_none());
+        // Press Esc to cancel
+        tui.handle_key_event(dummy_key(KeyCode::Esc));
+        assert!(tui.confirm_delete.is_none());
         assert_eq!(
             tui.selected_paths.len(),
             2,
-            "selections must remain untouched on NO"
+            "selections must remain untouched on Esc cancel"
+        );
+        assert!(f1.exists(), "file1 must not be deleted");
+        assert!(f2.exists(), "file2 must not be deleted");
+
+        // Re-open confirm and press 'q' to cancel
+        tui.handle_key_event(dummy_key(KeyCode::Backspace));
+        assert!(tui.confirm_delete.is_some());
+        tui.handle_key_event(dummy_key(KeyCode::Char('q')));
+        assert!(tui.confirm_delete.is_none());
+        assert_eq!(
+            tui.selected_paths.len(),
+            2,
+            "selections must remain untouched on 'q' cancel"
         );
         assert!(f1.exists(), "file1 must not be deleted");
         assert!(f2.exists(), "file2 must not be deleted");
@@ -2978,11 +3177,11 @@ mod tests {
 
         // Trigger batch delete
         tui.handle_key_event(dummy_key(KeyCode::Backspace));
-        assert!(tui.confirm_batch.is_some());
+        assert!(tui.confirm_delete.is_some());
 
-        // Confirm YES
-        tui.confirm_cursor = 1;
+        // Confirm YES (direct Enter)
         tui.handle_key_event(dummy_key(KeyCode::Enter));
+        tui.wait_for_delete();
 
         // The valid file must be deleted despite ghost failure
         assert!(!valid_file.exists(), "valid file must have been trashed");
@@ -3021,19 +3220,16 @@ mod tests {
         tui.handle_key_event(dummy_key(KeyCode::Backspace));
         assert_eq!(tui.filter_text, "t");
         assert!(tui.confirm_delete.is_none());
-        assert!(tui.confirm_batch.is_none());
 
         // Backspace again to empty
         tui.handle_key_event(dummy_key(KeyCode::Backspace));
         assert_eq!(tui.filter_text, "");
         assert!(tui.confirm_delete.is_none());
-        assert!(tui.confirm_batch.is_none());
 
         // Backspace on empty filter text in filter mode must still NOT trigger delete
         tui.handle_key_event(dummy_key(KeyCode::Backspace));
         assert_eq!(tui.filter_text, "");
         assert!(tui.confirm_delete.is_none());
-        assert!(tui.confirm_batch.is_none());
     }
 
     #[test]
@@ -3102,11 +3298,11 @@ mod tests {
 
         // Trigger batch delete
         tui.handle_key_event(dummy_key(KeyCode::Backspace));
-        assert!(tui.confirm_batch.is_some());
+        assert!(tui.confirm_delete.is_some());
 
-        // Confirm YES
-        tui.confirm_cursor = 1;
+        // Confirm YES (direct Enter in D1)
         tui.handle_key_event(dummy_key(KeyCode::Enter));
+        tui.wait_for_delete();
 
         // In dry run, files must remain intact
         assert!(s1.exists(), "sentinel1 must not be removed in dry-run");
@@ -3658,7 +3854,7 @@ mod tests {
 
         let mut tui = AnalyzeTui::new(false);
         tui.root = Some(root.clone());
-        tui.confirm_delete = Some(file1.clone());
+        tui.confirm_delete = DeleteConfirm::Single(file1.clone(), 1);
         tui.execute_delete();
         assert!(
             !crate::analyze::cache::cache_path(&d).exists(),
@@ -3670,7 +3866,7 @@ mod tests {
         assert!(crate::analyze::cache::cache_path(&d).exists());
 
         tui.selected_paths.insert(file2.clone());
-        tui.confirm_batch = Some(vec![file2.clone()]);
+        tui.confirm_delete = DeleteConfirm::Batch(vec![file2.clone()], 1);
         tui.execute_batch_delete();
         assert!(
             !crate::analyze::cache::cache_path(&d).exists(),
@@ -4737,12 +4933,12 @@ mod tests {
 
         tui.handle_key_event(dummy_key(KeyCode::Backspace));
         assert!(
-            tui.confirm_batch.is_none(),
+            tui.confirm_delete.is_none(),
             "batch delete must be prevented in largest files"
         );
         tui.handle_key_event(dummy_key(KeyCode::Delete));
         assert!(
-            tui.confirm_batch.is_none(),
+            tui.confirm_delete.is_none(),
             "batch delete must be prevented in largest files"
         );
         tui.handle_key_event(dummy_key(KeyCode::Char('d')));
@@ -4750,5 +4946,292 @@ mod tests {
             tui.confirm_delete.is_none(),
             "single delete must be prevented in largest files"
         );
+    }
+
+    #[test]
+    fn test_inline_confirm_rendered_single() {
+        let mut tui = AnalyzeTui::new(false);
+        let mut root = FileNode::new("root".into(), PathBuf::from("/tmp/root"), 1024, true, 1);
+        let victim = FileNode::new(
+            "victim.txt".into(),
+            PathBuf::from("/tmp/root/victim.txt"),
+            1024,
+            false,
+            1,
+        );
+        root.children = vec![victim];
+        tui.root = Some(root);
+
+        // Press 'd' to trigger single delete confirm
+        tui.handle_key_event(dummy_key(KeyCode::Char('d')));
+        assert!(matches!(tui.confirm_delete, DeleteConfirm::Single(..)));
+
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+
+        assert!(
+            text.contains("Delete: victim.txt, 1.0 KB  Press Enter to confirm  |  Esc cancel"),
+            "missing single inline confirm line in:\n{text}"
+        );
+
+        // Press Esc to cancel
+        tui.handle_key_event(dummy_key(KeyCode::Esc));
+        assert!(tui.confirm_delete.is_none());
+
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text_after = buffer_to_string(&terminal);
+        assert!(
+            !text_after.contains("Press Enter to confirm"),
+            "confirm line should disappear after Esc in:\n{text_after}"
+        );
+    }
+
+    #[test]
+    fn test_inline_confirm_rendered_multi() {
+        let mut tui = AnalyzeTui::new(false);
+        let mut root = FileNode::new("root".into(), PathBuf::from("/tmp/root"), 3072, true, 3);
+        let f1 = FileNode::new(
+            "alpha.txt".into(),
+            PathBuf::from("/tmp/root/alpha.txt"),
+            1024,
+            false,
+            1,
+        );
+        let f2 = FileNode::new(
+            "beta.txt".into(),
+            PathBuf::from("/tmp/root/beta.txt"),
+            1024,
+            false,
+            1,
+        );
+        let f3 = FileNode::new(
+            "gamma.txt".into(),
+            PathBuf::from("/tmp/root/gamma.txt"),
+            1024,
+            false,
+            1,
+        );
+        root.children = vec![f1, f2, f3];
+        tui.root = Some(root);
+
+        tui.selected_paths
+            .insert(PathBuf::from("/tmp/root/alpha.txt"));
+        tui.selected_paths
+            .insert(PathBuf::from("/tmp/root/beta.txt"));
+        tui.selected_paths
+            .insert(PathBuf::from("/tmp/root/gamma.txt"));
+
+        // Press Backspace to trigger batch confirm
+        tui.handle_key_event(dummy_key(KeyCode::Backspace));
+        assert!(matches!(tui.confirm_delete, DeleteConfirm::Batch(..)));
+
+        let backend = TestBackend::new(120, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+
+        assert!(
+            text.contains("Delete: 3 items, 3.0 KB  Press Enter to confirm  |  Esc cancel"),
+            "missing multi inline confirm header line in:\n{text}"
+        );
+        assert!(text.contains("• alpha.txt") || text.contains("alpha.txt"));
+        assert!(text.contains("• beta.txt") || text.contains("beta.txt"));
+        assert!(text.contains("• gamma.txt") || text.contains("gamma.txt"));
+
+        // Press 'q' to cancel
+        tui.handle_key_event(dummy_key(KeyCode::Char('q')));
+        assert!(tui.confirm_delete.is_none());
+        assert_eq!(
+            tui.selected_paths.len(),
+            3,
+            "selections preserved on cancel"
+        );
+
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text_after = buffer_to_string(&terminal);
+        assert!(
+            !text_after.contains("Press Enter to confirm"),
+            "confirm line should disappear after q in:\n{text_after}"
+        );
+    }
+
+    #[test]
+    fn test_busy_view_live_counter_rendered() {
+        let mut tui = AnalyzeTui::new(false);
+        let root = FileNode::new("root".into(), PathBuf::from("/tmp/root"), 1024, true, 1);
+        tui.root = Some(root);
+
+        tui.deleting = true;
+        tui.delete_count = 0;
+
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text0 = buffer_to_string(&terminal);
+
+        assert!(
+            text0.contains("Deleting: moving to Trash, please wait…"),
+            "missing count=0 busy view line in:\n{text0}"
+        );
+        assert!(
+            text0.contains("Ctrl+C Quit"),
+            "missing Ctrl+C Quit hint in footer in:\n{text0}"
+        );
+
+        // Counter advances to 12
+        tui.delete_count = 12;
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text12 = buffer_to_string(&terminal);
+
+        assert!(
+            text12.contains("Deleting: 12 items removed, please wait…"),
+            "missing count>0 busy view line in:\n{text12}"
+        );
+    }
+
+    #[test]
+    fn test_input_locked_while_deleting() {
+        let mut tui = AnalyzeTui::new(false);
+        let mut root = FileNode::new("root".into(), PathBuf::from("/tmp/root"), 200, true, 2);
+        let f1 = FileNode::new(
+            "f1.txt".into(),
+            PathBuf::from("/tmp/root/f1.txt"),
+            100,
+            false,
+            1,
+        );
+        let f2 = FileNode::new(
+            "f2.txt".into(),
+            PathBuf::from("/tmp/root/f2.txt"),
+            100,
+            false,
+            1,
+        );
+        root.children = vec![f1, f2];
+        tui.root = Some(root);
+
+        tui.deleting = true;
+        tui.cursor = 0;
+
+        // Keys must be ignored while deleting
+        assert!(!tui.handle_key_event(dummy_key(KeyCode::Esc)));
+        assert!(!tui.handle_key_event(dummy_key(KeyCode::Char('q'))));
+        assert!(!tui.handle_key_event(dummy_key(KeyCode::Char('j'))));
+        assert!(!tui.handle_key_event(dummy_key(KeyCode::Enter)));
+        assert!(!tui.handle_key_event(dummy_key(KeyCode::Backspace)));
+        assert!(!tui.handle_key_event(dummy_key(KeyCode::Delete)));
+        assert!(!tui.handle_key_event(dummy_key(KeyCode::Char(' '))));
+
+        assert_eq!(tui.cursor, 0, "cursor must not move while deleting");
+        assert!(tui.deleting, "deleting state must not be aborted by Esc/q");
+
+        // Ctrl+C must quit
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL);
+        assert!(
+            tui.handle_key_event(ctrl_c),
+            "Ctrl+C must return true to quit"
+        );
+    }
+
+    #[test]
+    fn test_sentinel_esc_and_q_leaves_disk_untouched() {
+        let d = tempdir("sentinel-esc-q");
+        let s1 = d.join("sentinel1.txt");
+        let s2 = d.join("sentinel2.txt");
+        std::fs::write(&s1, b"sentinel1").unwrap();
+        std::fs::write(&s2, b"sentinel2").unwrap();
+
+        let mut tui = AnalyzeTui::new(false);
+        let mut root = FileNode::new("d".into(), d.clone(), 20, true, 2);
+        let n1 = FileNode::new("sentinel1.txt".into(), s1.clone(), 10, false, 1);
+        let n2 = FileNode::new("sentinel2.txt".into(), s2.clone(), 10, false, 1);
+        root.children = vec![n1, n2];
+        tui.root = Some(root);
+
+        tui.selected_paths.insert(s1.clone());
+        tui.selected_paths.insert(s2.clone());
+
+        // Open batch confirm and Esc
+        tui.handle_key_event(dummy_key(KeyCode::Backspace));
+        assert!(tui.confirm_delete.is_some());
+        tui.handle_key_event(dummy_key(KeyCode::Esc));
+        assert!(tui.confirm_delete.is_none());
+        assert!(s1.exists(), "sentinel1 must exist on disk after Esc");
+        assert!(s2.exists(), "sentinel2 must exist on disk after Esc");
+        assert_eq!(tui.selected_paths.len(), 2);
+
+        // Open batch confirm and 'q'
+        tui.handle_key_event(dummy_key(KeyCode::Delete));
+        assert!(tui.confirm_delete.is_some());
+        tui.handle_key_event(dummy_key(KeyCode::Char('q')));
+        assert!(tui.confirm_delete.is_none());
+        assert!(s1.exists(), "sentinel1 must exist on disk after q");
+        assert!(s2.exists(), "sentinel2 must exist on disk after q");
+        assert_eq!(tui.selected_paths.len(), 2);
+
+        // Single delete on cursor and Esc
+        tui.selected_paths.clear();
+        tui.cursor = 0;
+        tui.handle_key_event(dummy_key(KeyCode::Char('d')));
+        assert!(tui.confirm_delete.is_some());
+        tui.handle_key_event(dummy_key(KeyCode::Esc));
+        assert!(tui.confirm_delete.is_none());
+        assert!(s1.exists(), "sentinel1 must exist on disk after Esc");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_async_delete_e2e_live_progress_and_completion() {
+        let d = tempdir("async-e2e");
+        let f1 = d.join("a.txt");
+        let f2 = d.join("b.txt");
+        let f3 = d.join("c.txt");
+        std::fs::write(&f1, b"aaa").unwrap();
+        std::fs::write(&f2, b"bbb").unwrap();
+        std::fs::write(&f3, b"ccc").unwrap();
+
+        let mut tui = AnalyzeTui::new(false);
+        let mut root = FileNode::new("d".into(), d.clone(), 30, true, 3);
+        let n1 = FileNode::new("a.txt".into(), f1.clone(), 10, false, 1);
+        let n2 = FileNode::new("b.txt".into(), f2.clone(), 10, false, 1);
+        let n3 = FileNode::new("c.txt".into(), f3.clone(), 10, false, 1);
+        root.children = vec![n1, n2, n3];
+        tui.root = Some(root);
+
+        tui.selected_paths.insert(f1.clone());
+        tui.selected_paths.insert(f2.clone());
+        tui.selected_paths.insert(f3.clone());
+
+        tui.handle_key_event(dummy_key(KeyCode::Backspace));
+        assert!(tui.confirm_delete.is_some());
+
+        // Confirm via Enter
+        tui.handle_key_event(dummy_key(KeyCode::Enter));
+        assert!(tui.deleting);
+
+        // Wait for async deletion to complete
+        tui.wait_for_delete();
+        assert!(!tui.deleting);
+        assert!(!f1.exists(), "f1 should be trashed");
+        assert!(!f2.exists(), "f2 should be trashed");
+        assert!(!f3.exists(), "f3 should be trashed");
+
+        assert_eq!(tui.selected_paths.len(), 0);
+        assert_eq!(tui.current_node().unwrap().children.len(), 0);
+        assert_eq!(tui.current_node().unwrap().size, 0);
+        assert!(
+            tui.message
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("Moved 3 items to trash"),
+            "expected success message in {:?}",
+            tui.message
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
