@@ -252,10 +252,13 @@ pub fn run_analyze_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let mut tui = analyze::AnalyzeTui::new(opts.dry_run);
+    if opts.path.is_none() {
+        tui.set_overview_mode(true);
+    }
 
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_for_worker = cancel.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, mut rx) = std::sync::mpsc::channel();
     let target_buf = target.to_path_buf();
 
     std::thread::spawn(move || {
@@ -270,6 +273,29 @@ pub fn run_analyze_tui(
     });
 
     loop {
+        if tui.rescan_requested {
+            tui.rescan_requested = false;
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            let new_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let new_cancel_worker = new_cancel.clone();
+            let (new_tx, new_rx) = std::sync::mpsc::channel();
+            rx = new_rx;
+            cancel = new_cancel;
+            let scan_target = tui
+                .current_node()
+                .map(|n| n.path.clone())
+                .unwrap_or_else(|| target.to_path_buf());
+            std::thread::spawn(move || {
+                let _ = std::panic::catch_unwind(move || {
+                    let _ = crate::analyze::walker::scan_path(
+                        &scan_target,
+                        crate::analyze::walker::WalkerOptions::default(),
+                        Some(new_tx),
+                        new_cancel_worker,
+                    );
+                });
+            });
+        }
         terminal.draw(|f| tui.render(f, f.area()))?;
 
         while let Ok(msg) = rx.try_recv() {
