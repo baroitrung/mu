@@ -185,6 +185,257 @@ impl std::fmt::Debug for AnalyzeTui {
     }
 }
 
+/// Width of the graphical usage bar in terminal cells.
+pub const BAR_WIDTH: usize = 24;
+/// Eighth-of-a-cell sub-block characters for the bar.
+pub const SUB_CELL_BLOCKS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+
+/// Return the terminal display width of a string in cells.
+pub fn display_width(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
+/// Truncate a name to fit `target_width` with ellipsis if necessary, then pad
+/// with spaces so its display width is exactly `target_width`.
+pub fn trim_and_pad_name(name: &str, target_width: usize) -> String {
+    let current_width = display_width(name);
+    if current_width == target_width {
+        return name.to_string();
+    }
+    if current_width < target_width {
+        let padding = " ".repeat(target_width - current_width);
+        return format!("{name}{padding}");
+    }
+
+    const ELLIPSIS: &str = "...";
+    const ELLIPSIS_WIDTH: usize = 3;
+    if target_width <= ELLIPSIS_WIDTH {
+        return ELLIPSIS.chars().take(target_width).collect();
+    }
+
+    let max_char_width = target_width - ELLIPSIS_WIDTH;
+    let mut collected = String::new();
+    let mut width = 0;
+    let mut buf = [0u8; 4];
+
+    for c in name.chars() {
+        let c_str = c.encode_utf8(&mut buf);
+        let c_w = display_width(c_str);
+        if width + c_w > max_char_width {
+            break;
+        }
+        collected.push(c);
+        width += c_w;
+    }
+
+    let mut result = format!("{collected}{ELLIPSIS}");
+    let final_width = display_width(&result);
+    if final_width < target_width {
+        result.push_str(&" ".repeat(target_width - final_width));
+    }
+    result
+}
+
+/// Compute the width of the name column from terminal width and index column width.
+pub fn calculate_name_width(term_width: usize, index_width: usize) -> usize {
+    const FIXED_WIDTH: usize = 65;
+    let available = term_width.saturating_sub(FIXED_WIDTH);
+    let name_width = available.clamp(24, 60);
+    name_width.saturating_sub(index_width.saturating_sub(2))
+}
+
+/// Color for a given percentage share of parent:
+/// >=50 red, >=20 yellow, >=5 blue, else green.
+pub fn bar_color_for_percent(percent: f64) -> Color {
+    if percent >= 50.0 {
+        Color::Red
+    } else if percent >= 20.0 {
+        Color::Yellow
+    } else if percent >= 5.0 {
+        Color::Blue
+    } else {
+        Color::Green
+    }
+}
+
+/// Render a 24-cell eighth-block bar colored by share ramp.
+pub fn render_bar_span(value: u64, max_value: u64, percent: f64) -> Span<'static> {
+    if value == 0 || max_value == 0 {
+        return Span::raw(" ".repeat(BAR_WIDTH));
+    }
+
+    let bar_color = bar_color_for_percent(percent);
+    let ratio = value as f64 / max_value as f64;
+    let eighths = (ratio * BAR_WIDTH as f64 * 8.0).round().max(0.0) as usize;
+    let full = eighths / 8;
+    let remainder = eighths % 8;
+
+    if full >= BAR_WIDTH {
+        return Span::styled("█".repeat(BAR_WIDTH), Style::default().fg(bar_color));
+    }
+
+    if full == 0 && remainder == 0 {
+        return Span::styled(
+            format!("{}{}", SUB_CELL_BLOCKS[1], " ".repeat(BAR_WIDTH - 1)),
+            Style::default().fg(Color::DarkGray),
+        );
+    }
+
+    let rem_str = if remainder > 0 {
+        SUB_CELL_BLOCKS[remainder]
+    } else {
+        ""
+    };
+    let drawn = full + if remainder > 0 { 1 } else { 0 };
+    let empty = BAR_WIDTH.saturating_sub(drawn);
+
+    Span::styled(
+        format!("{}{}{}", "█".repeat(full), rem_str, " ".repeat(empty)),
+        Style::default().fg(bar_color),
+    )
+}
+
+/// Format a percentage into a 6-character right-aligned column:
+/// `%.1f%%`, `< 0.1%` special case, or `  --  ` when unknown.
+pub fn format_percent(percent: Option<f64>) -> String {
+    const WIDTH: usize = 6;
+    let Some(percent) = percent else {
+        return "  --  ".to_string();
+    };
+
+    if percent > 0.0 && percent < 0.1 {
+        "< 0.1%".to_string()
+    } else {
+        let label = format!("{:.1}%", percent);
+        format!("{:>width$}", label, width = WIDTH)
+    }
+}
+
+/// Format a human-readable size string right-aligned in 10 columns.
+pub fn format_size_column(size_human: &str) -> String {
+    if let Some(trimmed) = size_human.strip_suffix('+') {
+        format!("{:>9}+", trimmed)
+    } else {
+        format!("{:>10}", size_human)
+    }
+}
+
+/// Data needed to render a unified analyze row.
+#[derive(Clone, Debug)]
+pub struct RowItem<'a> {
+    pub name: &'a str,
+    pub is_dir: bool,
+    pub size: u64,
+    pub size_human: &'a str,
+    pub is_cleanable: bool,
+    pub is_checked: bool,
+    pub is_cursor: bool,
+    pub index: usize,
+    pub index_width: usize,
+    pub max_size: u64,
+    pub parent_size: Option<u64>,
+    pub name_width: usize,
+    pub has_err: bool,
+}
+
+/// Build the styled spans for a row in tree or largest files view.
+pub fn row_cells(item: &RowItem) -> Vec<Span<'static>> {
+    let cursor_str = if item.is_cursor { "▶ " } else { "  " };
+    let cursor_style = if item.is_cursor {
+        selected_style()
+    } else {
+        normal_style()
+    };
+
+    let (select_str, select_style) = if item.is_checked {
+        ("● ", Style::default().fg(Color::Green))
+    } else {
+        ("○ ", Style::default().fg(Color::DarkGray))
+    };
+
+    let index_str = format!("{:>width$}.", item.index, width = item.index_width);
+    let num_style = if item.is_cursor {
+        selected_style()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let percent_val = item.parent_size.map(|ps| {
+        if ps > 0 {
+            (item.size as f64 / ps as f64) * 100.0
+        } else {
+            0.0
+        }
+    });
+    let bar_percent = percent_val.unwrap_or(0.0);
+    let bar_span = render_bar_span(item.size, item.max_size, bar_percent);
+
+    let sep_span = Span::styled("  |  ", Style::default().fg(Color::DarkGray));
+
+    let icon_str = if item.is_dir { "📁 " } else { "📄 " };
+    let icon_style = if item.is_cursor {
+        selected_style()
+    } else if item.is_dir {
+        Style::default().fg(Color::Cyan)
+    } else {
+        normal_style()
+    };
+
+    let padded_name = trim_and_pad_name(item.name, item.name_width);
+    let name_style = if item.has_err {
+        Style::default().fg(Color::Red)
+    } else if item.is_cursor {
+        selected_style()
+    } else if item.is_checked {
+        Style::default().fg(Color::Green)
+    } else if item.is_dir {
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        normal_style()
+    };
+
+    let size_str = format_size_column(item.size_human);
+    let size_style = if item.is_cursor {
+        selected_style()
+    } else {
+        Style::default().fg(bar_color_for_percent(bar_percent))
+    };
+
+    let mut spans = Vec::with_capacity(12);
+    spans.push(Span::styled(cursor_str, cursor_style));
+    spans.push(Span::styled(select_str, select_style));
+    spans.push(Span::styled(format!("{index_str} "), num_style));
+    spans.push(bar_span);
+
+    if let Some(pct) = percent_val {
+        spans.push(Span::raw(" "));
+        let percent_style = if item.is_cursor {
+            selected_style()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(format_percent(Some(pct)), percent_style));
+    }
+
+    spans.push(sep_span);
+    spans.push(Span::styled(icon_str, icon_style));
+    spans.push(Span::styled(padded_name, name_style));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(size_str, size_style));
+
+    if item.is_cleanable {
+        spans.push(Span::styled(
+            "  🧹",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    spans
+}
 impl AnalyzeTui {
     pub fn new(dry_run: bool) -> Self {
         let clean_roots = crate::clean::clean_target_roots();
@@ -1110,6 +1361,10 @@ impl AnalyzeTui {
 
         let visible_height = area.height as usize;
         let parent_size = node.size.max(1);
+        let total_items = items.len();
+        let index_width = total_items.to_string().len().max(2);
+        let max_size = items.iter().map(|(_, c)| c.size).max().unwrap_or(1).max(1);
+        let name_width = calculate_name_width(area.width as usize, index_width);
 
         let mut lines = Vec::new();
         for (display_idx, (_orig_idx, child)) in items
@@ -1120,69 +1375,30 @@ impl AnalyzeTui {
         {
             let is_cursor = display_idx == self.cursor;
             let is_checked = self.selected_paths.contains(&child.path);
-
-            let cursor_str = if is_cursor { "▶" } else { " " };
-            let check_str = if is_checked { "[x] " } else { "    " };
-            let prefix = format!("{cursor_str} {check_str}");
-
-            // Percentage bar (width 10)
-            let ratio = child.size as f64 / parent_size as f64;
-            let filled = (ratio * 10.0).round().min(10.0) as usize;
-            let empty = 10usize.saturating_sub(filled);
-            let bar = format!("[{}{}]", "#".repeat(filled), " ".repeat(empty));
-
-            let dir_icon = if child.is_dir { "[dir] " } else { "      " };
             let name_display = if child.is_dir {
                 format!("{}/", child.name)
             } else {
                 child.name.clone()
             };
+            let is_clean = is_cleanable(child, &self.clean_roots);
 
-            let item_count_str = if child.is_dir {
-                format!("({} items)", child.item_count)
-            } else {
-                String::new()
+            let row_item = RowItem {
+                name: &name_display,
+                is_dir: child.is_dir,
+                size: child.size,
+                size_human: &child.size_human,
+                is_cleanable: is_clean,
+                is_checked,
+                is_cursor,
+                index: display_idx + 1,
+                index_width,
+                max_size,
+                parent_size: Some(parent_size),
+                name_width,
+                has_err: child.err.is_some(),
             };
 
-            let mut style = if is_cursor {
-                selected_style()
-            } else if is_checked {
-                Style::default().fg(Color::Green)
-            } else if child.is_dir {
-                Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                normal_style()
-            };
-
-            if child.err.is_some() {
-                style = style.fg(Color::Red);
-            }
-            let clean_badge = if is_cleanable(child, &self.clean_roots) {
-                Span::styled(
-                    " [cleanable]",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::raw("")
-            };
-
-            let line = Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(
-                    format!("{:<10} ", child.size_human),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(format!("{bar} "), Style::default().fg(Color::DarkGray)),
-                Span::styled(dir_icon, Style::default().fg(Color::Cyan)),
-                Span::styled(format!("{:<30} ", name_display), style),
-                Span::styled(item_count_str, Style::default().fg(Color::DarkGray)),
-                clean_badge,
-            ]);
-            lines.push(line);
+            lines.push(Line::from(row_cells(&row_item)));
         }
 
         let p = Paragraph::new(lines);
@@ -1198,6 +1414,16 @@ impl AnalyzeTui {
         }
 
         let visible_height = area.height as usize;
+        let total_items = self.largest_files.len();
+        let index_width = total_items.to_string().len().max(2);
+        let max_size = self
+            .largest_files
+            .first()
+            .map(|f| f.size)
+            .unwrap_or(1)
+            .max(1);
+        let name_width = calculate_name_width(area.width as usize, index_width);
+
         let mut lines = Vec::new();
 
         for (i, file) in self
@@ -1207,22 +1433,26 @@ impl AnalyzeTui {
             .skip(self.scroll_off)
             .take(visible_height)
         {
-            let is_selected = i == self.cursor;
-            let prefix = if is_selected { "▶ " } else { "  " };
-            let style = if is_selected {
-                selected_style()
-            } else {
-                normal_style()
+            let is_cursor = i == self.cursor;
+            let path_str = file.path.display().to_string();
+
+            let row_item = RowItem {
+                name: &path_str,
+                is_dir: false,
+                size: file.size,
+                size_human: &file.size_human,
+                is_cleanable: false,
+                is_checked: false,
+                is_cursor,
+                index: i + 1,
+                index_width,
+                max_size,
+                parent_size: None,
+                name_width,
+                has_err: false,
             };
-            let line = Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(
-                    format!("{:<10} ", file.size_human),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(file.path.display().to_string(), style),
-            ]);
-            lines.push(line);
+
+            lines.push(Line::from(row_cells(&row_item)));
         }
 
         let p = Paragraph::new(lines);
@@ -2666,12 +2896,8 @@ mod tests {
         terminal.draw(|f| tui.render(f, f.area())).unwrap();
 
         let text = buffer_to_string(&terminal);
-
-        // Must display [cleanable]
-        assert!(
-            text.contains("[cleanable]"),
-            "missing cleanable badge in:\n{text}"
-        );
+        // Must display 🧹
+        assert!(text.contains("🧹"), "missing cleanable badge in:\n{text}");
 
         // Separate lines check
         let lines: Vec<&str> = text.lines().collect();
@@ -2680,7 +2906,7 @@ mod tests {
             .find(|l| l.contains("node_modules/"))
             .expect("node_modules line");
         assert!(
-            node_modules_line.contains("[cleanable]"),
+            node_modules_line.contains("🧹"),
             "node_modules must have badge: {node_modules_line}"
         );
 
@@ -2689,7 +2915,7 @@ mod tests {
             .find(|l| l.contains("target/"))
             .expect("target line");
         assert!(
-            target_line.contains("[cleanable]"),
+            target_line.contains("🧹"),
             "target must have badge: {target_line}"
         );
 
@@ -2698,7 +2924,7 @@ mod tests {
             .find(|l| l.contains(".venv/"))
             .expect(".venv line");
         assert!(
-            venv_line.contains("[cleanable]"),
+            venv_line.contains("🧹"),
             ".venv must have badge: {venv_line}"
         );
 
@@ -2707,7 +2933,7 @@ mod tests {
             .find(|l| l.contains("dist/"))
             .expect("dist line");
         assert!(
-            dist_line.contains("[cleanable]"),
+            dist_line.contains("🧹"),
             "dist must have badge: {dist_line}"
         );
 
@@ -2716,16 +2942,15 @@ mod tests {
             .find(|l| l.contains("tagged_cache/"))
             .expect("tagged line");
         assert!(
-            tagged_line.contains("[cleanable]"),
+            tagged_line.contains("🧹"),
             "tagged_cache must have badge: {tagged_line}"
         );
 
         let src_line = lines.iter().find(|l| l.contains("src/")).expect("src line");
         assert!(
-            !src_line.contains("[cleanable]"),
+            !src_line.contains("🧹"),
             "src must NOT have badge: {src_line}"
         );
-
         // Check excluded in clean root does not have badge
         assert!(!is_cleanable(
             &FileNode::new("target".into(), clean_root.join("target"), 100, true, 1),
@@ -2990,5 +3215,344 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_bar_rendering_and_color_thresholds() {
+        // Zero value or zero max_value gives 24 spaces
+        let empty_bar1 = render_bar_span(0, 100, 50.0);
+        assert_eq!(empty_bar1.content, " ".repeat(BAR_WIDTH));
+        assert_eq!(display_width(&empty_bar1.content), BAR_WIDTH);
+
+        let empty_bar2 = render_bar_span(100, 0, 50.0);
+        assert_eq!(empty_bar2.content, " ".repeat(BAR_WIDTH));
+        assert_eq!(display_width(&empty_bar2.content), BAR_WIDTH);
+
+        // 100% share (full width 24 blocks)
+        let full_bar = render_bar_span(1000, 1000, 100.0);
+        assert_eq!(full_bar.content, "█".repeat(BAR_WIDTH));
+        assert_eq!(full_bar.style.fg, Some(Color::Red));
+        assert_eq!(display_width(&full_bar.content), BAR_WIDTH);
+
+        // Very small value (>0 but rounded to 0 eighths) produces tick in DarkGray
+        let tick_bar = render_bar_span(1, 10_000_000, 0.0001);
+        assert!(tick_bar.content.starts_with(SUB_CELL_BLOCKS[1]));
+        assert_eq!(tick_bar.style.fg, Some(Color::DarkGray));
+        assert_eq!(display_width(&tick_bar.content), BAR_WIDTH);
+
+        // Color thresholds (>=50 red, >=20 yellow, >=5 blue, else green)
+        assert_eq!(bar_color_for_percent(50.0), Color::Red);
+        assert_eq!(bar_color_for_percent(75.5), Color::Red);
+        assert_eq!(bar_color_for_percent(100.0), Color::Red);
+
+        assert_eq!(bar_color_for_percent(20.0), Color::Yellow);
+        assert_eq!(bar_color_for_percent(35.0), Color::Yellow);
+        assert_eq!(bar_color_for_percent(49.99), Color::Yellow);
+
+        assert_eq!(bar_color_for_percent(5.0), Color::Blue);
+        assert_eq!(bar_color_for_percent(12.5), Color::Blue);
+        assert_eq!(bar_color_for_percent(19.99), Color::Blue);
+
+        assert_eq!(bar_color_for_percent(4.99), Color::Green);
+        assert_eq!(bar_color_for_percent(1.0), Color::Green);
+        assert_eq!(bar_color_for_percent(0.0), Color::Green);
+
+        // Sub-cell eighth-block progression
+        // 1/8 of 1 cell -> value = 1, max_value = 192 -> ratio * 24 * 8 = 1.0 eighth
+        for rem in 1..8 {
+            // (rem as f64 / 192.0) gives exactly rem eighths
+            let bar = render_bar_span(rem, 192, 10.0);
+            assert!(
+                bar.content.starts_with(SUB_CELL_BLOCKS[rem as usize]),
+                "expected remainder {rem} to start with {}",
+                SUB_CELL_BLOCKS[rem as usize]
+            );
+            assert_eq!(display_width(&bar.content), BAR_WIDTH);
+        }
+    }
+
+    #[test]
+    fn test_percent_formatting() {
+        assert_eq!(format_percent(None), "  --  ");
+        assert_eq!(format_percent(Some(0.0)), "  0.0%");
+        assert_eq!(format_percent(Some(0.01)), "< 0.1%");
+        assert_eq!(format_percent(Some(0.05)), "< 0.1%");
+        assert_eq!(format_percent(Some(0.099)), "< 0.1%");
+        assert_eq!(format_percent(Some(0.1)), "  0.1%");
+        assert_eq!(format_percent(Some(1.5)), "  1.5%");
+        assert_eq!(format_percent(Some(9.4)), "  9.4%");
+        assert_eq!(format_percent(Some(20.0)), " 20.0%");
+        assert_eq!(format_percent(Some(50.0)), " 50.0%");
+        assert_eq!(format_percent(Some(100.0)), "100.0%");
+
+        // Ensure all formatted percent strings have width exactly 6
+        for p in [
+            None,
+            Some(0.0),
+            Some(0.04),
+            Some(0.1),
+            Some(5.0),
+            Some(50.0),
+            Some(100.0),
+        ] {
+            assert_eq!(display_width(&format_percent(p)), 6);
+        }
+    }
+
+    #[test]
+    fn test_size_column_formatting() {
+        assert_eq!(format_size_column("0 B"), "       0 B");
+        assert_eq!(format_size_column("100 B"), "     100 B");
+        assert_eq!(format_size_column("1.5 KB"), "    1.5 KB");
+        assert_eq!(format_size_column("10.9 MB"), "   10.9 MB");
+        assert_eq!(format_size_column("200.0 MB"), "  200.0 MB");
+        assert_eq!(format_size_column("3.5 GB"), "    3.5 GB");
+        assert_eq!(format_size_column("100 B+"), "    100 B+");
+
+        for s in [
+            "0 B", "100 B", "1.5 KB", "10.9 MB", "200.0 MB", "3.5 GB", "100 B+",
+        ] {
+            assert_eq!(display_width(&format_size_column(s)), 10);
+        }
+    }
+
+    #[test]
+    fn test_unicode_name_alignment() {
+        let name_ascii = "ascii_file.txt";
+        let name_cjk = "测试项目目录/"; // 4 Chinese chars (width 8) + 2 chars = width 10
+        let name_emoji = "🦀_rust_code/"; // emoji (width 2) + 12 chars = width 14
+
+        let target_width = 30;
+        let padded_ascii = trim_and_pad_name(name_ascii, target_width);
+        let padded_cjk = trim_and_pad_name(name_cjk, target_width);
+        let padded_emoji = trim_and_pad_name(name_emoji, target_width);
+
+        assert_eq!(display_width(&padded_ascii), target_width);
+        assert_eq!(display_width(&padded_cjk), target_width);
+        assert_eq!(display_width(&padded_emoji), target_width);
+
+        // Render all three into a TestBackend buffer and check that the size column
+        // starts at the exact same column index on all rows.
+        let row1 = RowItem {
+            name: name_ascii,
+            is_dir: false,
+            size: 1000,
+            size_human: "1000 B",
+            is_cleanable: false,
+            is_checked: false,
+            is_cursor: false,
+            index: 1,
+            index_width: 2,
+            max_size: 1000,
+            parent_size: Some(1000),
+            name_width: target_width,
+            has_err: false,
+        };
+        let row2 = RowItem {
+            name: name_cjk,
+            is_dir: true,
+            size: 1000,
+            size_human: "1000 B",
+            is_cleanable: false,
+            is_checked: false,
+            is_cursor: false,
+            index: 2,
+            index_width: 2,
+            max_size: 1000,
+            parent_size: Some(1000),
+            name_width: target_width,
+            has_err: false,
+        };
+        let row3 = RowItem {
+            name: name_emoji,
+            is_dir: true,
+            size: 1000,
+            size_human: "1000 B",
+            is_cleanable: false,
+            is_checked: false,
+            is_cursor: false,
+            index: 3,
+            index_width: 2,
+            max_size: 1000,
+            parent_size: Some(1000),
+            name_width: target_width,
+            has_err: false,
+        };
+
+        let lines = vec![
+            Line::from(row_cells(&row1)),
+            Line::from(row_cells(&row2)),
+            Line::from(row_cells(&row3)),
+        ];
+
+        let backend = TestBackend::new(120, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let p = Paragraph::new(lines);
+                f.render_widget(p, f.area());
+            })
+            .unwrap();
+
+        let text = buffer_to_string(&terminal);
+        let rendered_lines: Vec<&str> = text.lines().collect();
+        assert!(rendered_lines.len() >= 3);
+
+        // Check the actual terminal column (x-coordinate) in the TestBackend buffer
+        let buf = terminal.backend().buffer();
+        let find_size_col = |y: u16| -> u16 {
+            for x in 0..(buf.area.width - 5) {
+                if buf[(x, y)].symbol() == "1"
+                    && buf[(x + 1, y)].symbol() == "0"
+                    && buf[(x + 2, y)].symbol() == "0"
+                    && buf[(x + 3, y)].symbol() == "0"
+                    && buf[(x + 4, y)].symbol() == " "
+                    && buf[(x + 5, y)].symbol() == "B"
+                {
+                    return x;
+                }
+            }
+            panic!("could not find '1000 B' in row {y}");
+        };
+
+        let col1 = find_size_col(0);
+        let col2 = find_size_col(1);
+        let col3 = find_size_col(2);
+
+        assert_eq!(
+            col1, col2,
+            "size column misaligned between ASCII and CJK: col {col1} vs col {col2}\nLine1: {}\nLine2: {}",
+            rendered_lines[0], rendered_lines[1]
+        );
+        assert_eq!(
+            col1, col3,
+            "size column misaligned between ASCII and Emoji: col {col1} vs col {col3}\nLine1: {}\nLine3: {}",
+            rendered_lines[0], rendered_lines[2]
+        );
+    }
+
+    #[test]
+    fn test_hint_presence_and_absence() {
+        let item_clean = RowItem {
+            name: "node_modules/",
+            is_dir: true,
+            size: 1000,
+            size_human: "1000 B",
+            is_cleanable: true,
+            is_checked: false,
+            is_cursor: false,
+            index: 1,
+            index_width: 2,
+            max_size: 1000,
+            parent_size: Some(1000),
+            name_width: 30,
+            has_err: false,
+        };
+        let spans_clean = row_cells(&item_clean);
+        let clean_str: String = spans_clean.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            clean_str.contains('🧹'),
+            "cleanable row must carry broom glyph"
+        );
+
+        let item_normal = RowItem {
+            name: "src/",
+            is_dir: true,
+            size: 500,
+            size_human: "500 B",
+            is_cleanable: false,
+            is_checked: false,
+            is_cursor: false,
+            index: 2,
+            index_width: 2,
+            max_size: 1000,
+            parent_size: Some(1000),
+            name_width: 30,
+            has_err: false,
+        };
+        let spans_normal = row_cells(&item_normal);
+        let normal_str: String = spans_normal.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !normal_str.contains('🧹'),
+            "normal row must NOT carry broom glyph"
+        );
+    }
+
+    #[test]
+    fn test_tree_view_row_snapshot() {
+        let mut tui = AnalyzeTui::new(false);
+        let mut root = FileNode::new(
+            "workspace".into(),
+            PathBuf::from("/workspace"),
+            2000,
+            true,
+            1,
+        );
+        let mut clean_node = FileNode::new(
+            "node_modules".into(),
+            PathBuf::from("/workspace/node_modules"),
+            1000,
+            true,
+            1,
+        );
+        clean_node.children = vec![];
+        let file_node = FileNode::new(
+            "main.rs".into(),
+            PathBuf::from("/workspace/main.rs"),
+            500,
+            false,
+            1,
+        );
+        let small_node = FileNode::new(
+            "readme.md".into(),
+            PathBuf::from("/workspace/readme.md"),
+            50,
+            false,
+            1,
+        );
+        root.children = vec![clean_node, file_node, small_node];
+        tui.root = Some(root);
+
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+
+        let text = buffer_to_string(&terminal);
+        let lines: Vec<&str> = text.lines().collect();
+
+        // Find row lines
+        let row1 = lines
+            .iter()
+            .find(|l| l.contains("node_modules/"))
+            .expect("row1");
+        let row2 = lines.iter().find(|l| l.contains("main.rs")).expect("row2");
+        let row3 = lines
+            .iter()
+            .find(|l| l.contains("readme.md"))
+            .expect("row3");
+
+        // Row 1 (cursor, 50% share, cleanable)
+        assert!(row1.contains('▶'), "cursor on row 1: {row1}");
+        assert!(row1.contains('○'), "unselected circle on row 1: {row1}");
+        assert!(row1.contains(" 1."), "index 1 on row 1: {row1}");
+        assert!(row1.contains("50.0%"), "50.0% on row 1: {row1}");
+        assert!(row1.contains('|'), "activity divider on row 1: {row1}");
+        assert!(row1.contains('📁'), "dir icon on row 1: {row1}");
+        assert!(row1.contains("1000 B"), "size on row 1: {row1}");
+        assert!(row1.contains('🧹'), "cleanable badge on row 1: {row1}");
+
+        // Row 2 (not cursor, 25% share, file)
+        assert!(!row2.contains('▶'), "no cursor on row 2: {row2}");
+        assert!(row2.contains('○'), "unselected circle on row 2: {row2}");
+        assert!(row2.contains(" 2."), "index 2 on row 2: {row2}");
+        assert!(row2.contains("25.0%"), "25.0% on row 2: {row2}");
+        assert!(row2.contains('📄'), "file icon on row 2: {row2}");
+        assert!(row2.contains("500 B"), "size on row 2: {row2}");
+        assert!(!row2.contains('🧹'), "no cleanable badge on row 2: {row2}");
+
+        // Row 3 (not cursor, 2.5% share, file)
+        assert!(row3.contains(" 3."), "index 3 on row 3: {row3}");
+        assert!(row3.contains(" 2.5%"), "2.5% on row 3: {row3}");
+        assert!(row3.contains("50 B"), "size on row 3: {row3}");
     }
 }
