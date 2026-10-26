@@ -725,7 +725,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(content.contains("Scanning"));
-        assert!(content.contains("q quit"));
+        assert!(content.contains("[View: Tree]"));
 
         // 'q' returns to menu
         let q_key = crossterm::event::KeyEvent::new(
