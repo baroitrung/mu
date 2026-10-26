@@ -9,6 +9,7 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
 
 use super::styles;
+use super::{AltScreenGuard, RawModeGuard};
 use crate::config::{self, Whitelist};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,6 +232,12 @@ impl WhitelistTui {
 
 pub fn run_whitelist_tui() -> crate::error::Result<()> {
     let mut terminal = ratatui::init();
+    // Restore the terminal on every exit path — an error from `draw`/`read`
+    // used to return before `ratatui::restore()`, leaving the shell raw
+    // (review rvp6#11). Guards drop in reverse order: alt screen, then raw
+    // mode.
+    let _raw_guard = RawModeGuard;
+    let _alt_guard = AltScreenGuard;
     let mut app = WhitelistTui::new();
 
     loop {
@@ -246,7 +253,6 @@ pub fn run_whitelist_tui() -> crate::error::Result<()> {
         }
     }
 
-    ratatui::restore();
     Ok(())
 }
 

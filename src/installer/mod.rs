@@ -10,12 +10,15 @@ use crate::error::Result;
 use crate::oplog;
 use crate::size;
 use crate::trash;
+use crate::tui::select::{self, SelectOutcome, Selection};
 use crate::xdg;
 
 pub use model::Options;
 
-/// Interactive selection hook (review F4). `None` = not interactive (non-TTY).
-pub type SelectFn = Box<dyn Fn(&[model::InstallerPackage]) -> Option<Vec<usize>>>;
+/// Interactive selection hook (review F4). [`SelectOutcome::NonInteractive`]
+/// means "no terminal, fall back to the headless `--yes` gate"; a user's
+/// cancel is [`SelectOutcome::Cancelled`] (review p4r1#1).
+pub type SelectFn = Box<dyn Fn(&[model::InstallerPackage]) -> SelectOutcome>;
 /// Deletion hook; production always routes through `trash::safe_delete`.
 pub type DeleteFn = Box<dyn Fn(&Path) -> Result<()>>;
 
@@ -129,17 +132,20 @@ pub(crate) fn run_in(opts: &Options, deps: &Deps) -> i32 {
     let selected: Vec<&model::InstallerPackage> = if opts.auto_yes {
         all_packages.iter().collect()
     } else {
-        match (deps.select)(&all_packages) {
-            None => {
-                println!("\nNon-interactive: pass --yes to confirm, or --dry-run to preview.");
-                println!("Aborted.");
-                return 0;
+        match select::resolve((deps.select)(&all_packages)) {
+            Selection::Stop {
+                code,
+                message,
+                is_error,
+            } => {
+                if is_error {
+                    eprintln!("{message}");
+                } else {
+                    println!("\n{message}");
+                }
+                return code;
             }
-            Some(indices) if indices.is_empty() => {
-                println!("\nNothing selected. Aborted.");
-                return 0;
-            }
-            Some(indices) => indices
+            Selection::Proceed(indices) => indices
                 .iter()
                 .filter_map(|&i| all_packages.get(i))
                 .collect(),
@@ -149,6 +155,7 @@ pub(crate) fn run_in(opts: &Options, deps: &Deps) -> i32 {
     // Execution: route strictly through the SafeDelete seam.
     let mut removed_count = 0;
     let mut freed_bytes = 0;
+    let attempted = selected.len();
     for p in selected {
         match (deps.delete)(&p.path) {
             Ok(()) => {
@@ -168,6 +175,12 @@ pub(crate) fn run_in(opts: &Options, deps: &Deps) -> i32 {
         removed_count,
         size::human_size(freed_bytes as i64)
     );
+    // Review rvp4#6: a run where every removal failed must not look like
+    // success to a script.
+    if attempted > 0 && removed_count == 0 {
+        eprintln!("error: every installer package failed to trash — nothing was removed");
+        return 1;
+    }
     0
 }
 
@@ -243,8 +256,8 @@ mod tests {
         let root = tempdir("abort");
         let dummy = fixture(&root, "app.AppImage");
 
-        // Non-TTY: the selector reports "not interactive" (None).
-        let (deps, removed) = test_deps(&root, Box::new(|_| None));
+        // Non-TTY: the selector reports "not interactive".
+        let (deps, removed) = test_deps(&root, Box::new(|_| SelectOutcome::NonInteractive));
         let opts = Options {
             paths: vec![root.clone()],
             dry_run: false,
@@ -261,13 +274,66 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Review p4r1#1: a user cancelling the TTY multi-select deletes nothing
+    // and is not reported as a non-interactive caller.
+    #[test]
+    fn installer_cancel_is_not_reported_as_non_interactive() {
+        let root = tempdir("cancel");
+        let dummy = fixture(&root, "app.AppImage");
+
+        let (deps, removed) = test_deps(&root, Box::new(|_| SelectOutcome::Cancelled));
+        let opts = Options {
+            paths: vec![root.clone()],
+            dry_run: false,
+            auto_yes: false,
+            debug: false,
+        };
+
+        assert_eq!(run_in(&opts, &deps), 0, "a cancel is not an error");
+        assert!(
+            dummy.exists(),
+            "cancelled installer must not delete anything"
+        );
+        assert!(removed.lock().unwrap().is_empty());
+
+        oplog::close_logger();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Review rvp4#6: when every removal fails the run must not exit 0.
+    #[test]
+    fn installer_exits_nonzero_when_every_removal_fails() {
+        let root = tempdir("allfail");
+        let dummy = fixture(&root, "app.AppImage");
+
+        let deps = Deps {
+            config_home: root.join("config-home"),
+            data_home: root.join("data-home"),
+            no_oplog: true,
+            select: Box::new(|_| panic!("--yes must not prompt")),
+            delete: Box::new(|_| Err(crate::error::Error::Msg("trash unavailable".into()))),
+        };
+        let opts = Options {
+            paths: vec![root.clone()],
+            dry_run: false,
+            auto_yes: true,
+            debug: false,
+        };
+
+        assert_eq!(run_in(&opts, &deps), 1, "all-fail must be nonzero");
+        assert!(dummy.exists(), "a failed removal must leave the file");
+
+        oplog::close_logger();
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // Review F1: `mu installer` must open the operations log itself.
     #[test]
     fn installer_dry_run_writes_operations_log() {
         let root = tempdir("log");
         fixture(&root, "dummy.deb");
 
-        let (deps, _removed) = test_deps(&root, Box::new(|_| None));
+        let (deps, _removed) = test_deps(&root, Box::new(|_| SelectOutcome::NonInteractive));
         let opts = Options {
             paths: vec![root.clone()],
             dry_run: true,
@@ -300,7 +366,7 @@ mod tests {
             &root,
             Box::new(|items| {
                 assert_eq!(items.len(), 2, "both candidates offered");
-                Some(vec![1])
+                SelectOutcome::Confirmed(vec![1])
             }),
         );
         let opts = Options {
@@ -330,7 +396,7 @@ mod tests {
         let root = tempdir("none");
         let dummy = fixture(&root, "dummy.deb");
 
-        let (deps, removed) = test_deps(&root, Box::new(|_| Some(Vec::new())));
+        let (deps, removed) = test_deps(&root, Box::new(|_| SelectOutcome::Confirmed(Vec::new())));
         let opts = Options {
             paths: vec![root.clone()],
             dry_run: false,
@@ -355,7 +421,10 @@ mod tests {
 
         let dummy = fixture(&root, "dummy.deb");
 
-        let (deps, removed) = test_deps(&root, Box::new(|_| panic!("bad config must not reach select")));
+        let (deps, removed) = test_deps(
+            &root,
+            Box::new(|_| panic!("bad config must not reach select")),
+        );
         let opts = Options {
             paths: vec![root.clone()],
             dry_run: true,

@@ -157,6 +157,7 @@ pub struct ScanStats {
 pub enum ScanMessage {
     Progress {
         items_scanned: u64,
+        dirs_scanned: u64,
         bytes_scanned: u64,
         current_dir: PathBuf,
     },

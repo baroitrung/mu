@@ -22,6 +22,67 @@ use super::{AltScreenGuard, RawModeGuard, is_ctrl_c};
 /// A row is `(label, detail)` — the path and its size/kind.
 pub type Row = (String, String);
 
+/// Why the interactive selector is not showing a list — the three outcomes a
+/// caller must be able to tell apart (review p4r1#1: a user's own cancel was
+/// reported as "Non-interactive").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectOutcome {
+    /// Enter pressed: the chosen indices, in list order (possibly empty).
+    Confirmed(Vec<usize>),
+    /// q, Esc or ctrl+c — the user cancelled.
+    Cancelled,
+    /// No terminal to draw on (stdout or stdin is not a TTY): the user was
+    /// never asked, so the caller falls back to its headless `--yes` gate.
+    NonInteractive,
+    /// A terminal was attached but could not be initialised.
+    Unavailable(String),
+}
+
+/// What a [`SelectOutcome`] means to the caller that asked for a selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Selection {
+    /// Act on these indices (never empty).
+    Proceed(Vec<usize>),
+    /// Print `message` (on stderr when `is_error`) and exit with `code`.
+    Stop {
+        code: i32,
+        message: String,
+        is_error: bool,
+    },
+}
+
+/// Resolve a selector outcome into "delete these" or "stop, with this text".
+///
+/// One home for the decision so a user's cancel, a caller with no terminal and
+/// an empty pick can never be reported as one another — the defect in review
+/// p4r1#1, where every `None` printed the non-TTY hint.
+pub fn resolve(outcome: SelectOutcome) -> Selection {
+    match outcome {
+        SelectOutcome::Confirmed(indices) if !indices.is_empty() => Selection::Proceed(indices),
+        SelectOutcome::Confirmed(_) => Selection::Stop {
+            code: 0,
+            message: "Nothing selected. Aborted.".to_string(),
+            is_error: false,
+        },
+        SelectOutcome::Cancelled => Selection::Stop {
+            code: 0,
+            message: "Cancelled. Nothing was deleted.".to_string(),
+            is_error: false,
+        },
+        SelectOutcome::NonInteractive => Selection::Stop {
+            code: 0,
+            message: "Non-interactive: pass --yes to confirm, or --dry-run to preview.\nAborted."
+                .to_string(),
+            is_error: false,
+        },
+        SelectOutcome::Unavailable(reason) => Selection::Stop {
+            code: 1,
+            message: format!("error: interactive selection unavailable: {reason}"),
+            is_error: true,
+        },
+    }
+}
+
 /// Multi-select dialog state.
 #[derive(Clone, Debug)]
 pub struct SelectList {
@@ -153,38 +214,39 @@ impl SelectList {
     }
 }
 
-/// Interactive multi-select on a TTY. Returns `Some(indices)` on confirm
-/// (possibly empty), `None` when the list is cancelled or stdout is not a
-/// terminal (the caller then falls back to the headless `--yes` gate).
-pub fn select_indices(title: &str, rows: Vec<Row>) -> Option<Vec<usize>> {
-    if !std::io::stdout().is_terminal() {
-        return None;
+/// Interactive multi-select on a TTY. [`SelectOutcome::Confirmed`] carries the
+/// chosen indices (possibly empty); a cancel and a missing terminal are
+/// distinct outcomes so the caller never mislabels one as the other.
+pub fn select_indices(title: &str, rows: Vec<Row>) -> SelectOutcome {
+    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+        return SelectOutcome::NonInteractive;
     }
     if rows.is_empty() {
-        return Some(Vec::new());
+        return SelectOutcome::Confirmed(Vec::new());
     }
-    if enable_raw_mode().is_err() {
-        return None;
+    if let Err(e) = enable_raw_mode() {
+        return SelectOutcome::Unavailable(format!("raw mode: {e}"));
     }
     let _raw_guard = RawModeGuard;
     let mut stdout = std::io::stdout();
-    if execute!(stdout, EnterAlternateScreen).is_err() {
-        return None;
+    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+        return SelectOutcome::Unavailable(format!("alternate screen: {e}"));
     }
     let _alt_guard = AltScreenGuard;
     let backend = CrosstermBackend::new(stdout);
-    let Ok(mut terminal) = Terminal::new(backend) else {
-        return None;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(e) => return SelectOutcome::Unavailable(format!("terminal: {e}")),
     };
 
     let mut list = SelectList::new(title, rows);
     loop {
-        if terminal.draw(|f| list.render(f, f.area())).is_err() {
-            return None;
+        if let Err(e) = terminal.draw(|f| list.render(f, f.area())) {
+            return SelectOutcome::Unavailable(format!("draw: {e}"));
         }
         let ev = match event::read() {
             Ok(ev) => ev,
-            Err(_) => return None,
+            Err(e) => return SelectOutcome::Unavailable(format!("read event: {e}")),
         };
         if let Event::Key(key) = ev
             && list.handle_key_event(key)
@@ -192,7 +254,10 @@ pub fn select_indices(title: &str, rows: Vec<Row>) -> Option<Vec<usize>> {
             break;
         }
     }
-    list.confirmed
+    match list.confirmed {
+        Some(indices) => SelectOutcome::Confirmed(indices),
+        None => SelectOutcome::Cancelled,
+    }
 }
 
 #[cfg(test)]
@@ -255,5 +320,72 @@ mod tests {
         let mut l = SelectList::new("pick", Vec::new());
         assert!(l.handle_key(KeyCode::Enter));
         assert_eq!(l.confirmed, Some(Vec::new()));
+    }
+
+    // Review p4r1#1: each "nothing to delete" outcome gets its own message and
+    // exit code — a cancel must never read "Non-interactive".
+    #[test]
+    fn resolve_keeps_cancel_and_non_interactive_apart() {
+        let cancel = resolve(SelectOutcome::Cancelled);
+        let non_tty = resolve(SelectOutcome::NonInteractive);
+
+        assert_eq!(stop_code(&cancel), 0, "a cancel is not an error");
+        assert_eq!(stop_code(&non_tty), 0);
+
+        let cancel_text = resolved_text(&cancel);
+        let non_tty_text = resolved_text(&non_tty);
+        assert!(cancel_text.contains("Cancelled"), "{cancel_text}");
+        assert!(non_tty_text.contains("Non-interactive"), "{non_tty_text}");
+        assert!(
+            !cancel_text.contains("Non-interactive"),
+            "a user's cancel must not be reported as non-interactive: {cancel_text}"
+        );
+    }
+
+    fn stop_code(s: &Selection) -> i32 {
+        match s {
+            Selection::Stop { code, .. } => *code,
+            Selection::Proceed(_) => panic!("expected a stop"),
+        }
+    }
+
+    fn resolved_text(s: &Selection) -> String {
+        match s {
+            Selection::Stop { message, .. } => message.clone(),
+            Selection::Proceed(_) => String::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_proceeds_only_on_a_non_empty_pick() {
+        assert_eq!(
+            resolve(SelectOutcome::Confirmed(vec![2, 0])),
+            Selection::Proceed(vec![2, 0])
+        );
+        match resolve(SelectOutcome::Confirmed(Vec::new())) {
+            Selection::Stop { code, message, .. } => {
+                assert_eq!(code, 0);
+                assert!(message.contains("Nothing selected"), "{message}");
+            }
+            Selection::Proceed(_) => panic!("an empty pick must not proceed"),
+        }
+    }
+
+    // A terminal that fails to initialise is a real error: nonzero exit and
+    // the reason on stderr, not the non-TTY hint.
+    #[test]
+    fn resolve_reports_an_unavailable_terminal_as_an_error() {
+        match resolve(SelectOutcome::Unavailable("raw mode: nope".into())) {
+            Selection::Stop {
+                code,
+                message,
+                is_error,
+            } => {
+                assert_eq!(code, 1);
+                assert!(is_error);
+                assert!(message.contains("raw mode: nope"), "{message}");
+            }
+            Selection::Proceed(_) => panic!("unavailable terminal must not proceed"),
+        }
     }
 }

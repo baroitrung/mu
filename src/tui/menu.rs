@@ -84,6 +84,67 @@ impl HealthSnapshot {
     }
 }
 
+/// Biometrics row state — resolved once per menu entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Biometrics {
+    /// pam_fprintd not installed: no row.
+    #[default]
+    None,
+    /// Installed but not enabled.
+    Available,
+    /// Enabled in the PAM stack.
+    Enabled,
+}
+
+/// The two rows that need the filesystem, resolved once when the menu is
+/// entered instead of on every frame (review p6r1#10).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MenuStatus {
+    pub biometrics: Biometrics,
+    /// A newer release recorded by a previous background check.
+    pub update: Option<String>,
+}
+
+impl MenuStatus {
+    /// Resolve the rows from the real system.
+    pub fn load() -> Self {
+        Self::load_from(
+            &crate::xdg::cache_home().join("mu/last_version_check.json"),
+            &crate::sudo::resolve_pam_path(None),
+        )
+    }
+
+    /// Testable core: `cache_file` is the update cache to read, `pam_path` the
+    /// PAM file whose biometrics state the row shows.
+    pub fn load_from(cache_file: &std::path::Path, pam_path: &std::path::Path) -> Self {
+        let status = crate::sudo::get_status(pam_path);
+        Self {
+            biometrics: biometrics_row(status.enabled, status.module_installed),
+            update: pending_update_from(cache_file),
+        }
+    }
+}
+
+/// Which biometrics row the menu shows, from the PAM state.
+fn biometrics_row(enabled: bool, module_installed: bool) -> Biometrics {
+    if enabled {
+        Biometrics::Enabled
+    } else if module_installed {
+        Biometrics::Available
+    } else {
+        Biometrics::None
+    }
+}
+
+/// The `latest` tag a previous background check recorded, when it is newer
+/// than this build. A missing or malformed cache file means "nothing known".
+fn pending_update_from(cache_file: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(cache_file).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let latest = v.get("latest")?.as_str()?.to_string();
+    crate::update::is_newer_version(&latest, crate::update::current_version()).then_some(latest)
+}
+
 /// Main menu state — mirrors Go's `mainMenuModel`.
 #[derive(Clone, Debug, Default)]
 pub struct MainMenu {
@@ -92,6 +153,8 @@ pub struct MainMenu {
     pub snapshot: Option<HealthSnapshot>,
     pub banner: String,
     pub banner_err: bool,
+    /// Rows resolved when the menu was entered — `render` never reads files.
+    pub status: MenuStatus,
 }
 
 impl MainMenu {
@@ -101,8 +164,16 @@ impl MainMenu {
         Self {
             cursor,
             snapshot,
+            status: MenuStatus::load(),
             ..Default::default()
         }
+    }
+
+    /// Set the pre-resolved status rows (tests, and any caller that already
+    /// knows them). Keeps `render` free of file I/O.
+    pub fn with_status(mut self, status: MenuStatus) -> Self {
+        self.status = status;
+        self
     }
 
     /// Set the transient banner (shown after a subcommand completes).
@@ -239,27 +310,21 @@ impl MainMenu {
             styles::bold_primary(),
         ));
 
-        // Biometric hint
-        let sudo_status = crate::sudo::get_status(&crate::sudo::resolve_pam_path(None));
-        if sudo_status.enabled {
-            lines.push(Line::styled(
+        // Biometric hint — resolved in `MainMenu::new`, never read here.
+        match self.status.biometrics {
+            Biometrics::Enabled => lines.push(Line::styled(
                 "  [Biometrics: Enabled (pam_fprintd)]",
                 styles::faint(),
-            ));
-        } else if sudo_status.module_installed {
-            lines.push(Line::styled(
+            )),
+            Biometrics::Available => lines.push(Line::styled(
                 "  [Biometrics: Available (run 'mu sudo enable')]",
                 styles::faint(),
-            ));
+            )),
+            Biometrics::None => {}
         }
 
-        // Update notice if cached check shows newer version
-        let cache_check = crate::xdg::cache_home().join("mu/last_version_check.json");
-        if let Ok(content) = std::fs::read_to_string(&cache_check)
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content)
-            && let Some(latest) = v.get("latest").and_then(|s| s.as_str())
-            && crate::update::is_newer_version(latest, crate::update::current_version())
-        {
+        // Update notice from the cached check, resolved in `MainMenu::new`.
+        if let Some(latest) = &self.status.update {
             lines.push(Line::styled(
                 format!("  ★ Update available: {latest} (run 'mu update')"),
                 styles::bold_primary(),
@@ -457,6 +522,110 @@ mod tests {
         assert!(content.contains("Mole Ubuntu"));
     }
 
+    /// Render `m` into a 60x20 test terminal and return the screen text.
+    fn render_text(m: &MainMenu) -> String {
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| m.render(f, f.area())).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    fn temp_cache(tag: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mu-menu-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("last_version_check.json");
+        std::fs::write(&file, body).unwrap();
+        file
+    }
+
+    // Review p6r1#10: the biometrics and update rows come from the status the
+    // menu resolved on entry — `render` itself reads no files.
+    #[test]
+    fn render_shows_the_status_captured_on_entry() {
+        let quiet = MainMenu::default().with_status(MenuStatus {
+            biometrics: Biometrics::None,
+            update: None,
+        });
+        let busy = MainMenu::default().with_status(MenuStatus {
+            biometrics: Biometrics::Enabled,
+            update: Some("9.9.9".to_string()),
+        });
+
+        let quiet_text = render_text(&quiet);
+        let busy_text = render_text(&busy);
+
+        assert!(busy_text.contains("Biometrics: Enabled"), "{busy_text}");
+        assert!(busy_text.contains("Update available: 9.9.9"), "{busy_text}");
+        assert!(!quiet_text.contains("Biometrics"), "{quiet_text}");
+        assert!(!quiet_text.contains("Update available"), "{quiet_text}");
+    }
+
+    // The row is resolved once: rewriting the cache after the menu was built
+    // must not change what the next frame shows.
+    #[test]
+    fn render_does_not_reread_the_update_cache() {
+        let cache = temp_cache("reread", r#"{"latest":"9.9.9","checked_at":1}"#);
+        let missing_pam = std::env::temp_dir().join("mu-menu-no-such-pam-file");
+        let status = MenuStatus::load_from(&cache, &missing_pam);
+        assert_eq!(status.update.as_deref(), Some("9.9.9"));
+
+        let menu = MainMenu::default().with_status(status);
+        // A later check records a different version, or the cache disappears.
+        std::fs::write(&cache, r#"{"latest":"0.0.1","checked_at":2}"#).unwrap();
+        assert!(
+            render_text(&menu).contains("Update available: 9.9.9"),
+            "render must use the value resolved on entry"
+        );
+        std::fs::remove_file(&cache).unwrap();
+        assert!(render_text(&menu).contains("Update available: 9.9.9"));
+
+        let _ = std::fs::remove_dir_all(cache.parent().unwrap());
+    }
+
+    // A cache that records an older or equal release shows no notice.
+    #[test]
+    fn menu_status_ignores_a_stale_update_cache() {
+        let missing_pam = std::env::temp_dir().join("mu-menu-no-such-pam-file");
+        for body in [
+            r#"{"latest":"0.0.1","checked_at":1}"#,
+            r#"{"checked_at":1}"#,
+            "not json",
+        ] {
+            let cache = temp_cache("stale", body);
+            let status = MenuStatus::load_from(&cache, &missing_pam);
+            assert_eq!(status.update, None, "body {body}");
+            let _ = std::fs::remove_dir_all(cache.parent().unwrap());
+        }
+    }
+
+    // The biometrics row is a pure function of the PAM state, so all three
+    // rows are provable without touching this host's /etc/pam.d.
+    #[test]
+    fn biometrics_row_covers_the_three_states() {
+        assert_eq!(biometrics_row(true, true), Biometrics::Enabled);
+        assert_eq!(biometrics_row(false, true), Biometrics::Available);
+        assert_eq!(biometrics_row(false, false), Biometrics::None);
+        assert_eq!(
+            biometrics_row(true, false),
+            Biometrics::Enabled,
+            "an enabled PAM entry wins over the module path check"
+        );
+    }
+
     #[test]
     fn render_snapshot_with_data() {
         let snap = HealthSnapshot {
@@ -465,7 +634,8 @@ mod tests {
             mem_total: 16000000,
             disk_free: 55.0,
         };
-        let m = MainMenu::new(0, Some(snap));
+        let mut m = MainMenu::default();
+        m.set_snapshot(snap);
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| m.render(f, f.area())).unwrap();
@@ -482,7 +652,10 @@ mod tests {
 
     #[test]
     fn render_cursor_highlight() {
-        let m = MainMenu::new(1, None); // cursor on "Clean"
+        let m = MainMenu {
+            cursor: 1,
+            ..Default::default()
+        }; // cursor on "Clean"
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| m.render(f, f.area())).unwrap();
@@ -509,7 +682,10 @@ mod tests {
 
     #[test]
     fn render_cursor_highlight_analyze() {
-        let m = MainMenu::new(4, None); // cursor on "Analyze"
+        let m = MainMenu {
+            cursor: 4,
+            ..Default::default()
+        }; // cursor on "Analyze"
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| m.render(f, f.area())).unwrap();
@@ -549,7 +725,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(content.contains("Scanning"));
-        assert!(content.contains("q quit"));
+        assert!(content.contains("[View: Tree]"));
 
         // 'q' returns to menu
         let q_key = crossterm::event::KeyEvent::new(

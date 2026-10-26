@@ -545,6 +545,19 @@ pub fn read_disk_io_full() -> (BTreeMap<String, DiskIOSample>, Option<Error>) {
 }
 
 pub fn read_disk_io_from(reader: impl BufRead) -> (BTreeMap<String, DiskIOSample>, Option<Error>) {
+    read_disk_io_from_with_sysfs(reader, Path::new("/sys/class/block"))
+}
+
+/// Testable core of [`read_disk_io_from`]: `sysfs_block` is the directory that
+/// holds one entry per block device (`/sys/class/block` in production).
+///
+/// The partition check reads that directory, so a fixture reader cannot
+/// exercise it alone — the seam is what makes the filter testable (review
+/// p5r1#2).
+pub fn read_disk_io_from_with_sysfs(
+    reader: impl BufRead,
+    sysfs_block: &Path,
+) -> (BTreeMap<String, DiskIOSample>, Option<Error>) {
     let mut samples = BTreeMap::new();
     let mut scan_errors = Vec::new();
     for line in reader.lines() {
@@ -558,10 +571,7 @@ pub fn read_disk_io_from(reader: impl BufRead) -> (BTreeMap<String, DiskIOSample
             || dev_name.starts_with("ram")
             || dev_name.starts_with("zram")
             || dev_name.starts_with("dm-")
-            || Path::new("/sys/class/block")
-                .join(dev_name)
-                .join("partition")
-                .exists()
+            || sysfs_block.join(dev_name).join("partition").exists()
         {
             continue;
         }
@@ -1336,6 +1346,47 @@ mod tests {
         assert_eq!(sda.sectors_read, 10000);
         assert_eq!(sda.writes, 300);
         assert_eq!(sda.sectors_written, 8000);
+    }
+
+    // Review p5r1#2: the partition/dm- filter decides from sysfs, so the test
+    // supplies its own sysfs root. `mufix0p1` cannot exist in any host's
+    // /sys/class/block, so the result never depends on where this runs.
+    #[test]
+    fn read_disk_io_filters_partitions_and_dm_from_a_fixture_sysfs() {
+        let root = std::env::temp_dir().join(format!("mu_sysfs_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Whole disks: present in sysfs, no `partition` attribute.
+        std::fs::create_dir_all(root.join("sda")).unwrap();
+        std::fs::create_dir_all(root.join("nvme0n1")).unwrap();
+        // Devices sysfs marks as partitions — dropped whatever the host has.
+        std::fs::create_dir_all(root.join("sda1")).unwrap();
+        std::fs::write(root.join("sda1").join("partition"), "1\n").unwrap();
+        std::fs::create_dir_all(root.join("nvme0n1p1")).unwrap();
+        std::fs::write(root.join("nvme0n1p1").join("partition"), "1\n").unwrap();
+        std::fs::create_dir_all(root.join("mufix0p1")).unwrap();
+        std::fs::write(root.join("mufix0p1").join("partition"), "1\n").unwrap();
+
+        let input = b"\
+   8       0 sda 500 10 10000 120 300 20 8000 140 0 20 50
+   8       1 sda1 100 0 800 10 50 0 400 5 0 5 10
+ 259       0 nvme0n1 1200 50 40000 200 800 30 24000 300 0 30 90
+ 259       1 nvme0n1p1 100 0 800 10 50 0 400 5 0 5 10
+ 253       0 dm-0 10 0 80 1 5 0 40 0 0 1 2
+   7       0 loop0 100 0 1000 50 200 0 2000 60 0 10 20
+ 999       0 mufix0p1 10 0 80 1 5 0 40 0 0 1 2
+";
+        let (samples, err) = read_disk_io_from_with_sysfs(input.as_slice(), &root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(err.is_none());
+        let names: Vec<&str> = samples.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["nvme0n1", "sda"], "kept: {names:?}");
+        for skipped in ["sda1", "nvme0n1p1", "dm-0", "loop0", "mufix0p1"] {
+            assert!(
+                !samples.contains_key(skipped),
+                "{skipped} must be filtered, kept {names:?}"
+            );
+        }
     }
 
     #[test]

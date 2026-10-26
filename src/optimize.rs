@@ -807,6 +807,22 @@ fn is_process_running(name: &str) -> bool {
     false
 }
 
+/// SQLite writes its write-ahead log and rollback journal beside the database
+/// as `<file>-wal` / `<file>-journal`. Chrome's databases have no extension
+/// (`History`), so `Path::with_extension` cannot name them; append instead
+/// (review rvp3#11).
+fn sqlite_sidecar(db: &Path, suffix: &str) -> PathBuf {
+    let mut name = db.as_os_str().to_os_string();
+    name.push(format!("-{suffix}"));
+    PathBuf::from(name)
+}
+
+/// Whether SQLite holds a live journal beside `db` — a vacuum must not run
+/// then.
+fn sqlite_sidecar_locked(db: &Path) -> bool {
+    sqlite_sidecar(db, "wal").exists() || sqlite_sidecar(db, "journal").exists()
+}
+
 fn sqlite_vacuum(runner: &dyn Runner, home: &Path, out: &mut dyn Write) -> Result<()> {
     if runner.look_path("sqlite3").is_err() {
         let _ = writeln!(out, "sqlite3 not found in PATH; skipped");
@@ -846,9 +862,7 @@ fn sqlite_vacuum(runner: &dyn Runner, home: &Path, out: &mut dyn Write) -> Resul
             );
             continue;
         }
-        let wal = db.with_extension("sqlite-wal");
-        let journal = db.with_extension("sqlite-journal");
-        if wal.exists() || journal.exists() {
+        if sqlite_sidecar_locked(&db) {
             let _ = writeln!(
                 out,
                 "sqlite: skipping {} (active lock/journal)",
@@ -1252,6 +1266,35 @@ mod tests {
 
     fn spec(argv: &[&str]) -> CommandSpec {
         CommandSpec::new(argv[0], &argv[1..])
+    }
+
+    // Review rvp3#11: a live `-wal` / `-journal` beside an extension-less
+    // Chrome database must block the vacuum. The sidecar check is host-free,
+    // unlike the step's process-name filters.
+    #[test]
+    fn sqlite_sidecar_lock_is_detected_for_extension_less_databases() {
+        let home = tempdir("sqlite-sidecar");
+        let history = home.join("History");
+        let places = home.join("places.sqlite");
+        let plain = home.join("plain.sqlite");
+        for db in [&history, &places, &plain] {
+            fs::write(db, b"db").unwrap();
+        }
+        // Chrome writes `<db>-wal`, not `<db>.sqlite-wal`.
+        fs::write(home.join("History-wal"), b"wal").unwrap();
+        fs::write(home.join("places.sqlite-journal"), b"journal").unwrap();
+
+        assert!(sqlite_sidecar_locked(&history), "History-wal must block");
+        assert!(
+            sqlite_sidecar_locked(&places),
+            "places.sqlite-journal must block"
+        );
+        assert!(
+            !sqlite_sidecar_locked(&plain),
+            "a database without sidecars must be vacuumable"
+        );
+
+        fs::remove_dir_all(&home).ok();
     }
 
     // Port of TestStepIDs.

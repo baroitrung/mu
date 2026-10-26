@@ -9,14 +9,16 @@ use crate::error::Result;
 use crate::oplog;
 use crate::size;
 use crate::trash;
+use crate::tui::select::{self, SelectOutcome, Selection};
 use crate::xdg;
 
 pub use model::Options;
 
-/// Interactive selection hook (review F4). `None` means "not interactive"
-/// (stdout is not a TTY) — the caller then falls back to the headless
-/// `--yes` gate. `Some(indices)` is the chosen subset (possibly empty).
-pub type SelectFn = Box<dyn Fn(&[model::PurgeArtifact]) -> Option<Vec<usize>>>;
+/// Interactive selection hook (review F4). A non-TTY (or a stdin without a
+/// keyboard) reports [`SelectOutcome::NonInteractive`] so the caller falls
+/// back to the headless `--yes` gate, while a user's own cancel stays
+/// [`SelectOutcome::Cancelled`] — the two are never conflated (review p4r1#1).
+pub type SelectFn = Box<dyn Fn(&[model::PurgeArtifact]) -> SelectOutcome>;
 /// Deletion hook; production always routes through `trash::safe_delete`.
 pub type DeleteFn = Box<dyn Fn(&Path) -> Result<()>>;
 
@@ -134,17 +136,20 @@ pub(crate) fn run_in(opts: &Options, deps: &Deps) -> i32 {
     let selected: Vec<&model::PurgeArtifact> = if opts.auto_yes {
         all_artifacts.iter().collect()
     } else {
-        match (deps.select)(&all_artifacts) {
-            None => {
-                println!("\nNon-interactive: pass --yes to confirm, or --dry-run to preview.");
-                println!("Aborted.");
-                return 0;
+        match select::resolve((deps.select)(&all_artifacts)) {
+            Selection::Stop {
+                code,
+                message,
+                is_error,
+            } => {
+                if is_error {
+                    eprintln!("{message}");
+                } else {
+                    println!("\n{message}");
+                }
+                return code;
             }
-            Some(indices) if indices.is_empty() => {
-                println!("\nNothing selected. Aborted.");
-                return 0;
-            }
-            Some(indices) => indices
+            Selection::Proceed(indices) => indices
                 .iter()
                 .filter_map(|&i| all_artifacts.get(i))
                 .collect(),
@@ -154,6 +159,7 @@ pub(crate) fn run_in(opts: &Options, deps: &Deps) -> i32 {
     // Non-dry-run execution: route strictly through the SafeDelete seam.
     let mut deleted_count = 0;
     let mut freed_bytes = 0;
+    let attempted = selected.len();
     for a in selected {
         match (deps.delete)(&a.path) {
             Ok(()) => {
@@ -173,6 +179,12 @@ pub(crate) fn run_in(opts: &Options, deps: &Deps) -> i32 {
         deleted_count,
         size::human_size(freed_bytes as i64)
     );
+    // Review rvp4#6: a run where every deletion failed must not look like
+    // success to a script.
+    if attempted > 0 && deleted_count == 0 {
+        eprintln!("error: every artifact failed to trash — nothing was deleted");
+        return 1;
+    }
     0
 }
 
@@ -254,8 +266,8 @@ mod tests {
         let proj = marked_project(&root, "proj", "target");
         let sentinel = proj.join("target").join("output.bin");
 
-        // Non-TTY: the selector reports "not interactive" (None).
-        let (deps, deleted) = test_deps(&root, Box::new(|_| None));
+        // Non-TTY: the selector reports "not interactive".
+        let (deps, deleted) = test_deps(&root, Box::new(|_| SelectOutcome::NonInteractive));
         let opts = Options {
             paths: vec![root.clone()],
             dry_run: false,
@@ -273,6 +285,107 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Review p4r1#1: a user pressing q/Esc on a TTY must see a cancel, not
+    // the "Non-interactive" text meant for a caller with no terminal.
+    #[test]
+    fn purge_cancel_is_not_reported_as_non_interactive() {
+        let root = tempdir("cancel");
+        let proj = marked_project(&root, "proj", "target");
+        let sentinel = proj.join("target").join("output.bin");
+
+        let (deps, deleted) = test_deps(&root, Box::new(|_| SelectOutcome::Cancelled));
+        let opts = Options {
+            paths: vec![root.clone()],
+            dry_run: false,
+            auto_yes: false,
+            include_empty: false,
+            debug: false,
+        };
+
+        assert_eq!(run_in(&opts, &deps), 0, "a cancel is not an error");
+        assert!(
+            sentinel.exists(),
+            "cancelled purge must not delete anything"
+        );
+        assert!(deleted.lock().unwrap().is_empty());
+
+        oplog::close_logger();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Review p4r1#1: the two "nothing was deleted" paths are distinct — the
+    // real selector reports non-interactive only when there is no TTY.
+    #[test]
+    fn purge_non_tty_selector_reports_non_interactive() {
+        // No TTY in the test process: the real selector says exactly that.
+        assert_eq!(
+            crate::tui::select::select_indices("pick", vec![("/tmp/a".into(), "1 B".into())]),
+            SelectOutcome::NonInteractive
+        );
+    }
+
+    // Review rvp4#6: when every deletion fails the run must not exit 0.
+    #[test]
+    fn purge_exits_nonzero_when_every_deletion_fails() {
+        let root = tempdir("allfail");
+        let proj = marked_project(&root, "proj", "target");
+        let sentinel = proj.join("target").join("output.bin");
+
+        // `--yes` selects everything; the delete seam fails every call.
+        let deps = Deps {
+            config_home: root.join("config-home"),
+            data_home: root.join("data-home"),
+            no_oplog: true,
+            select: Box::new(|_| panic!("--yes must not prompt")),
+            delete: Box::new(|_| Err(crate::error::Error::Msg("trash unavailable".into()))),
+        };
+        let opts = Options {
+            paths: vec![root.clone()],
+            dry_run: false,
+            auto_yes: true,
+            include_empty: false,
+            debug: false,
+        };
+
+        assert_eq!(run_in(&opts, &deps), 1, "all-fail must be nonzero");
+        assert!(sentinel.exists());
+
+        oplog::close_logger();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // A mixed run still exits 0 — the item is only about the all-fail case.
+    #[test]
+    fn purge_exits_zero_when_at_least_one_deletion_succeeds() {
+        let root = tempdir("mixed");
+        marked_project(&root, "proj", "target");
+
+        let deps = Deps {
+            config_home: root.join("config-home"),
+            data_home: root.join("data-home"),
+            no_oplog: true,
+            select: Box::new(|_| panic!("--yes must not prompt")),
+            delete: Box::new(|p| {
+                if p.ends_with("target") {
+                    Ok(())
+                } else {
+                    Err(crate::error::Error::Msg("trash unavailable".into()))
+                }
+            }),
+        };
+        let opts = Options {
+            paths: vec![root.clone()],
+            dry_run: false,
+            auto_yes: true,
+            include_empty: false,
+            debug: false,
+        };
+
+        assert_eq!(run_in(&opts, &deps), 0);
+        oplog::close_logger();
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // Review F1: a destructive command must open the operations log itself;
     // the dry-run path proves it because `log_outcome` writes only while
     // `LOG_FILE` is open.
@@ -281,7 +394,7 @@ mod tests {
         let root = tempdir("log");
         marked_project(&root, "proj", "target");
 
-        let (deps, _deleted) = test_deps(&root, Box::new(|_| None));
+        let (deps, _deleted) = test_deps(&root, Box::new(|_| SelectOutcome::NonInteractive));
         let opts = Options {
             paths: vec![root.clone()],
             dry_run: true,
@@ -313,7 +426,7 @@ mod tests {
             &root,
             Box::new(|items| {
                 assert_eq!(items.len(), 2, "both candidates offered");
-                Some(vec![0])
+                SelectOutcome::Confirmed(vec![0])
             }),
         );
         let opts = Options {
@@ -348,7 +461,7 @@ mod tests {
         let root = tempdir("none");
         let proj = marked_project(&root, "proj", "target");
 
-        let (deps, deleted) = test_deps(&root, Box::new(|_| Some(Vec::new())));
+        let (deps, deleted) = test_deps(&root, Box::new(|_| SelectOutcome::Confirmed(Vec::new())));
         let opts = Options {
             paths: vec![root.clone()],
             dry_run: false,
@@ -375,7 +488,10 @@ mod tests {
         let proj = marked_project(&root, "proj", "target");
         let sentinel = proj.join("target").join("output.bin");
 
-        let (deps, deleted) = test_deps(&root, Box::new(|_| panic!("bad config must not reach select")));
+        let (deps, deleted) = test_deps(
+            &root,
+            Box::new(|_| panic!("bad config must not reach select")),
+        );
         let opts = Options {
             paths: vec![root.clone()],
             dry_run: true,
@@ -386,7 +502,10 @@ mod tests {
 
         let code = run_in(&opts, &deps);
         assert_eq!(code, 1, "malformed config must cause nonzero exit");
-        assert!(sentinel.exists(), "malformed config must not delete anything");
+        assert!(
+            sentinel.exists(),
+            "malformed config must not delete anything"
+        );
         assert!(deleted.lock().unwrap().is_empty());
 
         let _ = fs::remove_dir_all(&root);

@@ -397,6 +397,9 @@ mod tests {
         };
 
         let code = run(&opts);
-        assert_eq!(code, 1, "non-interactive remove without --yes must return 1");
+        assert_eq!(
+            code, 1,
+            "non-interactive remove without --yes must return 1"
+        );
     }
 }

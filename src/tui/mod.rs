@@ -301,6 +301,7 @@ pub fn run_analyze_tui(
         while let Ok(msg) = rx.try_recv() {
             tui.apply_message(msg);
         }
+        tui.poll_delete();
 
         if event::poll(std::time::Duration::from_millis(60))? {
             match event::read()? {
