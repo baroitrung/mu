@@ -237,6 +237,8 @@ pub(crate) fn kernels_target_in(deps: &Deps) -> CleanTarget {
         label: "APT Autoremove Candidates",
         requires_sudo: true,
         opt_in: false,
+        // APT autoremove candidates are managed via apt-get; no static directory root.
+        roots: Vec::new(),
         scan: Box::new(move || {
             scan_load();
             let c = scan_cache.borrow();

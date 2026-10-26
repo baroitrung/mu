@@ -58,6 +58,8 @@ pub(crate) fn snap_target_in(deps: &Deps) -> CleanTarget {
         label: "Snap Disabled Revisions",
         requires_sudo: true,
         opt_in: false,
+        // Disabled snap revisions are managed via the snap CLI; no static directory root.
+        roots: Vec::new(),
         scan: Box::new(move || {
             if snap_missing {
                 return (0, None);

@@ -2,7 +2,8 @@
 //!
 //! Keys cache entries by schema version and canonical root path.
 //! Writes atomically via temporary files on the same filesystem.
-//! Read errors, corrupt files, and schema mismatches are treated as cache misses.
+//! Read errors, corrupt files, schema mismatches, and payloads over
+//! [`MAX_CACHE_BYTES`] are treated as cache misses.
 
 use std::fs;
 use std::io::Write;
@@ -16,6 +17,15 @@ use crate::analyze::model::{FileNode, ScanStats};
 
 /// Schema version for disk analysis cache payloads.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Upper bound on the on-disk size of a single cache entry (64 MiB).
+///
+/// A payload serializes to roughly 420 bytes per scanned entry, so a project
+/// with tens of thousands of files fits comfortably, while a `$HOME` or `/`
+/// scan (millions of entries) would be hundreds of MB. Such a file is never
+/// worth writing: the next run would have to read it back whole. Oversized
+/// payloads are silently not cached, and the next run scans again.
+pub const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Cache record stored on disk as JSON.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,7 +78,22 @@ pub fn load_cache(root: &Path) -> Option<(FileNode, ScanStats)> {
 
 /// Load cached scan results from a specified cache home.
 pub fn load_cache_in(cache_home: &Path, root: &Path) -> Option<(FileNode, ScanStats)> {
+    load_cache_limited(cache_home, root, MAX_CACHE_BYTES)
+}
+
+fn load_cache_limited(
+    cache_home: &Path,
+    root: &Path,
+    max_bytes: u64,
+) -> Option<(FileNode, ScanStats)> {
     let path = cache_path_in(cache_home, root);
+    let len = fs::metadata(&path).ok()?.len();
+    if len > max_bytes {
+        // Written before the size guard existed, or the limit shrank: drop it
+        // so it cannot linger. It is a miss either way.
+        let _ = fs::remove_file(&path);
+        return None;
+    }
     let content = fs::read_to_string(&path).ok()?;
     let entry: CacheEntry = serde_json::from_str(&content).ok()?;
     if entry.schema_version != SCHEMA_VERSION {
@@ -78,24 +103,37 @@ pub fn load_cache_in(cache_home: &Path, root: &Path) -> Option<(FileNode, ScanSt
 }
 
 /// Atomically write scan results to cache under `$XDG_CACHE_HOME/mu/analyze`.
+///
+/// Returns `Ok(None)` when the serialized payload exceeds [`MAX_CACHE_BYTES`];
+/// nothing is written in that case.
 pub fn save_cache(
     root: &Path,
     root_node: &FileNode,
     stats: &ScanStats,
-) -> Result<PathBuf, std::io::Error> {
+) -> Result<Option<PathBuf>, std::io::Error> {
     save_cache_in(&crate::xdg::cache_home(), root, root_node, stats)
 }
 
 /// Atomically write scan results to cache under a specified cache home.
+///
+/// Returns `Ok(None)` when the serialized payload exceeds [`MAX_CACHE_BYTES`];
+/// nothing is written in that case.
 pub fn save_cache_in(
     cache_home: &Path,
     root: &Path,
     root_node: &FileNode,
     stats: &ScanStats,
-) -> Result<PathBuf, std::io::Error> {
-    let dir = cache_dir_in(cache_home);
-    fs::create_dir_all(&dir)?;
+) -> Result<Option<PathBuf>, std::io::Error> {
+    save_cache_limited(cache_home, root, root_node, stats, MAX_CACHE_BYTES)
+}
 
+fn save_cache_limited(
+    cache_home: &Path,
+    root: &Path,
+    root_node: &FileNode,
+    stats: &ScanStats,
+    max_bytes: u64,
+) -> Result<Option<PathBuf>, std::io::Error> {
     let target_path = cache_path_in(cache_home, root);
     let entry = CacheEntry {
         schema_version: SCHEMA_VERSION,
@@ -106,6 +144,13 @@ pub fn save_cache_in(
 
     let json_bytes = serde_json::to_vec_pretty(&entry)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    if json_bytes.len() as u64 > max_bytes {
+        return Ok(None);
+    }
+
+    let dir = cache_dir_in(cache_home);
+    fs::create_dir_all(&dir)?;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -125,7 +170,7 @@ pub fn save_cache_in(
         return Err(e);
     }
 
-    Ok(target_path)
+    Ok(Some(target_path))
 }
 
 /// Invalidate (remove) the cached scan for the given root path.
@@ -182,7 +227,8 @@ mod tests {
         let (orig_root, orig_stats) = sample_tree(&scan_root);
 
         let saved_path = save_cache_in(&cache_home, &scan_root, &orig_root, &orig_stats)
-            .expect("save_cache must succeed");
+            .expect("save_cache must succeed")
+            .expect("a small payload must be written");
         assert!(saved_path.exists(), "cache file must exist");
 
         let loaded = load_cache_in(&cache_home, &scan_root);
@@ -209,6 +255,61 @@ mod tests {
         assert_eq!(loaded_stats.total_dirs, orig_stats.total_dirs);
         assert_eq!(loaded_stats.errors, orig_stats.errors);
         assert_eq!(loaded_stats.largest_files, orig_stats.largest_files);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_oversized_payload_is_not_saved() {
+        let temp = test_temp_dir("oversized-save");
+        let cache_home = temp.join("cache");
+        let scan_root = temp.join("scandir");
+        fs::create_dir_all(&scan_root).unwrap();
+
+        let (root, stats) = sample_tree(&scan_root);
+        let saved = save_cache_limited(&cache_home, &scan_root, &root, &stats, 16)
+            .expect("an oversized payload is not an error");
+        assert_eq!(saved, None, "nothing may be written over the size limit");
+        assert!(
+            !cache_path_in(&cache_home, &scan_root).exists(),
+            "oversized payload must leave no cache file"
+        );
+        assert!(
+            !cache_dir_in(&cache_home).exists(),
+            "oversized payload must not even create the cache directory"
+        );
+        assert!(
+            load_cache_in(&cache_home, &scan_root).is_none(),
+            "a scan with no cache file must be a miss"
+        );
+
+        // Same payload under a limit it fits: the guard must not block writes.
+        let saved = save_cache_in(&cache_home, &scan_root, &root, &stats).unwrap();
+        assert!(saved.is_some(), "a small payload must be written");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_oversized_cache_file_on_disk_is_miss_and_pruned() {
+        let temp = test_temp_dir("oversized-load");
+        let cache_home = temp.join("cache");
+        let scan_root = temp.join("scandir");
+        fs::create_dir_all(&scan_root).unwrap();
+
+        let (root, stats) = sample_tree(&scan_root);
+        let path = save_cache_in(&cache_home, &scan_root, &root, &stats)
+            .unwrap()
+            .expect("small payload is written");
+        assert!(path.exists());
+
+        // A file left by an older build (or a lower limit) is over the current
+        // budget: it must be a miss, and must not stay on disk.
+        assert!(load_cache_limited(&cache_home, &scan_root, 16).is_none());
+        assert!(
+            !path.exists(),
+            "an oversized cache file must be dropped on load"
+        );
 
         let _ = fs::remove_dir_all(&temp);
     }
@@ -270,7 +371,9 @@ mod tests {
         fs::create_dir_all(&scan_root).unwrap();
 
         let (orig_root, orig_stats) = sample_tree(&scan_root);
-        let path = save_cache_in(&cache_home, &scan_root, &orig_root, &orig_stats).unwrap();
+        let path = save_cache_in(&cache_home, &scan_root, &orig_root, &orig_stats)
+            .unwrap()
+            .expect("a small payload must be written");
         assert!(path.exists(), "cache file must exist prior to invalidation");
 
         invalidate_cache_in(&cache_home, &scan_root);
@@ -325,7 +428,9 @@ mod tests {
         fs::create_dir_all(&scan_root).unwrap();
 
         let (orig_root, orig_stats) = sample_tree(&scan_root);
-        let target = save_cache_in(&cache_home, &scan_root, &orig_root, &orig_stats).unwrap();
+        let target = save_cache_in(&cache_home, &scan_root, &orig_root, &orig_stats)
+            .unwrap()
+            .expect("a small payload must be written");
         assert!(target.exists());
 
         let dir = cache_dir_in(&cache_home);

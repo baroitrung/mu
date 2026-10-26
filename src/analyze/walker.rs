@@ -121,6 +121,8 @@ pub fn scan_path(
     cancel: Arc<AtomicBool>,
 ) -> Result<(FileNode, ScanStats), String> {
     let start_time = Instant::now();
+    // A bypassing scan (`--json`) never reads the cache, so it must not write one.
+    let bypass_cache = options.bypass_cache;
 
     let root_meta = match fs::metadata(root_path).or_else(|_| fs::symlink_metadata(root_path)) {
         Ok(m) => m,
@@ -134,7 +136,7 @@ pub fn scan_path(
         }
     };
 
-    if !options.bypass_cache
+    if !bypass_cache
         && !cancel.load(Ordering::Relaxed)
         && let Some((cached_root, cached_stats)) = crate::analyze::cache::load_cache(root_path)
     {
@@ -183,7 +185,7 @@ pub fn scan_path(
         largest_files,
     };
 
-    if !cancel.load(Ordering::Relaxed) {
+    if !bypass_cache && !cancel.load(Ordering::Relaxed) {
         let _ = crate::analyze::cache::save_cache(root_path, &root_node, &stats);
     }
 
@@ -397,6 +399,68 @@ mod tests {
         let (root, _) = scan_path(&dir, WalkerOptions::default(), None, cancel).unwrap();
         assert!(root.children.is_empty());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_bypass_cache_scan_does_not_write_cache() {
+        let dir = tempdir("bypass-nowrite");
+        fs::write(dir.join("file.txt"), [b'x'; 64].as_slice()).unwrap();
+        let cache_file = crate::analyze::cache::cache_path(&dir);
+        let _ = fs::remove_file(&cache_file);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let opts = WalkerOptions {
+            bypass_cache: true,
+            ..WalkerOptions::default()
+        };
+        let (_, stats) = scan_path(&dir, opts, None, cancel).unwrap();
+        assert_eq!(stats.total_files, 1);
+        assert!(
+            !cache_file.exists(),
+            "a bypassing scan must not write a cache file"
+        );
+
+        // The paired caching scan proves the assertion above can see a write.
+        let cancel = Arc::new(AtomicBool::new(false));
+        scan_path(&dir, WalkerOptions::default(), None, cancel).unwrap();
+        assert!(
+            cache_file.exists(),
+            "a non-bypassing scan must seed the cache"
+        );
+
+        crate::analyze::cache::invalidate_cache(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_warm_scan_reads_cache_without_rescanning() {
+        let dir = tempdir("warm");
+        fs::write(dir.join("a.txt"), [b'a'; 100].as_slice()).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_, first) = scan_path(&dir, WalkerOptions::default(), None, cancel).unwrap();
+        assert_eq!(first.total_bytes, 100);
+
+        // Disk changed after the cached scan: a warm run reports the cached
+        // tree, which is what makes the second TUI run cheap.
+        fs::write(dir.join("b.txt"), [b'b'; 4000].as_slice()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_, second) = scan_path(&dir, WalkerOptions::default(), None, cancel).unwrap();
+        assert_eq!(second.total_bytes, 100);
+        assert_eq!(second.total_files, 1);
+
+        // Bypassing always sees the real disk.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let opts = WalkerOptions {
+            bypass_cache: true,
+            ..WalkerOptions::default()
+        };
+        let (_, fresh) = scan_path(&dir, opts, None, cancel).unwrap();
+        assert_eq!(fresh.total_bytes, 4100);
+        assert_eq!(fresh.total_files, 2);
+
+        crate::analyze::cache::invalidate_cache(&dir);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -48,6 +48,7 @@ pub struct CleanTarget {
     pub requires_sudo: bool,
     /// Go `OptIn` — only included when the ID appears in `--include`.
     pub opt_in: bool,
+    pub roots: Vec<PathBuf>,
     pub scan: ScanFn,
     /// Go `Preview func() ([]string, error)` is nil-able — `None` here. The
     /// payload is a pair because Go targets can return a partial preview
@@ -657,6 +658,7 @@ mod tests {
             label: id,
             requires_sudo: false,
             opt_in: false,
+            roots: Vec::new(),
             scan: Box::new(|| (0, None)),
             preview: None,
             execute: Box::new(execute),

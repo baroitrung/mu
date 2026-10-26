@@ -78,6 +78,8 @@ pub(crate) fn new_docker_target_in(deps: &Deps) -> CleanTarget {
         label: "Docker Build Cache",
         requires_sudo: false,
         opt_in: true,
+        // Docker build cache is managed via the docker daemon/CLI; no filesystem directory root.
+        roots: Vec::new(),
         scan: Box::new(move || {
             match scan_runner.run(&CommandSpec::new(
                 "docker",
