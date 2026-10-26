@@ -153,10 +153,14 @@ pub struct AnalyzeTui {
     pub confirm_cursor: usize,
     /// Multi-selected paths for batch operations.
     pub selected_paths: HashSet<PathBuf>,
-    /// Whether user is actively typing a name filter.
+    /// Whether user is actively typing a name filter in Tree view.
     pub filter_mode: bool,
-    /// Current search/filter string.
+    /// Current search/filter string in Tree view.
     pub filter_text: String,
+    /// Whether user is actively typing a filter query in LargestFiles view.
+    pub large_filter_mode: bool,
+    /// Current search/filter string in LargestFiles view.
+    pub large_filter: String,
     pub message: Option<(String, bool)>,
     pub scanning: bool,
     pub spinner_idx: usize,
@@ -534,6 +538,12 @@ pub fn row_cells(item: &RowItem) -> Vec<Span<'static>> {
 
     spans
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAction {
+    OpenDir,
+    RevealFile,
+}
+
 impl AnalyzeTui {
     pub fn new(dry_run: bool) -> Self {
         let clean_roots = crate::clean::clean_target_roots();
@@ -559,6 +569,8 @@ impl AnalyzeTui {
             selected_paths: HashSet::new(),
             filter_mode: false,
             filter_text: String::new(),
+            large_filter_mode: false,
+            large_filter: String::new(),
             message: None,
             scanning: true,
             spinner_idx: 0,
@@ -742,6 +754,51 @@ impl AnalyzeTui {
         }
     }
 
+    /// Returns the largest files matching the large filter (or all largest files if no filter).
+    pub fn filtered_largest_files(&self) -> Vec<&LargestFile> {
+        let query = self.large_filter.trim().to_lowercase();
+        if query.is_empty() {
+            self.largest_files.iter().collect()
+        } else {
+            self.largest_files
+                .iter()
+                .filter(|file| {
+                    let path_str = file.path.to_string_lossy().to_lowercase();
+                    let name = file
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_lowercase())
+                        .unwrap_or_default();
+                    name.contains(&query) || path_str.contains(&query)
+                })
+                .collect()
+        }
+    }
+
+    /// Clamps cursor and scroll_off to valid range for the current view.
+    pub fn clamp_cursor(&mut self) {
+        let max_items = match self.view_mode {
+            ViewMode::Overview => self.overview_locations().len(),
+            ViewMode::Tree => self.filtered_children().len(),
+            ViewMode::LargestFiles => self.filtered_largest_files().len(),
+        };
+        if max_items == 0 {
+            self.cursor = 0;
+            self.scroll_off = 0;
+        } else {
+            if self.cursor >= max_items {
+                self.cursor = max_items - 1;
+            }
+            let visible_height = self.window_h.saturating_sub(6) as usize;
+            if visible_height > 0 && self.cursor >= self.scroll_off + visible_height {
+                self.scroll_off = self.cursor.saturating_sub(visible_height) + 1;
+            } else if self.cursor < self.scroll_off {
+                self.scroll_off = self.cursor;
+            }
+        }
+    }
+
     /// Returns the currently highlighted child under the cursor in the current view.
     pub fn current_child(&self) -> Option<(usize, &FileNode)> {
         if self.view_mode != ViewMode::Tree {
@@ -810,6 +867,7 @@ impl AnalyzeTui {
             match key.code {
                 KeyCode::Esc
                 | KeyCode::Char('q')
+                | KeyCode::Char('Q')
                 | KeyCode::Char('p')
                 | KeyCode::Char('P')
                 | KeyCode::Enter => {
@@ -823,6 +881,36 @@ impl AnalyzeTui {
         // Modal confirmation dialog handling
         if self.is_confirm_open() {
             return self.handle_confirm_key(key);
+        }
+
+        // Largest files filter typing mode handling
+        if self.large_filter_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.large_filter.clear();
+                    self.large_filter_mode = false;
+                    self.clamp_cursor();
+                }
+                KeyCode::Enter => {
+                    self.large_filter_mode = false;
+                }
+                KeyCode::Backspace => {
+                    self.large_filter.pop();
+                    self.clamp_cursor();
+                }
+                KeyCode::Down => {
+                    self.navigate_down();
+                }
+                KeyCode::Up => {
+                    self.navigate_up_cursor();
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    self.large_filter.push(c);
+                    self.clamp_cursor();
+                }
+                _ => {}
+            }
+            return false;
         }
 
         // Filter typing mode handling
@@ -861,13 +949,13 @@ impl AnalyzeTui {
         // Overview mode handling
         if self.view_mode == ViewMode::Overview {
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
                     self.navigate_up_cursor();
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
                     self.navigate_down();
                 }
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
                     self.enter_overview_location();
                 }
                 KeyCode::Char('r') | KeyCode::Char('R') => {
@@ -876,7 +964,7 @@ impl AnalyzeTui {
                 KeyCode::Char('o') | KeyCode::Char('O') => {
                     self.trigger_open_dir();
                 }
-                KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                     return true;
                 }
                 _ => {}
@@ -885,7 +973,7 @@ impl AnalyzeTui {
         }
 
         match key.code {
-            KeyCode::Char('q') => {
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
                 if !self.path_indices.is_empty() {
                     self.navigate_up();
                 } else if self.has_overview {
@@ -897,12 +985,19 @@ impl AnalyzeTui {
                 }
             }
             KeyCode::Esc => {
-                if !self.filter_text.is_empty() {
+                if self.view_mode == ViewMode::LargestFiles {
+                    if !self.large_filter.is_empty() {
+                        self.large_filter.clear();
+                        self.clamp_cursor();
+                    } else {
+                        self.view_mode = ViewMode::Tree;
+                        self.cursor = 0;
+                        self.scroll_off = 0;
+                    }
+                } else if !self.filter_text.is_empty() {
                     self.filter_text.clear();
                     self.cursor = 0;
                     self.scroll_off = 0;
-                } else if self.view_mode == ViewMode::LargestFiles {
-                    self.view_mode = ViewMode::Tree;
                 } else if !self.path_indices.is_empty() {
                     self.navigate_up();
                 } else if self.has_overview {
@@ -913,10 +1008,14 @@ impl AnalyzeTui {
                     return true;
                 }
             }
-            KeyCode::Tab => {
+            KeyCode::Tab | KeyCode::Char('t') | KeyCode::Char('T') => {
                 self.view_mode = match self.view_mode {
                     ViewMode::Tree => ViewMode::LargestFiles,
-                    ViewMode::LargestFiles => ViewMode::Tree,
+                    ViewMode::LargestFiles => {
+                        self.large_filter.clear();
+                        self.large_filter_mode = false;
+                        ViewMode::Tree
+                    }
                     ViewMode::Overview => ViewMode::Overview,
                 };
                 self.cursor = 0;
@@ -940,28 +1039,44 @@ impl AnalyzeTui {
             KeyCode::Char('p') | KeyCode::Char('P') => {
                 self.trigger_preview();
             }
-            KeyCode::Char('/') if self.view_mode == ViewMode::Tree => {
-                self.filter_mode = true;
+            KeyCode::Char('/') => {
+                if self.view_mode == ViewMode::Tree {
+                    self.filter_mode = true;
+                } else if self.view_mode == ViewMode::LargestFiles {
+                    self.large_filter_mode = true;
+                }
             }
-            KeyCode::Char(' ') if self.view_mode == ViewMode::Tree => {
+            KeyCode::Char(' ')
+                if self.view_mode == ViewMode::Tree || self.view_mode == ViewMode::LargestFiles =>
+            {
                 self.toggle_select_current();
             }
             KeyCode::Backspace | KeyCode::Delete if self.view_mode == ViewMode::Tree => {
                 self.trigger_batch_delete();
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
                 self.navigate_down();
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.navigate_up_cursor();
             }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
                 if self.view_mode == ViewMode::Tree {
                     self.navigate_into();
                 }
             }
-            KeyCode::Left | KeyCode::Char('h') => {
-                if self.view_mode == ViewMode::Tree {
+            KeyCode::Left
+            | KeyCode::Char('h')
+            | KeyCode::Char('H')
+            | KeyCode::Char('b')
+            | KeyCode::Char('B') => {
+                if self.view_mode == ViewMode::LargestFiles {
+                    self.large_filter.clear();
+                    self.large_filter_mode = false;
+                    self.view_mode = ViewMode::Tree;
+                    self.cursor = 0;
+                    self.scroll_off = 0;
+                } else if self.view_mode == ViewMode::Tree {
                     if !self.path_indices.is_empty() {
                         self.navigate_up();
                     } else if self.has_overview {
@@ -985,11 +1100,13 @@ impl AnalyzeTui {
             KeyCode::Left
             | KeyCode::Right
             | KeyCode::Char('h')
+            | KeyCode::Char('H')
             | KeyCode::Char('l')
+            | KeyCode::Char('L')
             | KeyCode::Tab => {
                 self.confirm_cursor = if self.confirm_cursor == 0 { 1 } else { 0 };
             }
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                 self.confirm_delete = None;
                 self.confirm_batch = None;
             }
@@ -1014,7 +1131,7 @@ impl AnalyzeTui {
         let max_items = match self.view_mode {
             ViewMode::Overview => self.overview_locations().len(),
             ViewMode::Tree => self.filtered_children().len(),
-            ViewMode::LargestFiles => self.largest_files.len(),
+            ViewMode::LargestFiles => self.filtered_largest_files().len(),
         };
 
         if max_items > 0 && self.cursor < max_items - 1 {
@@ -1071,11 +1188,23 @@ impl AnalyzeTui {
     }
 
     fn toggle_select_current(&mut self) {
-        let Some((_, child)) = self.current_child() else {
-            return;
+        let target_path = match self.view_mode {
+            ViewMode::Tree => {
+                let Some((_, child)) = self.current_child() else {
+                    return;
+                };
+                child.path.clone()
+            }
+            ViewMode::LargestFiles => {
+                let filtered = self.filtered_largest_files();
+                if self.cursor < filtered.len() {
+                    filtered[self.cursor].path.clone()
+                } else {
+                    return;
+                }
+            }
+            ViewMode::Overview => return,
         };
-        let target_path = child.path.clone();
-
         if self.is_path_protected(&target_path) {
             self.message = Some((
                 format!("Refused: {} is a protected path", target_path.display()),
@@ -1338,10 +1467,10 @@ impl AnalyzeTui {
                 "↑↓→ | Enter | R Refresh | O Open | P Preview | F File | Esc/q Quit".to_string()
             }
         } else if self.view_mode == ViewMode::LargestFiles {
-            if self.filter_mode {
+            if self.large_filter_mode || self.filter_mode {
                 // State 8 (typing): largest-files filter typing
                 "Type to filter  |  Enter Apply  |  Esc Clear  |  Ctrl+C Quit".to_string()
-            } else if !self.filter_text.is_empty() {
+            } else if !self.large_filter.is_empty() || !self.filter_text.is_empty() {
                 // State 8 (applied): largest-files filter applied
                 let del_part = if !self.selected_paths.is_empty() {
                     format!("⌫/Del {}", self.selected_paths.len())
@@ -1475,7 +1604,19 @@ impl AnalyzeTui {
             Style::default().fg(Color::Magenta),
         ));
 
-        if self.filter_mode || !self.filter_text.is_empty() {
+        if self.view_mode == ViewMode::LargestFiles {
+            if self.large_filter_mode || !self.large_filter.is_empty() {
+                let matches = self.filtered_largest_files().len();
+                let cursor_indicator = if self.large_filter_mode { "▌" } else { "" };
+                status_spans.push(Span::styled(
+                    format!(
+                        "[Filter: \"{}\"{cursor_indicator} ({matches} matches)]  ",
+                        self.large_filter
+                    ),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        } else if self.filter_mode || !self.filter_text.is_empty() {
             let matches = self.filtered_children().len();
             let cursor_indicator = if self.filter_mode { "▌" } else { "" };
             status_spans.push(Span::styled(
@@ -1666,28 +1807,27 @@ impl AnalyzeTui {
     }
 
     fn render_largest(&self, f: &mut Frame, area: Rect) {
-        if self.largest_files.is_empty() {
-            let p = Paragraph::new(Line::from("No large files discovered yet."))
-                .style(Style::default().fg(Color::DarkGray));
+        let filtered = self.filtered_largest_files();
+        if filtered.is_empty() {
+            let msg = if !self.large_filter.is_empty() {
+                format!("  No matches for \"{}\"", self.large_filter)
+            } else {
+                "No large files discovered yet.".to_string()
+            };
+            let p = Paragraph::new(Line::from(msg)).style(Style::default().fg(Color::DarkGray));
             f.render_widget(p, area);
             return;
         }
 
         let visible_height = area.height as usize;
-        let total_items = self.largest_files.len();
+        let total_items = filtered.len();
         let index_width = total_items.to_string().len().max(2);
-        let max_size = self
-            .largest_files
-            .first()
-            .map(|f| f.size)
-            .unwrap_or(1)
-            .max(1);
+        let max_size = filtered.first().map(|f| f.size).unwrap_or(1).max(1);
         let name_width = calculate_name_width(area.width as usize, index_width);
 
         let mut lines = Vec::new();
 
-        for (i, file) in self
-            .largest_files
+        for (i, file) in filtered
             .iter()
             .enumerate()
             .skip(self.scroll_off)
@@ -1702,7 +1842,7 @@ impl AnalyzeTui {
                 size: file.size,
                 size_human: &file.size_human,
                 is_cleanable: false,
-                is_checked: false,
+                is_checked: self.selected_paths.contains(&file.path),
                 is_cursor,
                 index: i + 1,
                 index_width,
@@ -1946,22 +2086,124 @@ impl AnalyzeTui {
         self.message = Some(("Rescanning...".to_string(), false));
     }
 
-    fn trigger_open_dir(&mut self) {
-        let target_dir = match self.view_mode {
-            ViewMode::Overview => {
-                let locs = self.overview_locations();
-                if self.cursor < locs.len() {
-                    locs[self.cursor].path.clone()
-                } else {
-                    return;
+    fn run_open_action(&mut self, action: OpenAction) {
+        if self.view_mode == ViewMode::Overview {
+            if action == OpenAction::RevealFile {
+                return;
+            }
+            let locs = self.overview_locations();
+            if self.cursor >= locs.len() {
+                return;
+            }
+            let target_dir = locs[self.cursor].path.clone();
+
+            if std::env::var_os("DISPLAY").is_none()
+                && std::env::var_os("WAYLAND_DISPLAY").is_none()
+            {
+                self.message = Some((
+                    "Cannot open GUI: neither DISPLAY nor WAYLAND_DISPLAY is set".to_string(),
+                    true,
+                ));
+                return;
+            }
+
+            let spec = CommandSpec::new("xdg-open", [target_dir.as_os_str()]);
+            match self.runner.run(&spec) {
+                Ok(_) => {
+                    self.message = Some((format!("Opened {}", target_dir.display()), false));
+                }
+                Err(e) => {
+                    self.message = Some((
+                        format!("Failed to open {}: {e}", target_dir.display()),
+                        true,
+                    ));
                 }
             }
+            return;
+        }
+
+        if !self.selected_paths.is_empty() {
+            let count = self.selected_paths.len();
+            if count > 20 {
+                let verb = match action {
+                    OpenAction::OpenDir => "open",
+                    OpenAction::RevealFile => "reveal",
+                };
+                self.message = Some((
+                    format!("Too many items to {verb}, max 20, selected {count}"),
+                    true,
+                ));
+                return;
+            }
+
+            if std::env::var_os("DISPLAY").is_none()
+                && std::env::var_os("WAYLAND_DISPLAY").is_none()
+            {
+                self.message = Some((
+                    "Cannot open GUI: neither DISPLAY nor WAYLAND_DISPLAY is set".to_string(),
+                    true,
+                ));
+                return;
+            }
+
+            let mut paths: Vec<PathBuf> = self.selected_paths.iter().cloned().collect();
+            paths.sort();
+
+            let mut errors = Vec::new();
+            for path in paths {
+                let target = match action {
+                    OpenAction::OpenDir => {
+                        if path.is_dir() {
+                            path
+                        } else {
+                            path.parent().unwrap_or(&path).to_path_buf()
+                        }
+                    }
+                    OpenAction::RevealFile => path,
+                };
+                let spec = CommandSpec::new("xdg-open", [target.as_os_str()]);
+                if let Err(e) = self.runner.run(&spec) {
+                    errors.push(format!("{}: {e}", target.display()));
+                }
+            }
+
+            if errors.is_empty() {
+                let verb = match action {
+                    OpenAction::OpenDir => "Opened",
+                    OpenAction::RevealFile => "Revealed",
+                };
+                self.message = Some((format!("{verb} {count} items"), false));
+            } else {
+                let verb = match action {
+                    OpenAction::OpenDir => "open",
+                    OpenAction::RevealFile => "reveal",
+                };
+                self.message = Some((
+                    format!(
+                        "Failed to {verb} {}/{count} items: {}",
+                        errors.len(),
+                        errors.join(", ")
+                    ),
+                    true,
+                ));
+            }
+            return;
+        }
+
+        // Single cursor item
+        let target = match self.view_mode {
+            ViewMode::Overview => return,
             ViewMode::Tree => {
                 if let Some((_, child)) = self.current_child() {
-                    if child.is_dir {
-                        child.path.clone()
-                    } else {
-                        child.path.parent().unwrap_or(&child.path).to_path_buf()
+                    match action {
+                        OpenAction::OpenDir => {
+                            if child.is_dir {
+                                child.path.clone()
+                            } else {
+                                child.path.parent().unwrap_or(&child.path).to_path_buf()
+                            }
+                        }
+                        OpenAction::RevealFile => child.path.clone(),
                     }
                 } else if let Some(node) = self.current_node() {
                     node.path.clone()
@@ -1970,9 +2212,15 @@ impl AnalyzeTui {
                 }
             }
             ViewMode::LargestFiles => {
-                if self.cursor < self.largest_files.len() {
-                    let file = &self.largest_files[self.cursor];
-                    file.path.parent().unwrap_or(&file.path).to_path_buf()
+                let filtered = self.filtered_largest_files();
+                if self.cursor < filtered.len() {
+                    let file = &filtered[self.cursor];
+                    match action {
+                        OpenAction::OpenDir => {
+                            file.path.parent().unwrap_or(&file.path).to_path_buf()
+                        }
+                        OpenAction::RevealFile => file.path.clone(),
+                    }
                 } else {
                     return;
                 }
@@ -1987,61 +2235,31 @@ impl AnalyzeTui {
             return;
         }
 
-        let spec = CommandSpec::new("xdg-open", [target_dir.as_os_str()]);
+        let spec = CommandSpec::new("xdg-open", [target.as_os_str()]);
         match self.runner.run(&spec) {
             Ok(_) => {
-                self.message = Some((format!("Opened {}", target_dir.display()), false));
+                let verb = match action {
+                    OpenAction::OpenDir => "Opened",
+                    OpenAction::RevealFile => "Revealed",
+                };
+                self.message = Some((format!("{verb} {}", target.display()), false));
             }
             Err(e) => {
-                self.message = Some((
-                    format!("Failed to open {}: {e}", target_dir.display()),
-                    true,
-                ));
+                let verb = match action {
+                    OpenAction::OpenDir => "open",
+                    OpenAction::RevealFile => "reveal",
+                };
+                self.message = Some((format!("Failed to {verb} {}: {e}", target.display()), true));
             }
         }
     }
 
+    fn trigger_open_dir(&mut self) {
+        self.run_open_action(OpenAction::OpenDir);
+    }
+
     fn trigger_reveal_file(&mut self) {
-        let target_path = match self.view_mode {
-            ViewMode::Overview => return,
-            ViewMode::Tree => {
-                if let Some((_, child)) = self.current_child() {
-                    child.path.clone()
-                } else if let Some(node) = self.current_node() {
-                    node.path.clone()
-                } else {
-                    return;
-                }
-            }
-            ViewMode::LargestFiles => {
-                if self.cursor < self.largest_files.len() {
-                    self.largest_files[self.cursor].path.clone()
-                } else {
-                    return;
-                }
-            }
-        };
-
-        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            self.message = Some((
-                "Cannot open GUI: neither DISPLAY nor WAYLAND_DISPLAY is set".to_string(),
-                true,
-            ));
-            return;
-        }
-
-        let spec = CommandSpec::new("xdg-open", [target_path.as_os_str()]);
-        match self.runner.run(&spec) {
-            Ok(_) => {
-                self.message = Some((format!("Revealed {}", target_path.display()), false));
-            }
-            Err(e) => {
-                self.message = Some((
-                    format!("Failed to reveal {}: {e}", target_path.display()),
-                    true,
-                ));
-            }
-        }
+        self.run_open_action(OpenAction::RevealFile);
     }
 
     fn trigger_preview(&mut self) {
@@ -2059,8 +2277,9 @@ impl AnalyzeTui {
                 }
             }
             ViewMode::LargestFiles => {
-                if self.cursor < self.largest_files.len() {
-                    self.largest_files[self.cursor].path.clone()
+                let filtered = self.filtered_largest_files();
+                if self.cursor < filtered.len() {
+                    filtered[self.cursor].path.clone()
                 } else {
                     return;
                 }
@@ -4122,6 +4341,414 @@ mod tests {
         assert!(
             s8.contains("↑↓← | Space Select | / Edit | Esc Clear filter | O Open | P Preview | F File | ⌫/Del | q Quit"),
             "State 8: {s8}"
+        );
+    }
+
+    #[test]
+    fn test_additive_keybindings() {
+        let mut tui = AnalyzeTui::new(false);
+        let mut root = FileNode::new(
+            "root".into(),
+            PathBuf::from("/tmp/test_root"),
+            1000,
+            true,
+            2,
+        );
+        let sub = FileNode::new(
+            "sub".into(),
+            PathBuf::from("/tmp/test_root/sub"),
+            600,
+            true,
+            1,
+        );
+        let f1 = FileNode::new(
+            "f1.txt".into(),
+            PathBuf::from("/tmp/test_root/f1.txt"),
+            400,
+            false,
+            1,
+        );
+        root.children = vec![sub, f1];
+        tui.root = Some(root);
+        tui.largest_files = vec![crate::analyze::model::LargestFile::new(
+            PathBuf::from("/tmp/test_root/f1.txt"),
+            500,
+        )];
+
+        // 1. T toggles top-files view (alongside Tab)
+        assert_eq!(tui.view_mode, ViewMode::Tree);
+        tui.handle_key_event(dummy_key(KeyCode::Char('T')));
+        assert_eq!(tui.view_mode, ViewMode::LargestFiles);
+        tui.handle_key_event(dummy_key(KeyCode::Tab));
+        assert_eq!(tui.view_mode, ViewMode::Tree);
+        tui.handle_key_event(dummy_key(KeyCode::Char('t')));
+        assert_eq!(tui.view_mode, ViewMode::LargestFiles);
+        tui.handle_key_event(dummy_key(KeyCode::Char('T')));
+        assert_eq!(tui.view_mode, ViewMode::Tree);
+
+        // 2. r and R trigger rescan
+        tui.rescan_requested = false;
+        tui.handle_key_event(dummy_key(KeyCode::Char('r')));
+        assert!(tui.rescan_requested);
+        tui.rescan_requested = false;
+        tui.handle_key_event(dummy_key(KeyCode::Char('R')));
+        assert!(tui.rescan_requested);
+
+        // 3. Movement variants: J / K
+        assert_eq!(tui.cursor, 0);
+        tui.handle_key_event(dummy_key(KeyCode::Char('J')));
+        assert_eq!(tui.cursor, 1);
+        tui.handle_key_event(dummy_key(KeyCode::Char('K')));
+        assert_eq!(tui.cursor, 0);
+
+        // 4. L enters directory, H / b goes back
+        tui.handle_key_event(dummy_key(KeyCode::Char('L')));
+        assert_eq!(tui.path_indices, vec![0]);
+        tui.handle_key_event(dummy_key(KeyCode::Char('H')));
+        assert!(tui.path_indices.is_empty());
+        tui.handle_key_event(dummy_key(KeyCode::Char('L')));
+        assert_eq!(tui.path_indices, vec![0]);
+        tui.handle_key_event(dummy_key(KeyCode::Char('b')));
+        assert!(tui.path_indices.is_empty());
+        tui.handle_key_event(dummy_key(KeyCode::Char('L')));
+        assert_eq!(tui.path_indices, vec![0]);
+        tui.handle_key_event(dummy_key(KeyCode::Char('B')));
+        assert!(tui.path_indices.is_empty());
+
+        // In largest files view, b / B / H returns to tree
+        tui.view_mode = ViewMode::LargestFiles;
+        tui.handle_key_event(dummy_key(KeyCode::Char('b')));
+        assert_eq!(tui.view_mode, ViewMode::Tree);
+        tui.view_mode = ViewMode::LargestFiles;
+        tui.handle_key_event(dummy_key(KeyCode::Char('H')));
+        assert_eq!(tui.view_mode, ViewMode::Tree);
+
+        // Q quits
+        assert!(tui.handle_key_event(dummy_key(KeyCode::Char('Q'))));
+    }
+
+    #[test]
+    fn test_batch_open_and_reveal_selection() {
+        let runner = Arc::new(FakeRunner::new());
+        let mut tui = AnalyzeTui::new(false).with_runner(runner.clone() as Arc<dyn Runner>);
+
+        let orig_disp = std::env::var_os("DISPLAY");
+        unsafe {
+            std::env::set_var("DISPLAY", ":0");
+        }
+
+        let file1 = PathBuf::from("/tmp/test_dir/file1.txt");
+        let file2 = PathBuf::from("/tmp/test_dir/file2.txt");
+        tui.selected_paths.insert(file1.clone());
+        tui.selected_paths.insert(file2.clone());
+
+        // O on selection -> opens parent directories
+        tui.handle_key_event(dummy_key(KeyCode::Char('O')));
+        let calls = runner.invocations();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].program, "xdg-open");
+        assert_eq!(calls[1].program, "xdg-open");
+        assert_eq!(tui.message, Some(("Opened 2 items".to_string(), false)));
+
+        // F on selection -> reveals the files
+        tui.handle_key_event(dummy_key(KeyCode::Char('F')));
+        let calls = runner.invocations();
+        assert_eq!(calls.len(), 4); // 2 previous + 2 new
+        assert_eq!(calls[2].program, "xdg-open");
+        assert_eq!(calls[2].args, vec![file1.as_os_str()]);
+        assert_eq!(calls[3].program, "xdg-open");
+        assert_eq!(calls[3].args, vec![file2.as_os_str()]);
+        assert_eq!(tui.message, Some(("Revealed 2 items".to_string(), false)));
+
+        unsafe {
+            if let Some(v) = orig_disp {
+                std::env::set_var("DISPLAY", v);
+            } else {
+                std::env::remove_var("DISPLAY");
+            }
+        }
+    }
+
+    #[test]
+    fn test_batch_open_and_reveal_cap_20() {
+        let runner = Arc::new(FakeRunner::new());
+        let mut tui = AnalyzeTui::new(false).with_runner(runner.clone() as Arc<dyn Runner>);
+
+        let orig_disp = std::env::var_os("DISPLAY");
+        unsafe {
+            std::env::set_var("DISPLAY", ":0");
+        }
+
+        // Select 21 items -> over cap of 20
+        for i in 0..21 {
+            tui.selected_paths
+                .insert(PathBuf::from(format!("/tmp/file_{i}.txt")));
+        }
+
+        // O refused over cap
+        tui.handle_key_event(dummy_key(KeyCode::Char('O')));
+        assert!(
+            runner.invocations().is_empty(),
+            "runner must not be called over cap"
+        );
+        assert_eq!(
+            tui.message,
+            Some((
+                "Too many items to open, max 20, selected 21".to_string(),
+                true
+            ))
+        );
+
+        // F refused over cap
+        tui.handle_key_event(dummy_key(KeyCode::Char('F')));
+        assert!(
+            runner.invocations().is_empty(),
+            "runner must not be called over cap"
+        );
+        assert_eq!(
+            tui.message,
+            Some((
+                "Too many items to reveal, max 20, selected 21".to_string(),
+                true
+            ))
+        );
+
+        // Exactly 20 items -> accepted
+        tui.selected_paths
+            .remove(&PathBuf::from("/tmp/file_20.txt"));
+        assert_eq!(tui.selected_paths.len(), 20);
+
+        tui.handle_key_event(dummy_key(KeyCode::Char('O')));
+        assert_eq!(runner.invocations().len(), 20);
+        assert_eq!(tui.message, Some(("Opened 20 items".to_string(), false)));
+
+        unsafe {
+            if let Some(v) = orig_disp {
+                std::env::set_var("DISPLAY", v);
+            } else {
+                std::env::remove_var("DISPLAY");
+            }
+        }
+    }
+
+    #[test]
+    fn test_batch_open_and_reveal_per_item_failure() {
+        let runner = Arc::new(FakeRunner::new());
+        let mut tui = AnalyzeTui::new(false).with_runner(runner.clone() as Arc<dyn Runner>);
+
+        let orig_disp = std::env::var_os("DISPLAY");
+        unsafe {
+            std::env::set_var("DISPLAY", ":0");
+        }
+
+        let p1 = PathBuf::from("/tmp/a_good.txt");
+        let p2 = PathBuf::from("/tmp/b_bad.txt");
+        let p3 = PathBuf::from("/tmp/c_good.txt");
+        tui.selected_paths.insert(p1);
+        tui.selected_paths.insert(p2);
+        tui.selected_paths.insert(p3);
+
+        runner.set_handler(|spec| {
+            if spec
+                .args
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("b_bad"))
+            {
+                Err(crate::runner::RunError::Spawn(std::io::Error::other(
+                    "disk failure",
+                )))
+            } else {
+                Ok(crate::runner::Output {
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    exit_code: 0,
+                    signal: None,
+                })
+            }
+        });
+
+        // Trigger F: all 3 items must be attempted (not aborted after failure on b_bad)
+        tui.handle_key_event(dummy_key(KeyCode::Char('F')));
+        assert_eq!(runner.invocations().len(), 3);
+        let msg = tui.message.as_ref().unwrap();
+        assert!(msg.1, "message must indicate error");
+        assert!(
+            msg.0.starts_with("Failed to reveal 1/3 items:"),
+            "expected partial failure count in: {}",
+            msg.0
+        );
+        assert!(msg.0.contains("/tmp/b_bad.txt") && msg.0.contains("disk failure"));
+
+        unsafe {
+            if let Some(v) = orig_disp {
+                std::env::set_var("DISPLAY", v);
+            } else {
+                std::env::remove_var("DISPLAY");
+            }
+        }
+    }
+
+    #[test]
+    fn test_largest_files_independent_filter() {
+        let mut tui = AnalyzeTui::new(false);
+        tui.largest_files = vec![
+            crate::analyze::model::LargestFile::new(PathBuf::from("/tmp/alpha.log"), 1000),
+            crate::analyze::model::LargestFile::new(PathBuf::from("/tmp/beta.txt"), 800),
+            crate::analyze::model::LargestFile::new(PathBuf::from("/tmp/gamma.log"), 500),
+        ];
+        tui.view_mode = ViewMode::LargestFiles;
+
+        // Enter filter mode with '/'
+        tui.handle_key_event(dummy_key(KeyCode::Char('/')));
+        assert!(tui.large_filter_mode);
+        assert!(!tui.filter_mode, "tree filter mode must not be affected");
+
+        // Type "log"
+        tui.handle_key_event(dummy_key(KeyCode::Char('l')));
+        tui.handle_key_event(dummy_key(KeyCode::Char('o')));
+        tui.handle_key_event(dummy_key(KeyCode::Char('g')));
+        assert_eq!(tui.large_filter, "log");
+        assert_eq!(tui.filter_text, "", "tree filter text must not be affected");
+        assert_eq!(tui.filtered_largest_files().len(), 2);
+
+        // Render check: header contains match count and cursor
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+        assert!(
+            text.contains("[Filter: \"log\"▌ (2 matches)]"),
+            "expected filter with cursor in header:\n{text}"
+        );
+
+        // Enter to apply filter
+        tui.handle_key_event(dummy_key(KeyCode::Enter));
+        assert!(!tui.large_filter_mode);
+        assert_eq!(tui.large_filter, "log");
+
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+        assert!(
+            text.contains("[Filter: \"log\" (2 matches)]"),
+            "expected applied filter in header:\n{text}"
+        );
+
+        // Filter matching nothing renders "No matches for..."
+        tui.large_filter = "zzz".into();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+        assert!(
+            text.contains("No matches for \"zzz\""),
+            "expected no matches message in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_largest_files_filter_esc_ordering() {
+        let mut tui = AnalyzeTui::new(false);
+        tui.largest_files = vec![crate::analyze::model::LargestFile::new(
+            PathBuf::from("/tmp/file.dat"),
+            1000,
+        )];
+        tui.view_mode = ViewMode::LargestFiles;
+
+        // 1. Esc while typing: clears query and exits typing, stays in LargestFiles
+        tui.handle_key_event(dummy_key(KeyCode::Char('/')));
+        tui.handle_key_event(dummy_key(KeyCode::Char('a')));
+        assert!(tui.large_filter_mode);
+        assert_eq!(tui.large_filter, "a");
+        tui.handle_key_event(dummy_key(KeyCode::Esc));
+        assert!(!tui.large_filter_mode);
+        assert_eq!(tui.large_filter, "");
+        assert_eq!(tui.view_mode, ViewMode::LargestFiles);
+
+        // 2. Esc when filter is applied: clears filter, stays in LargestFiles
+        tui.large_filter = "applied".into();
+        tui.large_filter_mode = false;
+        tui.handle_key_event(dummy_key(KeyCode::Esc));
+        assert_eq!(tui.large_filter, "");
+        assert_eq!(tui.view_mode, ViewMode::LargestFiles);
+
+        // 3. Esc when filter is empty: leaves LargestFiles, returns to Tree
+        tui.handle_key_event(dummy_key(KeyCode::Esc));
+        assert_eq!(tui.view_mode, ViewMode::Tree);
+    }
+
+    #[test]
+    fn test_largest_files_filter_cursor_clamp() {
+        let mut tui = AnalyzeTui::new(false);
+        tui.largest_files = vec![
+            crate::analyze::model::LargestFile::new(PathBuf::from("/tmp/alpha.dat"), 1000),
+            crate::analyze::model::LargestFile::new(PathBuf::from("/tmp/beta.dat"), 800),
+            crate::analyze::model::LargestFile::new(PathBuf::from("/tmp/gamma.dat"), 600),
+        ];
+        tui.view_mode = ViewMode::LargestFiles;
+        tui.cursor = 2; // at gamma
+
+        // Filter to "alpha": only 1 match -> cursor clamped to 0
+        tui.handle_key_event(dummy_key(KeyCode::Char('/')));
+        for c in "alpha".chars() {
+            tui.handle_key_event(dummy_key(KeyCode::Char(c)));
+        }
+        assert_eq!(tui.filtered_largest_files().len(), 1);
+        assert_eq!(tui.cursor, 0, "cursor must clamp to available match index");
+
+        // Filter matching nothing -> cursor is 0
+        tui.handle_key_event(dummy_key(KeyCode::Char('x')));
+        assert_eq!(tui.filtered_largest_files().len(), 0);
+        assert_eq!(tui.cursor, 0);
+    }
+
+    #[test]
+    fn test_largest_files_space_selection_and_no_delete() {
+        let mut tui = AnalyzeTui::new(false);
+        let p1 = PathBuf::from("/tmp/big1.dat");
+        let p2 = PathBuf::from("/tmp/big2.dat");
+        tui.largest_files = vec![
+            crate::analyze::model::LargestFile::new(p1.clone(), 1000),
+            crate::analyze::model::LargestFile::new(p2.clone(), 800),
+        ];
+        tui.view_mode = ViewMode::LargestFiles;
+        tui.cursor = 0;
+
+        // Space toggles selection
+        tui.handle_key_event(dummy_key(KeyCode::Char(' ')));
+        assert!(tui.selected_paths.contains(&p1));
+        assert_eq!(tui.selected_paths.len(), 1);
+
+        // Render shows checked marker
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+        assert!(
+            text.contains('●'),
+            "expected checked marker for selected item"
+        );
+
+        // Space toggles off
+        tui.handle_key_event(dummy_key(KeyCode::Char(' ')));
+        assert!(!tui.selected_paths.contains(&p1));
+        assert_eq!(tui.selected_paths.len(), 0);
+
+        // Select again and ensure delete is prevented in LargestFiles view
+        tui.handle_key_event(dummy_key(KeyCode::Char(' ')));
+        assert_eq!(tui.selected_paths.len(), 1);
+
+        tui.handle_key_event(dummy_key(KeyCode::Backspace));
+        assert!(
+            tui.confirm_batch.is_none(),
+            "batch delete must be prevented in largest files"
+        );
+        tui.handle_key_event(dummy_key(KeyCode::Delete));
+        assert!(
+            tui.confirm_batch.is_none(),
+            "batch delete must be prevented in largest files"
+        );
+        tui.handle_key_event(dummy_key(KeyCode::Char('d')));
+        assert!(
+            tui.confirm_delete.is_none(),
+            "single delete must be prevented in largest files"
         );
     }
 }
