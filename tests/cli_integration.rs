@@ -63,22 +63,28 @@ fn status_json_flag() {
     serde_json::from_str::<serde_json::Value>(&stdout(&o)).expect("status --json parse");
 }
 
-/// `mu status --json` emits extended fields `cpu_cores` and `disk_io`.
+/// `mu status --json` emits the stable fields, and the host-optional extended
+/// fields are well-formed when this machine provides them.
+///
+/// Their *schema* is pinned deterministically by
+/// `status::tests::snapshot_json_includes_extended_fields_when_present` with
+/// injected readers; requiring them here would only assert that the machine
+/// has a block device and a readable `/proc/stat` (review rvp5#6c).
 #[test]
 fn status_json_extended_fields() {
     let o = mu(&["status", "--json"]);
     assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).expect("status --json parse");
-    for key in [
-        "cpu_percent",
-        "memory",
-        "disks",
-        "network",
-        "health",
-        "cpu_cores",
-        "disk_io",
-    ] {
+    for key in ["cpu_percent", "memory", "disks", "network", "health"] {
         assert!(v.get(key).is_some(), "missing {key} in {v}");
+    }
+    if let Some(cores) = v.get("cpu_cores") {
+        assert!(cores.is_array(), "cpu_cores must be an array: {cores}");
+    }
+    for key in ["disk_io", "processes"] {
+        if let Some(map) = v.get(key) {
+            assert!(!map.is_null(), "{key} must never be null: {v}");
+        }
     }
 }
 
@@ -638,25 +644,46 @@ fn optimize_dry_run_skip_steps() {
     );
 }
 
-/// Phase 3: Sentinel immutability test on ~/.local/state/sentinel-test/stale.log.
+/// Sentinel immutability for the stale-state step: the file is older than the
+/// step's 30-day threshold, so a dry-run that wrongly executed the step would
+/// trash it. An `mtime` of "now" (the original test) could never catch that
+/// (review rvp3#9).
 #[test]
 fn optimize_dry_run_sentinel_immutability() {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    let state_dir = home.join(".local/state/sentinel-test");
-    let _ = std::fs::create_dir_all(&state_dir);
+    let state_home = std::env::temp_dir().join(format!(
+        "mu-optimize-sentinel-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let state_dir = state_home.join("sentinel-test");
+    std::fs::create_dir_all(&state_dir).unwrap();
     let sentinel_file = state_dir.join("stale.log");
     std::fs::write(&sentinel_file, "sentinel stale state data").unwrap();
+    // 40 days old — past the step's `-mtime +30` threshold.
+    let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&sentinel_file)
+        .unwrap()
+        .set_modified(stale)
+        .unwrap();
 
-    let o = mu(&["optimize", "--dry-run"]);
+    let o = Command::new(env!("CARGO_BIN_EXE_mu"))
+        .args(["optimize", "--dry-run"])
+        .env("XDG_STATE_HOME", &state_home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run mu");
     assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
     assert!(
         sentinel_file.exists(),
-        "sentinel file was deleted during dry-run!"
+        "a 40-day-old state file was deleted during dry-run"
     );
 
-    let _ = std::fs::remove_dir_all(&state_dir);
+    let _ = std::fs::remove_dir_all(&state_home);
 }
 
 /// Phase 3: `mu clean --dry-run --include=dev-cache` output includes "Developer CLI Caches".
