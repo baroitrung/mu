@@ -44,6 +44,7 @@ pub(crate) fn user_cache_target_in(deps: &Deps) -> CleanTarget {
         label: "User Cache (~/.cache)",
         requires_sudo: false,
         opt_in: false,
+        roots: vec![cache_home],
         scan: Box::new(move || {
             // Go: `return total, err` — WalkDir aborts at the first error
             // and the partial total rides back with it.
@@ -172,7 +173,7 @@ pub(crate) fn thumbnails_target_in(deps: &Deps) -> CleanTarget {
     let thumb_dir = deps.cache_home.join("thumbnails");
 
     let scan_thumb = thumb_dir.clone();
-    let exec_thumb = thumb_dir;
+    let exec_thumb = thumb_dir.clone();
     let exec_root = deps.cache_home.clone();
     let exec_cfg = deps.config_home.clone();
     let exec_runner = Arc::clone(&deps.trash_runner);
@@ -183,6 +184,7 @@ pub(crate) fn thumbnails_target_in(deps: &Deps) -> CleanTarget {
         label: "Thumbnail Cache",
         requires_sudo: false,
         opt_in: false,
+        roots: vec![thumb_dir],
         scan: Box::new(move || {
             if !paths::path_exists(&scan_thumb) {
                 return (0, None);
@@ -211,6 +213,7 @@ pub(crate) fn apt_cache_target_in(deps: &Deps) -> CleanTarget {
         label: "APT Package Cache",
         requires_sudo: true,
         opt_in: false,
+        roots: vec![PathBuf::from("/var/cache/apt/archives")],
         scan: Box::new(move || {
             let (bytes, _) = size::dir_size(Path::new("/var/cache/apt/archives"));
             (bytes as i64, None)
@@ -247,6 +250,8 @@ pub(crate) fn journal_logs_target_in(deps: &Deps) -> CleanTarget {
         label: "Journal Logs",
         requires_sudo: true,
         opt_in: false,
+        // Systemd journal logs are queried and vacuumed via journalctl; no static directory root.
+        roots: Vec::new(),
         scan: Box::new(move || match journal_size(&*scan_runner) {
             Ok(n) => (n, None),
             Err(e) => (0, Some(e)),
@@ -294,12 +299,14 @@ pub(crate) fn font_cache_target_in(deps: &Deps) -> CleanTarget {
     let prev_root = home_root.clone();
     let exec_cache = cache_home;
     let exec_root = home_root;
+    let roots = font_cache_dirs_in(&scan_root, &scan_cache);
 
     CleanTarget {
         id: "font-cache",
         label: "Font Cache (all users)",
         requires_sudo: true,
         opt_in: false,
+        roots,
         scan: Box::new(move || {
             let mut total: i64 = 0;
             for dir in font_cache_dirs_in(&scan_root, &scan_cache) {
@@ -425,12 +432,17 @@ pub(crate) fn sandbox_font_cache_target_in(deps: &Deps) -> CleanTarget {
     let exec_cfg = deps.config_home.clone();
     let exec_runner = Arc::clone(&deps.trash_runner);
     let exec_deps = deps.trash_deps.clone();
+    let roots = sandbox_font_cache_dirs_in(&scan_home)
+        .into_iter()
+        .map(|(root, _)| root)
+        .collect();
 
     CleanTarget {
         id: "sandbox-font-cache",
         label: "Sandboxed Font Caches (snap/flatpak)",
         requires_sudo: false,
         opt_in: false,
+        roots,
         scan: Box::new(move || {
             let mut total: i64 = 0;
             for (_, dir) in sandbox_font_cache_dirs_in(&scan_home) {
@@ -537,6 +549,7 @@ pub(crate) fn system_trash_target_in(deps: &Deps) -> CleanTarget {
         label: "System Trash",
         requires_sudo: false,
         opt_in: true,
+        roots: vec![deps.data_home.join("Trash")],
         scan: Box::new(move || {
             let sz = system_trash_size(&scan_data);
             (sz, None)
@@ -681,6 +694,7 @@ pub(crate) fn external_volume_target_in(deps: &Deps, mount: &Path) -> CleanTarge
         requires_sudo: false,
         // Only ever present when `--external` names the mount.
         opt_in: true,
+        roots: vec![mount.to_path_buf()],
         scan: Box::new(move || {
             let mut total = 0i64;
             let mut scan_errors: Vec<Error> = Vec::new();
@@ -836,12 +850,14 @@ pub(crate) fn dev_cache_target_in(deps: &Deps) -> CleanTarget {
     let exec_cfg = deps.config_home.clone();
     let exec_runner = Arc::clone(&deps.trash_runner);
     let exec_deps = deps.trash_deps.clone();
+    let roots = dev_cache_paths(&deps.home);
 
     CleanTarget {
         id: "dev-cache",
         label: "Developer CLI Caches",
         requires_sudo: false,
         opt_in: true,
+        roots,
         scan: Box::new(move || {
             let mut total: i64 = 0;
             let mut scan_errors: Vec<Error> = Vec::new();
@@ -919,17 +935,10 @@ pub fn clean_target_roots() -> Vec<PathBuf> {
 }
 
 pub(crate) fn clean_target_roots_in(deps: &Deps) -> Vec<PathBuf> {
-    let mut roots = vec![
-        deps.cache_home.clone(),
-        PathBuf::from("/var/cache/apt/archives"),
-        deps.data_home.join("Trash"),
-    ];
-    roots.extend(dev_cache_paths(&deps.home));
-    roots.extend(font_cache_dirs(&deps.cache_home));
-    for (root, _) in sandbox_font_cache_dirs_in(&deps.home) {
-        roots.push(root);
-    }
-    roots
+    super::all_targets_in(deps)
+        .into_iter()
+        .flat_map(|t| t.roots)
+        .collect()
 }
 
 /// One line of `podman system df --format '{{json .}}'`.
@@ -966,6 +975,8 @@ pub(crate) fn podman_target_in(deps: &Deps) -> CleanTarget {
         label: "Podman System Cache",
         requires_sudo: false,
         opt_in: true,
+        // Podman container and image caches are managed via the podman CLI; no static directory root.
+        roots: Vec::new(),
         scan: Box::new(move || {
             if scan_runner.look_path("podman").is_err() {
                 return (0, None);
@@ -1090,6 +1101,8 @@ pub(crate) fn orphaned_app_data_target_in(deps: &Deps) -> CleanTarget {
         label: "Orphaned Application Data",
         requires_sudo: false,
         opt_in: true,
+        // Discovers orphaned package data dynamically at scan time; no static directory root.
+        roots: Vec::new(),
         // Fail closed: a discovery error aborts the scan instead of treating
         // the effective "installed" set as empty.
         scan: Box::new(move || {
@@ -1311,6 +1324,8 @@ pub(crate) fn orphaned_services_target_in(deps: &Deps) -> CleanTarget {
         label: "Orphaned User Services",
         requires_sudo: false,
         opt_in: true,
+        // Discovers broken systemd user service symlinks dynamically at scan time; no static directory root.
+        roots: Vec::new(),
         // Broken enablement symlinks live in `<target>.wants/` subdirs, so the
         // scan recurses the whole user unit tree rather than its top level.
         scan: Box::new(move || {
@@ -2027,6 +2042,128 @@ mod tests {
         assert!(perr.is_none());
         assert_eq!(items.len(), 1, "items={items:?}");
         assert!(items[0].contains("ghost.service"), "{items:?}");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    fn legacy_clean_target_roots_in(deps: &Deps) -> Vec<PathBuf> {
+        let mut roots = vec![
+            deps.cache_home.clone(),
+            PathBuf::from("/var/cache/apt/archives"),
+            deps.data_home.join("Trash"),
+        ];
+        roots.extend(dev_cache_paths(&deps.home));
+        roots.extend(font_cache_dirs(&deps.cache_home));
+        for (root, _) in sandbox_font_cache_dirs_in(&deps.home) {
+            roots.push(root);
+        }
+        roots
+    }
+
+    #[test]
+    fn test_clean_target_roots_matches_legacy_and_preserves_badges() {
+        let tmp = tempdir("roots-equality");
+        let snap_dir = tmp.join("snap/myapp/common/.cache/fontconfig");
+        fs::create_dir_all(&snap_dir).unwrap();
+        let flatpak_dir = tmp.join(".var/app/myapp/cache/fontconfig");
+        fs::create_dir_all(&flatpak_dir).unwrap();
+
+        let deps = deps_for_test(&tmp, Arc::new(FakeRunner::new()));
+        let derived = clean_target_roots_in(&deps);
+        let legacy = legacy_clean_target_roots_in(&deps);
+
+        // 1. Every legacy root is preserved in the derived roots
+        for root in &legacy {
+            assert!(
+                derived.contains(root),
+                "derived roots must contain legacy root: {root:?}"
+            );
+        }
+
+        // 2. The only additional root in derived is the explicit thumbnails root,
+        // which is a sub-path of cache_home (already covered by user-cache).
+        let thumb_dir = deps.cache_home.join("thumbnails");
+        for root in &derived {
+            assert!(
+                legacy.contains(root) || *root == thumb_dir,
+                "unexpected root in derived: {root:?}"
+            );
+        }
+
+        // 3. Badge decisions (is_cleanable) are byte-for-byte identical across all path types
+        let test_paths = vec![
+            tmp.join(".cache/foo"),
+            tmp.join(".cache/thumbnails/thumb1.png"),
+            tmp.join(".cargo/registry/cache/pkg"),
+            tmp.join(".npm/_cacache/data"),
+            tmp.join("data-home/Trash/files/file.txt"),
+            PathBuf::from("/var/cache/apt/archives/pkg.deb"),
+            tmp.join("snap/myapp/common/.cache/fontconfig/cache"),
+            tmp.join(".var/app/myapp/cache/fontconfig/cache"),
+            tmp.join("workspace/node_modules"),
+            tmp.join("workspace/target"),
+            tmp.join("workspace/.venv"),
+            tmp.join("workspace/dist"),
+            tmp.join("workspace/CACHEDIR.TAG"),
+            tmp.join("Downloads/file.zip"),
+        ];
+
+        for p in &test_paths {
+            let node = crate::analyze::model::FileNode::new(
+                p.file_name().unwrap_or_default().to_string_lossy().into(),
+                p.clone(),
+                100,
+                true,
+                1,
+            );
+            assert_eq!(
+                crate::tui::analyze::is_cleanable(&node, &derived),
+                crate::tui::analyze::is_cleanable(&node, &legacy),
+                "badge decision must match for {p:?}"
+            );
+        }
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_per_target_roots() {
+        let tmp = tempdir("per-target-roots");
+        let mount = tmp.join("mnt");
+        let deps = deps_for_test(&tmp, Arc::new(FakeRunner::new()));
+
+        let ucache = user_cache_target_in(&deps);
+        assert_eq!(ucache.roots, vec![deps.cache_home.clone()]);
+
+        let thumbs = thumbnails_target_in(&deps);
+        assert_eq!(thumbs.roots, vec![deps.cache_home.join("thumbnails")]);
+
+        let apt = apt_cache_target_in(&deps);
+        assert_eq!(apt.roots, vec![PathBuf::from("/var/cache/apt/archives")]);
+
+        let journal = journal_logs_target_in(&deps);
+        assert!(journal.roots.is_empty());
+
+        let font = font_cache_target_in(&deps);
+        assert_eq!(font.roots, font_cache_dirs(&deps.cache_home));
+
+        let trash = system_trash_target_in(&deps);
+        assert_eq!(trash.roots, vec![deps.data_home.join("Trash")]);
+
+        let dev = dev_cache_target_in(&deps);
+        assert_eq!(dev.roots, dev_cache_paths(&deps.home));
+
+        let podman = podman_target_in(&deps);
+        assert!(podman.roots.is_empty());
+
+        let app_data = orphaned_app_data_target_in(&deps);
+        assert!(app_data.roots.is_empty());
+
+        let services = orphaned_services_target_in(&deps);
+        assert!(services.roots.is_empty());
+
+        let ext = external_volume_target_in(&deps, &mount);
+        assert_eq!(ext.roots, vec![mount.clone()]);
+
         fs::remove_dir_all(&tmp).ok();
     }
 }

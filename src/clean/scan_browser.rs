@@ -207,6 +207,8 @@ pub(crate) fn browser_cache_target_in(deps: &Deps) -> CleanTarget {
         label: "Browser Caches (Chrome/Firefox/VSCode/Snap/Flatpak)",
         requires_sudo: false,
         opt_in: true,
+        // Browser cache paths are dynamic per profile and opt-in; badges do not exclude them.
+        roots: Vec::new(),
         scan: Box::new(move || {
             let mut total: i64 = 0;
             let mut scan_errors: Vec<Error> = Vec::new();

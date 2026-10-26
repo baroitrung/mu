@@ -794,6 +794,7 @@ mod tests {
                     label: labels[i],
                     requires_sudo: false,
                     opt_in: false,
+                    roots: Vec::new(),
                     scan: Box::new(move || {
                         if scan_fails {
                             (0, Some(Error::Msg("scan boom".to_string())))
@@ -1047,6 +1048,7 @@ mod tests {
             label: "X Cache",
             requires_sudo: false,
             opt_in: false,
+            roots: Vec::new(),
             scan: Box::new(|| (SIZE_A, None)),
             preview: Some(Box::new(|| {
                 (
@@ -1149,6 +1151,7 @@ mod tests {
                 label: "APT Cache",
                 requires_sudo: true,
                 opt_in: false,
+                roots: Vec::new(),
                 scan: Box::new(|| (0, None)),
                 preview: None,
                 execute: Box::new(|_| Ok(())),
@@ -1161,6 +1164,7 @@ mod tests {
                 label: "User cache",
                 requires_sudo: false,
                 opt_in: false,
+                roots: Vec::new(),
                 scan: Box::new(|| (0, None)),
                 preview: None,
                 execute: Box::new(|_| Ok(())),
@@ -1220,6 +1224,7 @@ mod tests {
             label: "System Trash",
             requires_sudo: false,
             opt_in: true,
+            roots: Vec::new(),
             scan: Box::new(|| (SIZE_A, None)),
             preview: None,
             execute: Box::new(|_| Ok(())),
