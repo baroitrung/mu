@@ -102,6 +102,7 @@ impl WalkerContext {
         {
             let _ = tx.send(ScanMessage::Progress {
                 items_scanned: self.items_scanned,
+                dirs_scanned: self.total_dirs,
                 bytes_scanned: self.bytes_scanned,
                 current_dir: current.to_path_buf(),
             });

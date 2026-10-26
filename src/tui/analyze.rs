@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use nix::sys::statvfs::statvfs;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -172,6 +173,13 @@ pub struct AnalyzeTui {
     pub cleanable_cache_count: usize,
     pub preview_modal: Option<(String, Vec<String>)>,
     pub rescan_requested: bool,
+    pub files_scanned: u64,
+    pub dirs_scanned: u64,
+    pub bytes_scanned: u64,
+    pub current_scan_dir: Option<PathBuf>,
+    pub last_total_files: Option<u64>,
+    pub filesystem_free: Option<u64>,
+    pub history: Vec<PathBuf>,
 }
 
 impl std::fmt::Debug for AnalyzeTui {
@@ -193,6 +201,96 @@ pub const SUB_CELL_BLOCKS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "
 /// Return the terminal display width of a string in cells.
 pub fn display_width(s: &str) -> usize {
     Span::raw(s).width()
+}
+
+/// Format a number with thousands separators (e.g. 1,234,567).
+pub fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+/// Query free filesystem space in bytes for a given path using statvfs.
+pub fn query_filesystem_free(path: &Path) -> Option<u64> {
+    match statvfs(path) {
+        Ok(stat) => {
+            let frsize = stat.fragment_size();
+            let bavail = stat.blocks_available();
+            Some(frsize.saturating_mul(bavail))
+        }
+        Err(_) => {
+            if let Some(parent) = path.parent() {
+                match statvfs(parent) {
+                    Ok(stat) => {
+                        let frsize = stat.fragment_size();
+                        let bavail = stat.blocks_available();
+                        Some(frsize.saturating_mul(bavail))
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Truncate middle of a string so display width does not exceed `max_width`.
+pub fn truncate_middle(s: &str, max_width: usize) -> String {
+    let current_width = display_width(s);
+    if current_width <= max_width {
+        return s.to_string();
+    }
+    if max_width <= 3 {
+        let mut out = String::new();
+        let mut w = 0;
+        for c in s.chars() {
+            let cw = display_width(&c.to_string());
+            if w + cw > max_width {
+                break;
+            }
+            out.push(c);
+            w += cw;
+        }
+        return out;
+    }
+    let target_head_width = (max_width.saturating_sub(3)) / 3;
+    let target_tail_width = max_width
+        .saturating_sub(3)
+        .saturating_sub(target_head_width);
+
+    let mut head = String::new();
+    let mut head_width = 0;
+    for c in s.chars() {
+        let cw = display_width(&c.to_string());
+        if head_width + cw > target_head_width {
+            break;
+        }
+        head.push(c);
+        head_width += cw;
+    }
+
+    let mut tail_chars = Vec::new();
+    let mut tail_width = 0;
+    for c in s.chars().rev() {
+        let cw = display_width(&c.to_string());
+        if tail_width + cw > target_tail_width {
+            break;
+        }
+        tail_chars.push(c);
+        tail_width += cw;
+    }
+    tail_chars.reverse();
+    let tail: String = tail_chars.into_iter().collect();
+
+    format!("{head}...{tail}")
 }
 
 /// Truncate a name to fit `target_width` with ellipsis if necessary, then pad
@@ -477,7 +575,23 @@ impl AnalyzeTui {
             cleanable_cache_count: 0,
             preview_modal: None,
             rescan_requested: false,
+            files_scanned: 0,
+            dirs_scanned: 0,
+            bytes_scanned: 0,
+            current_scan_dir: None,
+            last_total_files: None,
+            filesystem_free: None,
+            history: Vec::new(),
         }
+    }
+
+    pub fn filesystem_free_human(&self) -> Option<String> {
+        self.filesystem_free
+            .map(|b| crate::size::human_size(b as i64))
+    }
+
+    pub fn refresh_filesystem_free(&mut self, path: &Path) {
+        self.filesystem_free = query_filesystem_free(path);
     }
 
     pub fn with_runner(mut self, runner: Arc<dyn Runner>) -> Self {
@@ -495,6 +609,12 @@ impl AnalyzeTui {
             self.view_mode = ViewMode::Overview;
             self.cursor = 0;
             self.scroll_off = 0;
+            if self.filesystem_free.is_none() {
+                let home = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                self.refresh_filesystem_free(&home);
+            }
         } else {
             self.view_mode = ViewMode::Tree;
         }
@@ -528,9 +648,18 @@ impl AnalyzeTui {
         match msg {
             ScanMessage::Progress {
                 items_scanned,
+                dirs_scanned,
                 bytes_scanned,
                 current_dir,
             } => {
+                let files_scanned = items_scanned.saturating_sub(dirs_scanned);
+                self.files_scanned = files_scanned;
+                self.dirs_scanned = dirs_scanned;
+                self.bytes_scanned = bytes_scanned;
+                if self.filesystem_free.is_none() {
+                    self.refresh_filesystem_free(&current_dir);
+                }
+                self.current_scan_dir = Some(current_dir.clone());
                 let bytes_human = crate::size::human_size(bytes_scanned as i64);
                 let name = current_dir
                     .file_name()
@@ -542,6 +671,9 @@ impl AnalyzeTui {
                 let (c_bytes, c_count) = count_cleanable_nodes(&root, &self.clean_roots);
                 self.cleanable_cache_bytes = c_bytes;
                 self.cleanable_cache_count = c_count;
+                self.last_total_files = Some(stats.total_files);
+                self.refresh_filesystem_free(&root.path);
+                self.current_scan_dir = None;
                 self.root = Some(root);
                 self.largest_files = stats.largest_files;
                 self.scanning = false;
@@ -1194,70 +1326,124 @@ impl AnalyzeTui {
         }
     }
 
-    fn render_header(&self, f: &mut Frame, area: Rect) {
+    /// Contextual footer hint line representing the 8 states of the TUI.
+    pub fn footer_hint(&self) -> String {
         if self.view_mode == ViewMode::Overview {
-            let mut status_spans = Vec::new();
-            if self.scanning {
-                let spinner = SPINNER_FRAMES[self.spinner_idx];
-                status_spans.push(Span::styled(
-                    format!("{spinner} Scanning: {} ", self.scan_progress_text),
-                    Style::default().fg(Color::Yellow),
-                ));
+            if !self.history.is_empty() {
+                // State 2: overview+history
+                "↑↓←→ | Enter | R Refresh | O Open | P Preview | F File | Esc Back | q Quit"
+                    .to_string()
             } else {
-                status_spans.push(Span::styled(
-                    "✔ Scan ready  ",
-                    Style::default().fg(Color::Green),
-                ));
+                // State 1: overview
+                "↑↓→ | Enter | R Refresh | O Open | P Preview | F File | Esc/q Quit".to_string()
             }
-
-            if self.dry_run {
-                status_spans.push(Span::styled(
-                    "[DRY RUN] ",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ));
+        } else if self.view_mode == ViewMode::LargestFiles {
+            if self.filter_mode {
+                // State 8 (typing): largest-files filter typing
+                "Type to filter  |  Enter Apply  |  Esc Clear  |  Ctrl+C Quit".to_string()
+            } else if !self.filter_text.is_empty() {
+                // State 8 (applied): largest-files filter applied
+                let del_part = if !self.selected_paths.is_empty() {
+                    format!("⌫/Del {}", self.selected_paths.len())
+                } else {
+                    "⌫/Del".to_string()
+                };
+                format!(
+                    "↑↓← | Space Select | / Edit | Esc Clear filter | O Open | P Preview | F File | {del_part} | q Quit"
+                )
+            } else {
+                // State 7: largest-files idle
+                let del_part = if !self.selected_paths.is_empty() {
+                    format!("⌫/Del {}", self.selected_paths.len())
+                } else {
+                    "⌫/Del".to_string()
+                };
+                format!(
+                    "↑↓← | Space Select | / Filter | R Refresh | O Open | P Preview | F File | {del_part} | Esc Back | q Quit"
+                )
             }
-
-            status_spans.push(Span::styled(
-                "[View: Overview]  ",
-                Style::default().fg(Color::Magenta),
-            ));
-
-            let lines = vec![
-                Line::from(vec![Span::styled(
-                    "Disk Usage Overview",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )]),
-                Line::from(status_spans),
-            ];
-
-            let block = Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(Color::DarkGray));
-            let paragraph = Paragraph::new(lines).block(block);
-            f.render_widget(paragraph, area);
-            return;
+        } else if self.filter_mode {
+            // State 5: tree filter typing
+            "Type to filter  |  Enter Apply  |  Esc Clear  |  Ctrl+C Quit".to_string()
+        } else if !self.filter_text.is_empty() {
+            // State 6: tree filter applied
+            let del_part = if !self.selected_paths.is_empty() {
+                format!("⌫/Del {}", self.selected_paths.len())
+            } else {
+                "⌫/Del".to_string()
+            };
+            format!(
+                "↑↓←→ | Enter | Space Select | / Edit | Esc Clear filter | O Open | P Preview | F File | {del_part} | q Quit"
+            )
+        } else {
+            let del_part = if !self.selected_paths.is_empty() {
+                format!("⌫/Del {}", self.selected_paths.len())
+            } else {
+                "⌫/Del".to_string()
+            };
+            let top_part = if !self.largest_files.is_empty() {
+                format!(" | Tab Top {}", self.largest_files.len())
+            } else {
+                String::new()
+            };
+            // State 3 (tree idle) or State 4 (tree with a selection)
+            format!(
+                "↑↓←→ | Space Select | Enter | / Filter | R Refresh | O Open | P Preview | F File | {del_part}{top_part} | Esc Back | q Quit"
+            )
         }
-        let current_path = self
-            .current_node()
-            .map(|n| n.path.display().to_string())
-            .unwrap_or_else(|| "...".into());
+    }
 
-        let total_size = self
-            .current_node()
-            .map(|n| n.size_human.clone())
-            .unwrap_or_else(|| "0 B".into());
-
-        let total_items = self.current_node().map(|n| n.item_count).unwrap_or(0);
-
+    fn build_scan_status_spans(&self, area_width: usize) -> Vec<Span<'static>> {
         let mut status_spans = Vec::new();
         if self.scanning {
             let spinner = SPINNER_FRAMES[self.spinner_idx];
             status_spans.push(Span::styled(
-                format!("{spinner} Scanning: {} ", self.scan_progress_text),
+                format!("{spinner} "),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+
+            let progress_prefix = if let Some(total) = self.last_total_files {
+                if total > 0 {
+                    let mut percent =
+                        (self.files_scanned as f64 / total as f64 * 100.0).round() as u64;
+                    if percent > 100 {
+                        percent = 100;
+                    }
+                    if self.scanning && percent >= 100 {
+                        percent = 99;
+                    }
+                    format!(" {percent}%")
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            status_spans.push(Span::styled(
+                format!("Scanning{progress_prefix}: "),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+
+            status_spans.push(Span::styled(
+                format!("{} files", format_number(self.files_scanned)),
                 Style::default().fg(Color::Yellow),
             ));
+            status_spans.push(Span::raw(", "));
+            status_spans.push(Span::styled(
+                format!("{} dirs", format_number(self.dirs_scanned)),
+                Style::default().fg(Color::Yellow),
+            ));
+            status_spans.push(Span::raw(", "));
+            status_spans.push(Span::styled(
+                crate::size::human_size(self.bytes_scanned as i64),
+                Style::default().fg(Color::Green),
+            ));
+            status_spans.push(Span::raw("  "));
         } else {
             status_spans.push(Span::styled(
                 "✔ Scan ready  ",
@@ -1272,10 +1458,12 @@ impl AnalyzeTui {
             ));
         }
 
-        status_spans.push(Span::styled(
-            format!("[Sort: {}]  ", self.sort_mode.label()),
-            Style::default().fg(Color::Cyan),
-        ));
+        if self.view_mode != ViewMode::Overview {
+            status_spans.push(Span::styled(
+                format!("[Sort: {}]  ", self.sort_mode.label()),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
 
         let view_label = match self.view_mode {
             ViewMode::Overview => "[View: Overview]  ",
@@ -1287,10 +1475,14 @@ impl AnalyzeTui {
             Style::default().fg(Color::Magenta),
         ));
 
-        if !self.filter_text.is_empty() {
+        if self.filter_mode || !self.filter_text.is_empty() {
             let matches = self.filtered_children().len();
+            let cursor_indicator = if self.filter_mode { "▌" } else { "" };
             status_spans.push(Span::styled(
-                format!("[Filter: \"{}\" ({matches} matches)]  ", self.filter_text),
+                format!(
+                    "[Filter: \"{}\"{cursor_indicator} ({matches} matches)]  ",
+                    self.filter_text
+                ),
                 Style::default().fg(Color::Yellow),
             ));
         }
@@ -1304,22 +1496,90 @@ impl AnalyzeTui {
             ));
         }
 
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("Path: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    current_path,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  ({total_size}, {total_items} items)"),
-                    Style::default().fg(Color::Green),
-                ),
-            ]),
-            Line::from(status_spans),
+        if self.scanning
+            && let Some(dir) = &self.current_scan_dir
+        {
+            let status_w: usize = status_spans.iter().map(|s| display_width(&s.content)).sum();
+            let short_path = dir.display().to_string();
+            let remaining = area_width.saturating_sub(status_w + 2);
+            if remaining >= 12 {
+                let truncated = truncate_middle(&short_path, remaining);
+                status_spans.push(Span::styled(
+                    truncated,
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+
+        status_spans
+    }
+
+    fn render_header(&self, f: &mut Frame, area: Rect) {
+        if self.view_mode == ViewMode::Overview {
+            let status_spans = self.build_scan_status_spans(area.width as usize);
+
+            let mut title_spans = vec![Span::styled(
+                "Disk Usage Overview",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            if let Some(free_str) = self.filesystem_free_human() {
+                title_spans.push(Span::styled(
+                    format!("  ({free_str} free)"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            let lines = vec![Line::from(title_spans), Line::from(status_spans)];
+
+            let block = Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray));
+            let paragraph = Paragraph::new(lines).block(block);
+            f.render_widget(paragraph, area);
+            return;
+        }
+
+        let current_path = self
+            .current_node()
+            .map(|n| n.path.display().to_string())
+            .unwrap_or_else(|| {
+                self.current_scan_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "...".into())
+            });
+
+        let status_spans = self.build_scan_status_spans(area.width as usize);
+
+        let mut path_spans = vec![
+            Span::styled("Path: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                current_path,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ];
+
+        if (!self.scanning || self.root.is_some())
+            && let Some(node) = self.current_node()
+        {
+            path_spans.push(Span::styled(
+                format!("  ({}, {} items)", node.size_human, node.item_count),
+                Style::default().fg(Color::Green),
+            ));
+        }
+
+        if let Some(free_str) = self.filesystem_free_human() {
+            path_spans.push(Span::styled(
+                format!("  ({free_str} free)"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        let lines = vec![Line::from(path_spans), Line::from(status_spans)];
 
         let block = Block::default()
             .borders(Borders::BOTTOM)
@@ -1460,28 +1720,6 @@ impl AnalyzeTui {
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
-        if self.filter_mode {
-            let matches = self.filtered_children().len();
-            let p = Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!("/{} ", self.filter_text),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("({matches} matches)"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    " · Esc clear/exit · Enter finish typing",
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-            f.render_widget(p, area);
-            return;
-        }
-
         if let Some((text, is_err)) = &self.message {
             let color = if *is_err { Color::Red } else { Color::Green };
             let p = Paragraph::new(Line::from(vec![Span::styled(
@@ -1492,13 +1730,9 @@ impl AnalyzeTui {
             return;
         }
 
-        let help = if self.view_mode == ViewMode::Overview {
-            "↑/↓/j/k nav · Enter browse · R rescan · O open · q quit"
-        } else {
-            "↑/↓ nav · Space sel · / filter · ⌫ del · R rescan · O open · F reveal · P view · s sort · Tab · q quit"
-        };
+        let hint = self.footer_hint();
         let p = Paragraph::new(Line::from(vec![Span::styled(
-            help,
+            hint,
             Style::default().fg(Color::DarkGray),
         )]));
         f.render_widget(p, area);
@@ -1643,6 +1877,8 @@ impl AnalyzeTui {
         }
         let loc_name = locs[self.cursor].name;
         let loc_path = locs[self.cursor].path.clone();
+        self.history.push(loc_path.clone());
+        self.refresh_filesystem_free(&loc_path);
         self.view_mode = ViewMode::Tree;
         self.cursor = 0;
         self.scroll_off = 0;
@@ -1684,18 +1920,26 @@ impl AnalyzeTui {
     }
 
     pub fn trigger_rescan(&mut self) {
-        if let Some(target) = self.current_node().map(|n| n.path.clone()) {
+        let target_opt = self.current_node().map(|n| n.path.clone());
+        if let Some(target) = target_opt {
             crate::analyze::cache::invalidate_cache(&target);
-        }
-        if let Some(root) = &self.root {
-            crate::analyze::cache::invalidate_cache(&root.path);
+            self.refresh_filesystem_free(&target);
+        } else if let Some(root_path) = self.root.as_ref().map(|r| r.path.clone()) {
+            crate::analyze::cache::invalidate_cache(&root_path);
+            self.refresh_filesystem_free(&root_path);
         }
         if self.view_mode == ViewMode::Overview {
             let locs = self.overview_locations();
             if self.cursor < locs.len() {
-                crate::analyze::cache::invalidate_cache(&locs[self.cursor].path);
+                let loc_path = locs[self.cursor].path.clone();
+                crate::analyze::cache::invalidate_cache(&loc_path);
+                self.refresh_filesystem_free(&loc_path);
             }
         }
+        self.files_scanned = 0;
+        self.dirs_scanned = 0;
+        self.bytes_scanned = 0;
+        self.current_scan_dir = None;
         self.scanning = true;
         self.rescan_requested = true;
         self.scan_progress_text = "Rescanning...".to_string();
@@ -3554,5 +3798,330 @@ mod tests {
         assert!(row3.contains(" 3."), "index 3 on row 3: {row3}");
         assert!(row3.contains(" 2.5%"), "2.5% on row 3: {row3}");
         assert!(row3.contains("50 B"), "size on row 3: {row3}");
+    }
+
+    #[test]
+    fn test_footer_eight_states() {
+        let mut tui = AnalyzeTui::new(false);
+
+        // State 1: Overview idle (no history)
+        tui.view_mode = ViewMode::Overview;
+        tui.history.clear();
+        assert_eq!(
+            tui.footer_hint(),
+            "↑↓→ | Enter | R Refresh | O Open | P Preview | F File | Esc/q Quit"
+        );
+
+        // State 2: Overview with history
+        tui.history.push(PathBuf::from("/home/user"));
+        assert_eq!(
+            tui.footer_hint(),
+            "↑↓←→ | Enter | R Refresh | O Open | P Preview | F File | Esc Back | q Quit"
+        );
+
+        // State 3: Tree idle (no selection, with and without top files)
+        tui.view_mode = ViewMode::Tree;
+        tui.selected_paths.clear();
+        tui.largest_files.clear();
+        assert_eq!(
+            tui.footer_hint(),
+            "↑↓←→ | Space Select | Enter | / Filter | R Refresh | O Open | P Preview | F File | ⌫/Del | Esc Back | q Quit"
+        );
+
+        tui.largest_files = (0..12)
+            .map(|i| LargestFile {
+                path: PathBuf::from(format!("/tmp/file_{i}.dat")),
+                size: (12 - i) as u64 * 1024,
+                size_human: format!("{} KB", 12 - i),
+            })
+            .collect();
+        assert_eq!(
+            tui.footer_hint(),
+            "↑↓←→ | Space Select | Enter | / Filter | R Refresh | O Open | P Preview | F File | ⌫/Del | Tab Top 12 | Esc Back | q Quit"
+        );
+
+        // State 4: Tree with a selection
+        tui.selected_paths.insert(PathBuf::from("/tmp/a"));
+        tui.selected_paths.insert(PathBuf::from("/tmp/b"));
+        tui.selected_paths.insert(PathBuf::from("/tmp/c"));
+        assert_eq!(
+            tui.footer_hint(),
+            "↑↓←→ | Space Select | Enter | / Filter | R Refresh | O Open | P Preview | F File | ⌫/Del 3 | Tab Top 12 | Esc Back | q Quit"
+        );
+
+        // State 5: Tree filter typing
+        tui.filter_mode = true;
+        assert_eq!(
+            tui.footer_hint(),
+            "Type to filter  |  Enter Apply  |  Esc Clear  |  Ctrl+C Quit"
+        );
+
+        // State 6: Tree filter applied
+        tui.filter_mode = false;
+        tui.filter_text = "target".into();
+        assert_eq!(
+            tui.footer_hint(),
+            "↑↓←→ | Enter | Space Select | / Edit | Esc Clear filter | O Open | P Preview | F File | ⌫/Del 3 | q Quit"
+        );
+        tui.selected_paths.clear();
+        assert_eq!(
+            tui.footer_hint(),
+            "↑↓←→ | Enter | Space Select | / Edit | Esc Clear filter | O Open | P Preview | F File | ⌫/Del | q Quit"
+        );
+
+        // State 7: Largest files idle
+        tui.view_mode = ViewMode::LargestFiles;
+        tui.filter_text.clear();
+        assert_eq!(
+            tui.footer_hint(),
+            "↑↓← | Space Select | / Filter | R Refresh | O Open | P Preview | F File | ⌫/Del | Esc Back | q Quit"
+        );
+        tui.selected_paths.insert(PathBuf::from("/tmp/file_0.dat"));
+        tui.selected_paths.insert(PathBuf::from("/tmp/file_1.dat"));
+        assert_eq!(
+            tui.footer_hint(),
+            "↑↓← | Space Select | / Filter | R Refresh | O Open | P Preview | F File | ⌫/Del 2 | Esc Back | q Quit"
+        );
+
+        // State 8: Largest files filter
+        tui.filter_mode = true;
+        assert_eq!(
+            tui.footer_hint(),
+            "Type to filter  |  Enter Apply  |  Esc Clear  |  Ctrl+C Quit"
+        );
+        tui.filter_mode = false;
+        tui.filter_text = "dat".into();
+        assert_eq!(
+            tui.footer_hint(),
+            "↑↓← | Space Select | / Edit | Esc Clear filter | O Open | P Preview | F File | ⌫/Del 2 | q Quit"
+        );
+    }
+
+    #[test]
+    fn test_header_free_space_rendering() {
+        let mut tui = AnalyzeTui::new(false);
+        let mut root = FileNode::new(
+            "root".into(),
+            PathBuf::from("/tmp/test_root"),
+            1000,
+            true,
+            1,
+        );
+        root.children = vec![FileNode::new(
+            "a.txt".into(),
+            PathBuf::from("/tmp/test_root/a.txt"),
+            1000,
+            false,
+            1,
+        )];
+        tui.root = Some(root);
+        tui.scanning = false;
+
+        // 1. With free space in Tree view
+        tui.filesystem_free = Some(50 * 1024 * 1024 * 1024); // 50 GiB
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+        assert!(
+            text.contains("50.0 GB free"),
+            "expected free space in:\n{text}"
+        );
+
+        // 2. Without free space in Tree view
+        tui.filesystem_free = None;
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+        assert!(
+            !text.contains("free)"),
+            "expected no free label in:\n{text}"
+        );
+
+        // 3. Overview mode with free space
+        tui.set_overview_mode(true);
+        tui.filesystem_free = Some(120 * 1024 * 1024 * 1024);
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+        assert!(
+            text.contains("Disk Usage Overview  (120.0 GB free)"),
+            "expected overview free in:\n{text}"
+        );
+
+        // 4. Overview mode without free space
+        tui.filesystem_free = None;
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+        assert!(
+            text.contains("Disk Usage Overview"),
+            "expected overview title in:\n{text}"
+        );
+        assert!(
+            !text.contains("free)"),
+            "expected no free label in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_header_scan_counters_and_percent() {
+        let mut tui = AnalyzeTui::new(false);
+        tui.scanning = true;
+        tui.files_scanned = 1250;
+        tui.dirs_scanned = 150;
+        tui.bytes_scanned = 45 * 1024 * 1024;
+
+        // Initial scan: last_total_files is None -> no percent prefix, no fake (0 B, 0 items)
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+        assert!(
+            text.contains("Scanning: 1,250 files, 150 dirs, 45.0 MB"),
+            "expected formatted counters in:\n{text}"
+        );
+        assert!(
+            !text.contains('%'),
+            "expected no percent prefix during initial scan in:\n{text}"
+        );
+        assert!(
+            !text.contains("(0 B, 0 items)"),
+            "must not display fake unmeasured total in:\n{text}"
+        );
+
+        // Rescan with known previous total: last_total_files = Some(2500) -> 50%
+        tui.last_total_files = Some(2500);
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+        assert!(
+            text.contains("Scanning 50%: 1,250 files, 150 dirs, 45.0 MB"),
+            "expected 50% rescan progress in:\n{text}"
+        );
+
+        // Cap at 99% while scanning
+        tui.files_scanned = 2500;
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| tui.render(f, f.area())).unwrap();
+        let text = buffer_to_string(&terminal);
+        assert!(
+            text.contains("Scanning 99%: 2,500 files, 150 dirs, 45.0 MB"),
+            "expected 99% capped rescan progress in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_format_number_and_truncate_middle() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1000), "1,000");
+        assert_eq!(format_number(1234567), "1,234,567");
+
+        let long_path = "/home/user/very/deeply/nested/directory/structure/file.txt";
+        let truncated = truncate_middle(long_path, 25);
+        assert!(display_width(&truncated) <= 25);
+        assert!(truncated.contains("..."));
+        assert_eq!(truncate_middle("short", 10), "short");
+    }
+
+    #[test]
+    fn test_all_eight_states_backend_snapshots() {
+        let render_bottom_line = |tui: &mut AnalyzeTui| -> String {
+            let backend = TestBackend::new(120, 10);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| tui.render(f, f.area())).unwrap();
+            let text = buffer_to_string(&terminal);
+            text.lines().last().unwrap().to_string()
+        };
+
+        let mut tui = AnalyzeTui::new(false);
+        let mut root = FileNode::new("root".into(), PathBuf::from("/tmp/root"), 100, true, 1);
+        root.children = vec![FileNode::new(
+            "a".into(),
+            PathBuf::from("/tmp/root/a"),
+            100,
+            false,
+            1,
+        )];
+        tui.root = Some(root);
+        tui.scanning = false;
+
+        // 1. Overview idle
+        tui.set_overview_mode(true);
+        tui.history.clear();
+        let s1 = render_bottom_line(&mut tui);
+        assert!(
+            s1.contains("↑↓→ | Enter | R Refresh | O Open | P Preview | F File | Esc/q Quit"),
+            "State 1: {s1}"
+        );
+
+        // 2. Overview + history
+        tui.history.push(PathBuf::from("/tmp/root"));
+        let s2 = render_bottom_line(&mut tui);
+        assert!(
+            s2.contains(
+                "↑↓←→ | Enter | R Refresh | O Open | P Preview | F File | Esc Back | q Quit"
+            ),
+            "State 2: {s2}"
+        );
+
+        // 3. Tree idle
+        tui.view_mode = ViewMode::Tree;
+        tui.selected_paths.clear();
+        tui.largest_files.clear();
+        let s3 = render_bottom_line(&mut tui);
+        assert!(
+            s3.contains("↑↓←→ | Space Select | Enter | / Filter | R Refresh | O Open | P Preview | F File | ⌫/Del | Esc Back | q Quit"),
+            "State 3: {s3}"
+        );
+
+        // 4. Tree with selection
+        tui.selected_paths.insert(PathBuf::from("/tmp/root/a"));
+        let s4 = render_bottom_line(&mut tui);
+        assert!(
+            s4.contains("↑↓←→ | Space Select | Enter | / Filter | R Refresh | O Open | P Preview | F File | ⌫/Del 1 | Esc Back | q Quit"),
+            "State 4: {s4}"
+        );
+
+        // 5. Tree filter typing
+        tui.filter_mode = true;
+        let s5 = render_bottom_line(&mut tui);
+        assert!(
+            s5.contains("Type to filter  |  Enter Apply  |  Esc Clear  |  Ctrl+C Quit"),
+            "State 5: {s5}"
+        );
+
+        // 6. Tree filter applied
+        tui.filter_mode = false;
+        tui.filter_text = "test".into();
+        let s6 = render_bottom_line(&mut tui);
+        assert!(
+            s6.contains("↑↓←→ | Enter | Space Select | / Edit | Esc Clear filter | O Open | P Preview | F File | ⌫/Del 1 | q Quit"),
+            "State 6: {s6}"
+        );
+
+        // 7. Largest files idle
+        tui.view_mode = ViewMode::LargestFiles;
+        tui.filter_text.clear();
+        tui.selected_paths.clear();
+        let s7 = render_bottom_line(&mut tui);
+        assert!(
+            s7.contains("↑↓← | Space Select | / Filter | R Refresh | O Open | P Preview | F File | ⌫/Del | Esc Back | q Quit"),
+            "State 7: {s7}"
+        );
+
+        // 8. Largest files filter
+        tui.filter_text = "bin".into();
+        let s8 = render_bottom_line(&mut tui);
+        assert!(
+            s8.contains("↑↓← | Space Select | / Edit | Esc Clear filter | O Open | P Preview | F File | ⌫/Del | q Quit"),
+            "State 8: {s8}"
+        );
     }
 }
