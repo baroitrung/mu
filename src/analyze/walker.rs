@@ -21,6 +21,7 @@ pub struct WalkerOptions {
     pub follow_symlinks: bool,
     pub cross_filesystems: bool,
     pub max_largest_files: usize,
+    pub bypass_cache: bool,
 }
 
 impl Default for WalkerOptions {
@@ -29,6 +30,7 @@ impl Default for WalkerOptions {
             follow_symlinks: false,
             cross_filesystems: false,
             max_largest_files: MAX_LARGEST_FILES,
+            bypass_cache: false,
         }
     }
 }
@@ -123,6 +125,7 @@ pub fn scan_path(
     let root_meta = match fs::metadata(root_path).or_else(|_| fs::symlink_metadata(root_path)) {
         Ok(m) => m,
         Err(e) => {
+            crate::analyze::cache::invalidate_cache(root_path);
             let msg = format!("cannot inspect {}: {e}", root_path.display());
             if let Some(tx) = &tx {
                 let _ = tx.send(ScanMessage::Error(msg.clone()));
@@ -131,9 +134,22 @@ pub fn scan_path(
         }
     };
 
+    if !options.bypass_cache
+        && !cancel.load(Ordering::Relaxed)
+        && let Some((cached_root, cached_stats)) = crate::analyze::cache::load_cache(root_path)
+    {
+        if let Some(tx) = &tx {
+            let _ = tx.send(ScanMessage::Complete {
+                root: cached_root.clone(),
+                stats: cached_stats.clone(),
+            });
+        }
+        return Ok((cached_root, cached_stats));
+    }
+
     let root_dev = root_meta.dev();
     let is_dir = root_meta.is_dir();
-    let mut ctx = WalkerContext::new(options, root_dev, tx.clone(), cancel);
+    let mut ctx = WalkerContext::new(options, root_dev, tx.clone(), cancel.clone());
 
     let mut root_node = if is_dir {
         ctx.record_dir(root_path);
@@ -166,6 +182,10 @@ pub fn scan_path(
         duration: start_time.elapsed(),
         largest_files,
     };
+
+    if !cancel.load(Ordering::Relaxed) {
+        let _ = crate::analyze::cache::save_cache(root_path, &root_node, &stats);
+    }
 
     if let Some(tx) = &tx {
         let _ = tx.send(ScanMessage::Complete {

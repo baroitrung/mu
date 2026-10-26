@@ -824,6 +824,11 @@ impl AnalyzeTui {
         }
 
         if !self.dry_run {
+            if success_count > 0
+                && let Some(root) = &self.root
+            {
+                crate::analyze::cache::invalidate_cache(&root.path);
+            }
             if let Some(root) = &mut self.root {
                 root.recalculate_sizes();
             }
@@ -878,6 +883,12 @@ impl AnalyzeTui {
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| target_path.display().to_string());
+                if !self.dry_run {
+                    if let Some(root) = &self.root {
+                        crate::analyze::cache::invalidate_cache(&root.path);
+                    }
+                    crate::analyze::cache::invalidate_cache(&target_path);
+                }
 
                 // Remove child from memory
                 if let Some(root) = &mut self.root {
@@ -1443,6 +1454,18 @@ impl AnalyzeTui {
     }
 
     pub fn trigger_rescan(&mut self) {
+        if let Some(target) = self.current_node().map(|n| n.path.clone()) {
+            crate::analyze::cache::invalidate_cache(&target);
+        }
+        if let Some(root) = &self.root {
+            crate::analyze::cache::invalidate_cache(&root.path);
+        }
+        if self.view_mode == ViewMode::Overview {
+            let locs = self.overview_locations();
+            if self.cursor < locs.len() {
+                crate::analyze::cache::invalidate_cache(&locs[self.cursor].path);
+            }
+        }
         self.scanning = true;
         self.rescan_requested = true;
         self.scan_progress_text = "Rescanning...".to_string();
@@ -2877,6 +2900,94 @@ mod tests {
         // Press Esc -> closes preview modal
         tui.handle_key_event(dummy_key(KeyCode::Esc));
         assert!(tui.preview_modal.is_none());
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_tui_rescan_invalidates_cache() {
+        let d = tempdir("rescan-cache");
+        let file = d.join("a.txt");
+        std::fs::write(&file, b"test").unwrap();
+
+        let mut root = FileNode::new("d".into(), d.clone(), 4, true, 1);
+        let child = FileNode::new("a.txt".into(), file.clone(), 4, false, 1);
+        root.children = vec![child];
+
+        let stats = crate::analyze::model::ScanStats {
+            total_bytes: 4,
+            total_bytes_human: "4 B".into(),
+            total_files: 1,
+            total_dirs: 1,
+            errors: 0,
+            duration: std::time::Duration::from_millis(5),
+            largest_files: vec![],
+        };
+
+        crate::analyze::cache::save_cache(&d, &root, &stats).unwrap();
+        assert!(crate::analyze::cache::cache_path(&d).exists());
+
+        let mut tui = AnalyzeTui::new(false);
+        tui.root = Some(root);
+
+        // Press 'r' to trigger rescan
+        tui.handle_key_event(dummy_key(KeyCode::Char('r')));
+        assert!(tui.rescan_requested);
+        assert!(
+            !crate::analyze::cache::cache_path(&d).exists(),
+            "R rescan must invalidate cache"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_tui_delete_and_batch_delete_invalidate_cache() {
+        let d = tempdir("delete-cache");
+        let file1 = d.join("f1.txt");
+        let file2 = d.join("f2.txt");
+        std::fs::write(&file1, b"1").unwrap();
+        std::fs::write(&file2, b"2").unwrap();
+
+        let mut root = FileNode::new("d".into(), d.clone(), 2, true, 1);
+        let c1 = FileNode::new("f1.txt".into(), file1.clone(), 1, false, 1);
+        let c2 = FileNode::new("f2.txt".into(), file2.clone(), 1, false, 1);
+        root.children = vec![c1, c2];
+
+        let stats = crate::analyze::model::ScanStats {
+            total_bytes: 2,
+            total_bytes_human: "2 B".into(),
+            total_files: 2,
+            total_dirs: 1,
+            errors: 0,
+            duration: std::time::Duration::from_millis(5),
+            largest_files: vec![],
+        };
+
+        // 1. Single delete invalidation
+        crate::analyze::cache::save_cache(&d, &root, &stats).unwrap();
+        assert!(crate::analyze::cache::cache_path(&d).exists());
+
+        let mut tui = AnalyzeTui::new(false);
+        tui.root = Some(root.clone());
+        tui.confirm_delete = Some(file1.clone());
+        tui.execute_delete();
+        assert!(
+            !crate::analyze::cache::cache_path(&d).exists(),
+            "single delete must invalidate cache"
+        );
+
+        // 2. Batch delete invalidation
+        crate::analyze::cache::save_cache(&d, &root, &stats).unwrap();
+        assert!(crate::analyze::cache::cache_path(&d).exists());
+
+        tui.selected_paths.insert(file2.clone());
+        tui.confirm_batch = Some(vec![file2.clone()]);
+        tui.execute_batch_delete();
+        assert!(
+            !crate::analyze::cache::cache_path(&d).exists(),
+            "batch delete must invalidate cache"
+        );
 
         let _ = std::fs::remove_dir_all(&d);
     }

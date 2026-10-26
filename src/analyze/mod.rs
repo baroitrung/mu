@@ -1,5 +1,6 @@
 //! Disk analysis module (`mu analyze`).
 
+pub mod cache;
 pub mod json;
 pub mod model;
 pub mod walker;
@@ -27,7 +28,11 @@ pub fn run(opts: &Options) -> i32 {
 
     if opts.json {
         let cancel = Arc::new(AtomicBool::new(false));
-        match scan_path(&target, WalkerOptions::default(), None, cancel) {
+        let walker_opts = WalkerOptions {
+            bypass_cache: true,
+            ..WalkerOptions::default()
+        };
+        match scan_path(&target, walker_opts, None, cancel) {
             Ok((root, stats)) => match json::to_json_pretty(&root, &stats) {
                 Ok(j) => {
                     let stdout = std::io::stdout();

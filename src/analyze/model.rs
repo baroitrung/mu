@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Serialize a `PathBuf` as a lossy UTF-8 string, preventing serialization failure
 /// when encountering non-UTF-8 filenames on Unix filesystems.
@@ -50,7 +50,7 @@ pub enum ViewMode {
 }
 
 /// A node in the scanned directory tree.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileNode {
     pub name: String,
     #[serde(serialize_with = "serialize_path_lossy")]
@@ -59,11 +59,11 @@ pub struct FileNode {
     pub size_human: String,
     pub is_dir: bool,
     pub item_count: usize,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<FileNode>,
-    #[serde(skip)]
+    #[serde(default, skip)]
     pub dev: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub err: Option<String>,
 }
 
@@ -120,7 +120,7 @@ impl FileNode {
 }
 
 /// A discovered large file.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LargestFile {
     #[serde(serialize_with = "serialize_path_lossy")]
     pub path: PathBuf,
@@ -139,14 +139,14 @@ impl LargestFile {
 }
 
 /// Scan statistics.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanStats {
     pub total_bytes: u64,
     pub total_bytes_human: String,
     pub total_files: u64,
     pub total_dirs: u64,
     pub errors: u64,
-    #[serde(skip)]
+    #[serde(default, skip)]
     pub duration: Duration,
     pub largest_files: Vec<LargestFile>,
 }
