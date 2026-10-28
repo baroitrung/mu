@@ -93,7 +93,7 @@ pub fn resolve_target_bin(custom: Option<&Path>) -> Result<PathBuf, String> {
 pub fn current_version() -> &'static str {
     match option_env!("MU_VERSION") {
         Some(v) => v,
-        None => "0.3.0",
+        None => "0.4.0",
     }
 }
 
