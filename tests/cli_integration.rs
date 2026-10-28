@@ -1041,3 +1041,131 @@ fn uninstall_non_interactive_without_yes_exits_nonzero() {
 
     let _ = std::fs::remove_dir_all(&test_dir);
 }
+
+#[test]
+fn purge_non_interactive_without_yes_exits_nonzero() {
+    let test_dir = std::env::temp_dir().join(format!("mu-purge-nonint-{}", std::process::id()));
+    let proj = test_dir.join("proj");
+    let target = proj.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        proj.join("Cargo.toml"),
+        b"[package]\nname = \"p\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let sentinel = target.join("output.bin");
+    std::fs::write(&sentinel, b"target artifact").unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["purge", &format!("--paths={}", test_dir.display())]);
+    cmd.stdin(Stdio::null());
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_CONFIG_HOME", test_dir.join(".config"));
+    cmd.env("XDG_CACHE_HOME", test_dir.join(".cache"));
+    cmd.env("XDG_DATA_HOME", test_dir.join(".local/share"));
+    let output = cmd.output().expect("failed to run mu purge");
+
+    assert_eq!(output.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("Non-interactive: pass --yes to confirm, or --dry-run to preview."),
+        "expected non-interactive note on stderr: {err}"
+    );
+    assert!(
+        sentinel.exists(),
+        "aborted purge must leave sentinel intact"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn purge_non_interactive_dry_run_exits_zero() {
+    let test_dir = std::env::temp_dir().join(format!("mu-purge-dryrun-{}", std::process::id()));
+    let proj = test_dir.join("proj");
+    let target = proj.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        proj.join("Cargo.toml"),
+        b"[package]\nname = \"p\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let sentinel = target.join("output.bin");
+    std::fs::write(&sentinel, b"target artifact").unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args([
+        "purge",
+        "--dry-run",
+        &format!("--paths={}", test_dir.display()),
+    ]);
+    cmd.stdin(Stdio::null());
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_CONFIG_HOME", test_dir.join(".config"));
+    cmd.env("XDG_CACHE_HOME", test_dir.join(".cache"));
+    cmd.env("XDG_DATA_HOME", test_dir.join(".local/share"));
+    let output = cmd.output().expect("failed to run mu purge --dry-run");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        sentinel.exists(),
+        "dry-run purge must leave sentinel intact"
+    );
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn installer_non_interactive_without_yes_exits_nonzero() {
+    let test_dir = std::env::temp_dir().join(format!("mu-inst-nonint-{}", std::process::id()));
+    let pkg = test_dir.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let dummy = pkg.join("app.deb");
+    std::fs::write(&dummy, b"dummy deb package content").unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args(["installer", &format!("--paths={}", pkg.display())]);
+    cmd.stdin(Stdio::null());
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_CONFIG_HOME", test_dir.join(".config"));
+    cmd.env("XDG_CACHE_HOME", test_dir.join(".cache"));
+    cmd.env("XDG_DATA_HOME", test_dir.join(".local/share"));
+    let output = cmd.output().expect("failed to run mu installer");
+
+    assert_eq!(output.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("Non-interactive: pass --yes to confirm, or --dry-run to preview."),
+        "expected non-interactive note on stderr: {err}"
+    );
+    assert!(dummy.exists(), "aborted installer must leave package intact");
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn installer_non_interactive_dry_run_exits_zero() {
+    let test_dir = std::env::temp_dir().join(format!("mu-inst-dryrun-{}", std::process::id()));
+    let pkg = test_dir.join("pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let dummy = pkg.join("app.deb");
+    std::fs::write(&dummy, b"dummy deb package content").unwrap();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mu"));
+    cmd.args([
+        "installer",
+        "--dry-run",
+        &format!("--paths={}", pkg.display()),
+    ]);
+    cmd.stdin(Stdio::null());
+    cmd.env("HOME", &test_dir);
+    cmd.env("XDG_CONFIG_HOME", test_dir.join(".config"));
+    cmd.env("XDG_CACHE_HOME", test_dir.join(".cache"));
+    cmd.env("XDG_DATA_HOME", test_dir.join(".local/share"));
+    let output = cmd.output().expect("failed to run mu installer --dry-run");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(dummy.exists(), "dry-run installer must leave package intact");
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
