@@ -1,6 +1,16 @@
 
   Optimize plan
-  [run]   apt-get update && apt-get autoremove --purge
-  [run]   journalctl --vacuum-size=500M
-  [run]   update icon/mime/font caches
+  [dry-run] sudo apt-get update && sudo apt-get autoremove --purge -y
+  [dry-run] sudo journalctl --vacuum-size=500M
+  [dry-run] sudo update-mime-database /usr/share/mime && fc-cache -f
+  [dry-run] sudo resolvectl flush-caches
+  [dry-run] sudo dpkg --configure -a && sudo apt-get install -f -y
+  [dry-run] sudo systemctl reset-failed && systemctl --user reset-failed
+  [dry-run] flatpak uninstall --unused -y
+  [dry-run] sqlite3 <db_path> "VACUUM;"
+  [dry-run] find ~/.local/state -type f -mtime +30 -delete
+  [dry-run] audit ~/.config/autostart/*.desktop for missing Exec binaries
+  [dry-run] audit broken symlinks in /etc/systemd/system and ~/.config/systemd/user
+  [dry-run] audit files in $HOME owned by root
+  [dry-run] smartctl --scan || journalctl -k --grep=EXT4-fs
   Dry run — nothing executed.

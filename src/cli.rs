@@ -146,9 +146,19 @@ Global Flags:
 
 const OPTIMIZE_HELP: &str = "\
 Runs the following maintenance tasks:
-  1. apt-get update && apt-get autoremove --purge
-  2. journalctl --vacuum-size=500M
-  3. update-mime-database, fc-cache
+   1. apt — apt-get update && apt-get autoremove --purge
+   2. journal — journalctl --vacuum-size=500M
+   3. caches — update icon/mime/font caches
+   4. dns — flush DNS cache
+   5. packages — repair interrupted package installs
+   6. systemd — reset failed systemd units
+   7. flatpak — clean unused Flatpak runtimes
+   8. sqlite — vacuum application sqlite databases
+   9. state — clean stale files older than 30 days in ~/.local/state
+  10. autostart — audit autostart desktop entries for missing binaries
+  11. services — audit broken systemd service symlinks
+  12. permissions — audit root-owned files in home directory
+  13. disk-health — audit filesystem integrity and SMART disk health
 
 Use --dry-run to see what would run without executing.
 Use --skip to exclude specific steps (e.g. --skip=apt,journal).
@@ -160,7 +170,7 @@ Usage:
 Flags:
       --dry-run        Preview actions without making changes
   -h, --help           help for optimize
-      --skip strings   Steps to skip (apt, journal, caches)
+      --skip strings   Steps to skip (apt, journal, caches, dns, packages, systemd, flatpak, sqlite, state, autostart, services, permissions, disk-health)
   -y, --yes            Skip confirmation prompt
 
 Global Flags:
