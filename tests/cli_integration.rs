@@ -1138,7 +1138,10 @@ fn installer_non_interactive_without_yes_exits_nonzero() {
         err.contains("Non-interactive: pass --yes to confirm, or --dry-run to preview."),
         "expected non-interactive note on stderr: {err}"
     );
-    assert!(dummy.exists(), "aborted installer must leave package intact");
+    assert!(
+        dummy.exists(),
+        "aborted installer must leave package intact"
+    );
 
     let _ = std::fs::remove_dir_all(&test_dir);
 }
@@ -1165,7 +1168,10 @@ fn installer_non_interactive_dry_run_exits_zero() {
     let output = cmd.output().expect("failed to run mu installer --dry-run");
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(dummy.exists(), "dry-run installer must leave package intact");
+    assert!(
+        dummy.exists(),
+        "dry-run installer must leave package intact"
+    );
 
     let _ = std::fs::remove_dir_all(&test_dir);
 }

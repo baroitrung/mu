@@ -4,6 +4,7 @@ pub mod inspect;
 pub mod model;
 pub mod scanner;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
@@ -30,6 +31,8 @@ pub struct Deps {
     pub data_home: PathBuf,
     /// `MU_NO_OPLOG=1` disables the operations log.
     pub no_oplog: bool,
+    /// TTY detection hook for stdin.
+    pub is_terminal: Box<dyn Fn() -> bool>,
     /// Interactive selection (review F4).
     pub select: SelectFn,
     /// Deletion seam; production always routes through `trash::safe_delete`.
@@ -43,6 +46,7 @@ impl Deps {
             config_home: xdg::config_home(),
             data_home: xdg::data_home(),
             no_oplog: std::env::var_os("MU_NO_OPLOG").as_deref() == Some(std::ffi::OsStr::new("1")),
+            is_terminal: Box::new(|| std::io::stdin().is_terminal()),
             select: Box::new(|packages| {
                 let rows: Vec<(String, String)> = packages
                     .iter()
@@ -69,6 +73,13 @@ pub fn run(opts: &Options) -> i32 {
 pub(crate) fn run_in(opts: &Options, deps: &Deps) -> i32 {
     if let Err(e) = crate::config::load_whitelist_from(&deps.config_home) {
         eprintln!("invalid mu configuration: {e}");
+        return 1;
+    }
+
+    // Fail-closed non-interactive gate: without --yes or --dry-run, require a
+    // TTY before running any expensive scan or attempting any removal.
+    if !opts.auto_yes && !opts.dry_run && !(deps.is_terminal)() {
+        eprintln!("Non-interactive: pass --yes to confirm, or --dry-run to preview.\nAborted.");
         return 1;
     }
 
@@ -132,23 +143,31 @@ pub(crate) fn run_in(opts: &Options, deps: &Deps) -> i32 {
     let selected: Vec<&model::InstallerPackage> = if opts.auto_yes {
         all_packages.iter().collect()
     } else {
-        match select::resolve((deps.select)(&all_packages)) {
-            Selection::Stop {
-                code,
-                message,
-                is_error,
-            } => {
-                if is_error {
-                    eprintln!("{message}");
-                } else {
-                    println!("\n{message}");
-                }
-                return code;
+        match (deps.select)(&all_packages) {
+            SelectOutcome::NonInteractive => {
+                eprintln!(
+                    "Non-interactive: pass --yes to confirm, or --dry-run to preview.\nAborted."
+                );
+                return 1;
             }
-            Selection::Proceed(indices) => indices
-                .iter()
-                .filter_map(|&i| all_packages.get(i))
-                .collect(),
+            outcome => match select::resolve(outcome) {
+                Selection::Stop {
+                    code,
+                    message,
+                    is_error,
+                } => {
+                    if is_error {
+                        eprintln!("{message}");
+                    } else {
+                        println!("\n{message}");
+                    }
+                    return code;
+                }
+                Selection::Proceed(indices) => indices
+                    .iter()
+                    .filter_map(|&i| all_packages.get(i))
+                    .collect(),
+            },
         }
     };
 
@@ -208,12 +227,21 @@ mod tests {
     /// Deps rooted at a temp `data_home` with a no-op delete that records the
     /// paths it was asked to remove — no env mutation, no real trash.
     fn test_deps(root: &Path, select: SelectFn) -> (Deps, Arc<Mutex<Vec<PathBuf>>>) {
+        test_deps_terminal(root, true, select)
+    }
+
+    fn test_deps_terminal(
+        root: &Path,
+        is_terminal: bool,
+        select: SelectFn,
+    ) -> (Deps, Arc<Mutex<Vec<PathBuf>>>) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let sink = log.clone();
         let deps = Deps {
             config_home: root.join("config-home"),
             data_home: root.join("data-home"),
             no_oplog: false,
+            is_terminal: Box::new(move || is_terminal),
             select,
             delete: Box::new(move |p| {
                 sink.lock().unwrap().push(p.to_path_buf());
@@ -257,7 +285,8 @@ mod tests {
         let dummy = fixture(&root, "app.AppImage");
 
         // Non-TTY: the selector reports "not interactive".
-        let (deps, removed) = test_deps(&root, Box::new(|_| SelectOutcome::NonInteractive));
+        let (deps, removed) =
+            test_deps_terminal(&root, false, Box::new(|_| SelectOutcome::NonInteractive));
         let opts = Options {
             paths: vec![root.clone()],
             dry_run: false,
@@ -266,7 +295,7 @@ mod tests {
         };
 
         let code = run_in(&opts, &deps);
-        assert_eq!(code, 0);
+        assert_eq!(code, 1);
         assert!(dummy.exists(), "aborted installer must not delete anything");
         assert!(removed.lock().unwrap().is_empty());
 
@@ -310,6 +339,7 @@ mod tests {
             config_home: root.join("config-home"),
             data_home: root.join("data-home"),
             no_oplog: true,
+            is_terminal: Box::new(|| false),
             select: Box::new(|_| panic!("--yes must not prompt")),
             delete: Box::new(|_| Err(crate::error::Error::Msg("trash unavailable".into()))),
         };
@@ -436,6 +466,42 @@ mod tests {
         assert_eq!(code, 1, "malformed config must cause nonzero exit");
         assert!(dummy.exists(), "malformed config must not delete anything");
         assert!(removed.lock().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn installer_real_run_non_interactive_without_yes_exits_one() {
+        let root = tempdir("real-nonint");
+        let dummy = fixture(&root, "app.deb");
+        let opts = Options {
+            paths: vec![root.clone()],
+            dry_run: false,
+            auto_yes: false,
+            debug: false,
+        };
+
+        let code = run(&opts);
+        assert_eq!(code, 1, "mu installer without --yes on non-TTY must exit 1");
+        assert!(dummy.exists(), "must not delete anything");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn installer_real_run_dry_run_exits_zero() {
+        let root = tempdir("real-dryrun");
+        let dummy = fixture(&root, "app.deb");
+        let opts = Options {
+            paths: vec![root.clone()],
+            dry_run: true,
+            auto_yes: false,
+            debug: false,
+        };
+
+        let code = run(&opts);
+        assert_eq!(code, 0, "mu installer --dry-run must exit 0");
+        assert!(dummy.exists(), "must not delete anything");
 
         let _ = fs::remove_dir_all(&root);
     }
